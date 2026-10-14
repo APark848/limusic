@@ -17,9 +17,9 @@ concurrency:
 
 jobs:
   simulator:
-    # macos-14 is the stable Apple Silicon hosted image. It has Xcode and an arm64 simulator SDK,
+    # macos-15 provides the Xcode 16 toolchain and an arm64 simulator SDK,
     # so aarch64-apple-ios-sim exercises the target the generated Tauri project will use.
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +50,9 @@ jobs:
       - name: Xcode and CocoaPods
         run: |
           xcode-select -p
+          xcodebuild -version
           xcrun --sdk iphonesimulator --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-version
           pod --version
 
       # Match the pinned CLI used by macos-release.yml. Do not cargo-install: the npm package
