@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          tauri ios build --debug --target aarch64-apple-ios-sim \
+          tauri ios build --debug --target aarch64-sim \
             --config '{"build":{"beforeBuildCommand":""}}' 2>&1 | tee ios-build.log
 
       - name: Preserve iOS generation and build logs
