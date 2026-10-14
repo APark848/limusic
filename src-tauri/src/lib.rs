@@ -38,6 +38,8 @@ mod tray;
 mod videoproxy;
 mod webview;
 
+mod platform;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -234,7 +236,6 @@ fn keep_on_screen(w: &tauri::WebviewWindow) {
     }
 }
 
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
 /// Logs to stdout **and** to `<app data>/limusic.log`, truncated each launch (the previous run is
 /// kept as `limusic.log.1`).
 ///
@@ -347,6 +348,7 @@ fn should_start_minimized(db: &Db) -> bool {
 /// Tauri entry point. Applies the platform boot fixes (open-fd limit, NVIDIA/WebKit env), restores
 /// the persisted session, wires every command and plugin, and runs the event loop. context/01
 /// §startup.
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Must happen before any webview exists: the limit is inherited by the web processes WebKit
     // forks, and cannot be raised for them afterwards.

@@ -13,6 +13,10 @@
 //! `/GenerateIT` hands that attestation an integrity token of the wrong class. See `botguard.rs`
 //! and `progress/KNOWN-ISSUES.md` KI-1.
 
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+mod botguard;
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[path = "botguard_unavailable.rs"]
 mod botguard;
 
 use std::sync::atomic::{AtomicBool, Ordering};
