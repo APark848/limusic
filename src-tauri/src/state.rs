@@ -7,12 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use std::sync::Arc;
 
+use crate::platform::player::Player;
 use innertube::{
     AccountIdentity, AccountInfo, AudioQuality, BlockList, Clients, InnerTube, SongItem,
     MAIN_CLIENT,
 };
 use listen_protocol::{Playback, PlaybackKind, Track};
-use player::Player;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
