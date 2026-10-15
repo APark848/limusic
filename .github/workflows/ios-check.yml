@@ -55,10 +55,9 @@ jobs:
           xcrun --sdk iphonesimulator --show-sdk-version
           pod --version
 
-      # Match the pinned CLI used by macos-release.yml. Do not cargo-install: the npm package
-      # supplies the prebuilt CLI and avoids silently selecting a newer Tauri release.
+      # Pin the Cargo CLI to the same version used by the desktop workflow.
       - name: Tauri CLI
-        run: npm install -g "@tauri-apps/cli@2.11.5"
+        run: cargo install tauri-cli --version 2.11.5 --locked
 
       # Generated Apple sources are intentionally not committed by CI. On the first run this
       # produces a reviewable artifact; a later dedicated change can add the generated project to
@@ -70,7 +69,17 @@ jobs:
           if [ -d src-tauri/gen/apple ]; then
             echo "existing generated Apple project found"
           else
-            tauri ios init --ci 2>&1 | tee ios-init.log
+            cargo tauri ios init --ci 2>&1 | tee ios-init.log
+          fi
+
+      - name: Validate generated Cargo Xcode script
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F "cargo tauri ios xcode-script" src-tauri/gen/apple/project.yml
+          if grep -Fq "node tauri ios xcode-script" src-tauri/gen/apple/project.yml; then
+            echo "generated Xcode project uses the invalid Node launcher" >&2
+            exit 1
           fi
 
       # Keep this command failing on compiler/configuration errors. The artifact step below still
@@ -79,7 +88,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          tauri ios build --debug --target aarch64-sim \
+          cargo tauri ios build --debug --target aarch64-sim \
             --config '{"build":{"beforeBuildCommand":""}}' 2>&1 | tee ios-build.log
 
       - name: Preserve iOS generation and build logs
