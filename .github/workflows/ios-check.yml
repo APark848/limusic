@@ -91,6 +91,88 @@ jobs:
           cargo tauri ios build --debug --target aarch64-sim \
             --config '{"build":{"beforeBuildCommand":""}}' 2>&1 | tee ios-build.log
 
+      # Headless launch validation only: this proves the generated bundle can be installed and
+      # remains alive after startup. It does not interact with the UI or claim audio playback.
+      - name: Smoke test iOS simulator launch
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          simulator_name="iPhone 16"
+          sdk_version="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          runtime="com.apple.CoreSimulator.SimRuntime.iOS-${sdk_version//./-}"
+          simulator_udid="$(
+            xcrun simctl list devices available -j |
+              jq -r --arg runtime "$runtime" --arg name "$simulator_name" \
+                '.devices[$runtime][]? | select(.name == $name) | .udid' |
+              head -n 1
+          )"
+          if [ -z "$simulator_udid" ]; then
+            echo "No available $simulator_name for iOS $sdk_version" >&2
+            xcrun simctl list devices available
+            exit 1
+          fi
+
+          diagnostics_dir="simulator-diagnostics"
+          mkdir -p "$diagnostics_dir"
+          capture_failure() {
+            set +e
+            echo "Capturing simulator diagnostics after launch failure"
+            xcrun simctl spawn "$simulator_udid" log show \
+              --style compact --last 3m \
+              --predicate 'process == "limusic" OR eventMessage CONTAINS[c] "com.limusic.desktop"' \
+              > "$diagnostics_dir/system.log" 2>&1
+            find "$HOME/Library/Logs/DiagnosticReports" -maxdepth 1 \
+              -type f -iname 'limusic*' -exec cp {} "$diagnostics_dir/" \; 2>/dev/null
+          }
+          fail() {
+            trap - ERR
+            echo "$1" >&2
+            capture_failure
+            exit 1
+          }
+          shutdown_simulator() {
+            xcrun simctl shutdown "$simulator_udid" >/dev/null 2>&1 || true
+          }
+          trap capture_failure ERR
+          trap shutdown_simulator EXIT
+
+          # Start from a known state even if the hosted runner left this device booted.
+          shutdown_simulator
+          echo "Booting $simulator_name ($simulator_udid), iOS $sdk_version"
+          xcrun simctl boot "$simulator_udid"
+          xcrun simctl bootstatus "$simulator_udid" -b
+
+          app_bundle="$(find src-tauri/gen/apple/build/arm64-sim -maxdepth 1 \
+            -type d -name '*.app' -print -quit)"
+          if [ -z "$app_bundle" ]; then
+            fail "Could not locate the generated simulator app bundle"
+          fi
+          bundle_id="$(plutil -extract CFBundleIdentifier raw "$app_bundle/Info.plist")"
+          echo "Installing $app_bundle ($bundle_id)"
+          xcrun simctl install "$simulator_udid" "$app_bundle"
+
+          set +e
+          launch_output="$(xcrun simctl launch "$simulator_udid" "$bundle_id" 2>&1)"
+          launch_status=$?
+          set -e
+          printf '%s\n' "$launch_output" | tee simulator-launch.log
+          if [ "$launch_status" -ne 0 ]; then
+            fail "simctl could not launch $bundle_id"
+          fi
+          app_pid="$(printf '%s\n' "$launch_output" | awk -F ': ' 'END { print $2 }')"
+          if ! [[ "$app_pid" =~ ^[0-9]+$ ]]; then
+            fail "Could not parse the launched process id"
+          fi
+
+          # A startup panic or native integration failure should surface within this window.
+          sleep 12
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            fail "Limusic exited immediately after launch (pid $app_pid)"
+          fi
+          echo "Limusic remained alive after launch (pid $app_pid)"
+          trap - ERR
+
       - name: Preserve iOS generation and build logs
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
@@ -99,6 +181,8 @@ jobs:
           path: |
             ios-init.log
             ios-build.log
+            simulator-launch.log
+            simulator-diagnostics
             src-tauri/gen/apple
           if-no-files-found: warn
           retention-days: 14
