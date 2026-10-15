@@ -2705,6 +2705,7 @@ pub async fn listenbrainz_profile(
 /// with SWP_FRAMECHANGED to force one recalculation with the fullscreen flag set. On the main
 /// thread, where the window messages run inline and the order is guaranteed.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub fn theater_fullscreen(window: tauri::WebviewWindow, on: bool) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {
