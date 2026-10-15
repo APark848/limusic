@@ -106,10 +106,8 @@ impl Bridge {
                     .visible(false)
                     .inner_size(1.0, 1.0);
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-            let builder = builder.skip_taskbar(true);
+            let builder = builder.skip_taskbar(true).decorations(false).focused(false);
             let res = builder
-                .decorations(false)
-                .focused(false)
                 .on_page_load(move |_wv, payload| {
                     if matches!(payload.event(), PageLoadEvent::Finished) {
                         if let Some(tx) = ready_slot2.lock().unwrap().take() {
