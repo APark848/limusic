@@ -1,0 +1,104 @@
+name: iOS validation
+
+# This is deliberately limited to the port branch. It creates no release artifacts, signs nothing,
+# and has no repository write permission: its job is to make the first real Xcode/Rust error easy
+# to inspect while the iOS implementation is still incomplete.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ios-port]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  simulator:
+    # macos-15 provides the Xcode 16 toolchain and an arm64 simulator SDK,
+    # so aarch64-apple-ios-sim exercises the target the generated Tauri project will use.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Frontend dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend build
+        working-directory: ui
+        run: pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Xcode and CocoaPods
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphonesimulator --show-sdk-path
+          xcrun --sdk iphonesimulator --show-sdk-version
+          pod --version
+
+      # Pin the Cargo CLI to the same version used by the desktop workflow.
+      - name: Tauri CLI
+        run: cargo install tauri-cli --version 2.11.5 --locked
+
+      # Generated Apple sources are intentionally not committed by CI. On the first run this
+      # produces a reviewable artifact; a later dedicated change can add the generated project to
+      # version control once its identity/configuration is reviewed.
+      - name: Initialize iOS project
+        shell: bash
+        run: |
+          set -o pipefail
+          if [ -d src-tauri/gen/apple ]; then
+            echo "existing generated Apple project found"
+          else
+            cargo tauri ios init --ci 2>&1 | tee ios-init.log
+          fi
+
+      - name: Validate generated Cargo Xcode script
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F "cargo tauri ios xcode-script" src-tauri/gen/apple/project.yml
+          if grep -Fq "node tauri ios xcode-script" src-tauri/gen/apple/project.yml; then
+            echo "generated Xcode project uses the invalid Node launcher" >&2
+            exit 1
+          fi
+
+      # Keep this command failing on compiler/configuration errors. The artifact step below still
+      # captures the generated project and logs, but no error is hidden with continue-on-error.
+      - name: Build iOS simulator
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo tauri ios build --debug --target aarch64-sim \
+            --config '{"build":{"beforeBuildCommand":""}}' 2>&1 | tee ios-build.log
+
+      - name: Preserve iOS generation and build logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-validation-${{ github.run_id }}
+          path: |
+            ios-init.log
+            ios-build.log
+            src-tauri/gen/apple
+          if-no-files-found: warn
+          retention-days: 14

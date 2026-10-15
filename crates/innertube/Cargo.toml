@@ -14,6 +14,10 @@ tokio = { workspace = true, features = ["time", "sync"] }
 sha1 = "0.10"
 hex = "0.4"
 urlencoding = "2"
+
+# The rustypipe safety net embeds QuickJS and is only used by the desktop application. Mobile
+# targets keep the same fallback API but report it unavailable until they have a native strategy.
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 rustypipe = { version = "0.11", default-features = false, features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]

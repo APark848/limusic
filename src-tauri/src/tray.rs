@@ -224,7 +224,7 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 mod imp {
     use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
     use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};

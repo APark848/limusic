@@ -7,14 +7,14 @@
 //! that rolls over while Limusic sits in front may go unseen. Best-effort like `media.rs`: a
 //! missing notification daemon is a `debug!` line.
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
 /// The last song's notification, closed before the next one is shown so a run of skips leaves one
 /// up, not a stack. Not `replaces_id`: Plasma updates an expired notification in place in its
 /// history and never pops it up again, so only the first skip was visible.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 static PREV: Mutex<Option<notify_rust::NotificationHandle>> = Mutex::new(None);
 
 pub fn track_changed(app: &AppHandle, title: &str, artists: &str, even_focused: bool) {
@@ -24,7 +24,7 @@ pub fn track_changed(app: &AppHandle, title: &str, artists: &str, even_focused: 
     }
     let mut n = notify_rust::Notification::new();
     n.summary(title).body(artists).appname("Limusic");
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     {
         // The binary name is the icon name the .deb/.rpm install. An AppImage has no themed icon,
         // so there the daemon shows its generic one.
@@ -50,17 +50,17 @@ pub fn track_changed(app: &AppHandle, title: &str, artists: &str, even_focused: 
     // A blocking D-Bus / WinRT / AppKit call: keep it off the playback path.
     std::thread::spawn(move || {
         // Held across close + show, so two quick skips can't both close the same one.
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(target_os = "linux")]
         let mut prev = PREV.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(target_os = "linux")]
         if let Some(h) = prev.take() {
             h.close();
         }
         tracing::debug!("notification sent");
         match n.show() {
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(target_os = "linux")]
             Ok(h) => *prev = Some(h),
-            #[cfg(not(all(unix, not(target_os = "macos"))))]
+            #[cfg(not(target_os = "linux"))]
             Ok(_) => {}
             Err(e) => tracing::debug!("notification: {e}"),
         }
