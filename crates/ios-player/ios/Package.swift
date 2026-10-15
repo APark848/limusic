@@ -3,22 +3,22 @@
 import PackageDescription
 
 let package = Package(
-  name: "limusic-ios-player",
+  name: "ios-player",
   platforms: [
     .iOS(.v16),
   ],
   products: [
     .library(
-      name: "limusic-ios-player",
+      name: "ios-player",
       type: .static,
-      targets: ["limusic-ios-player"])
+      targets: ["ios-player"])
   ],
   dependencies: [
     .package(name: "Tauri", path: "../.tauri/tauri-api")
   ],
   targets: [
     .target(
-      name: "limusic-ios-player",
+      name: "ios-player",
       dependencies: [
         .byName(name: "Tauri")
       ],
