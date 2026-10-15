@@ -11,7 +11,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::platform::player::PlayerEvent;
 use crate::state::AppState;
 
-const ENABLE_ENV: &str = "LIMUSIC_IOS_PLAYER_SELF_TEST";
+const ENABLE_ARG: &str = "--limusic-ios-player-self-test";
 const RESULT_FILE: &str = "ios-player-self-test.json";
 const FIXTURE_SECONDS: f64 = 8.0;
 const SEEK_SECONDS: f64 = 4.0;
@@ -19,7 +19,7 @@ const SEEK_SECONDS: f64 = 4.0;
 static EVENT_TAP: OnceLock<Mutex<Option<UnboundedSender<PlayerEvent>>>> = OnceLock::new();
 
 pub(crate) fn install_event_tap() -> Option<UnboundedReceiver<PlayerEvent>> {
-    if std::env::var_os(ENABLE_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
+    if !std::env::args_os().any(|arg| arg == std::ffi::OsStr::new(ENABLE_ARG)) {
         return None;
     }
     let (tx, rx) = unbounded_channel();

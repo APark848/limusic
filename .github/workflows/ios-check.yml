@@ -155,8 +155,8 @@ jobs:
           result_file=""
 
           set +e
-          launch_output="$(env SIMCTL_CHILD_LIMUSIC_IOS_PLAYER_SELF_TEST=1 \
-            xcrun simctl launch "$simulator_udid" "$bundle_id" 2>&1)"
+          launch_output="$(xcrun simctl launch "$simulator_udid" "$bundle_id" \
+            --limusic-ios-player-self-test 2>&1)"
           launch_status=$?
           set -e
           printf '%s\n' "$launch_output" | tee simulator-launch.log
