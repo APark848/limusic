@@ -15,7 +15,16 @@ pub(crate) mod player {
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub(crate) mod mobile_services;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "ios")]
+#[path = "ios_player.rs"]
+pub(crate) mod player;
+
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "ios"
+)))]
 pub(crate) mod player {
     use std::collections::HashMap;
 

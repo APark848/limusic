@@ -11,7 +11,9 @@ include!("desktop_app.rs");
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 #[tauri::mobile_entry_point]
 pub fn run() {
-    tauri::Builder::default()
-        .run(tauri::generate_context!())
-        .expect("error while running Limusic mobile shell");
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "ios")]
+    let builder = builder.plugin(ios_player::init());
+
+    builder.run(tauri::generate_context!()).expect("error while running Limusic mobile shell");
 }

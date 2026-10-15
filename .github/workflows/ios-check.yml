@@ -1,12 +1,12 @@
 name: iOS validation
 
-# This is deliberately limited to the port branch. It creates no release artifacts, signs nothing,
+# This is deliberately limited to the playback port branch. It creates no release artifacts, signs nothing,
 # and has no repository write permission: its job is to make the first real Xcode/Rust error easy
 # to inspect while the iOS implementation is still incomplete.
 on:
   workflow_dispatch:
   push:
-    branches: [ios-port]
+    branches: [ios-playback]
 
 permissions:
   contents: read
