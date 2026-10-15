@@ -6,9 +6,9 @@
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("BotGuard is not implemented on this platform")]
-    Fatal,
+    Fatal(String),
     #[error("BotGuard is not implemented on this platform")]
-    Transient,
+    Transient(String),
 }
 
 pub struct Minter;
@@ -21,10 +21,10 @@ pub struct Bootstrap {
 
 impl Minter {
     pub async fn spawn(_user_agent: String, _session_ident: String) -> Result<Bootstrap, Error> {
-        Err(Error::Fatal)
+        Err(Error::Fatal("BotGuard is not implemented on this platform".into()))
     }
 
     pub async fn mint(&self, _ident: &str) -> Result<String, Error> {
-        Err(Error::Transient)
+        Err(Error::Transient("BotGuard is not implemented on this platform".into()))
     }
 }

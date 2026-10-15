@@ -12,6 +12,13 @@ pub(crate) use ios_player::PlayerEvent;
 
 pub(crate) type Error = ios_player::Error;
 
+pub(crate) fn create(
+    app: &tauri::AppHandle,
+    _cache_dir: &std::path::Path,
+) -> Result<Player, Error> {
+    Player::new(app)
+}
+
 pub(crate) struct Player {
     native: ios_player::IosPlayer<tauri::Wry>,
     events: Option<tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>>,
