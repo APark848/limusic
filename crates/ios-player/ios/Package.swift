@@ -5,7 +5,7 @@ import PackageDescription
 let package = Package(
   name: "limusic-ios-player",
   platforms: [
-    .iOS(.v13),
+    .iOS(.v16),
   ],
   products: [
     .library(
