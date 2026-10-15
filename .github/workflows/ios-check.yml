@@ -91,9 +91,9 @@ jobs:
           cargo tauri ios build --debug --target aarch64-sim \
             --config '{"build":{"beforeBuildCommand":""}}' 2>&1 | tee ios-build.log
 
-      # Headless launch validation only: this proves the generated bundle can be installed and
-      # remains alive after startup. It does not interact with the UI or claim audio playback.
-      - name: Smoke test iOS simulator launch
+      # Headless debug validation: drives the production Rust -> plugin -> AVPlayer -> callback
+      # event path with a deterministic local WAV. It does not use an account or network stream.
+      - name: Smoke test iOS AVPlayer
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -151,9 +151,12 @@ jobs:
           bundle_id="$(plutil -extract CFBundleIdentifier raw "$app_bundle/Info.plist")"
           echo "Installing $app_bundle ($bundle_id)"
           xcrun simctl install "$simulator_udid" "$app_bundle"
+          data_container="$(xcrun simctl get_app_container "$simulator_udid" "$bundle_id" data)"
+          result_file=""
 
           set +e
-          launch_output="$(xcrun simctl launch "$simulator_udid" "$bundle_id" 2>&1)"
+          launch_output="$(env SIMCTL_CHILD_LIMUSIC_IOS_PLAYER_SELF_TEST=1 \
+            xcrun simctl launch "$simulator_udid" "$bundle_id" 2>&1)"
           launch_status=$?
           set -e
           printf '%s\n' "$launch_output" | tee simulator-launch.log
@@ -165,12 +168,28 @@ jobs:
             fail "Could not parse the launched process id"
           fi
 
-          # A startup panic or native integration failure should surface within this window.
-          sleep 12
-          if ! kill -0 "$app_pid" 2>/dev/null; then
-            fail "Limusic exited immediately after launch (pid $app_pid)"
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              fail "Limusic exited during the AVPlayer self-test (pid $app_pid)"
+            fi
+            result_file="$(find "$data_container" -name ios-player-self-test.json -print -quit)"
+            if [ -n "$result_file" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$result_file" ]; then
+            fail "Timed out waiting for the AVPlayer self-test result"
           fi
-          echo "Limusic remained alive after launch (pid $app_pid)"
+          cp "$result_file" ios-player-self-test.json
+          cat ios-player-self-test.json
+          if [ "$(jq -r '.status' ios-player-self-test.json)" != "passed" ]; then
+            fail "The AVPlayer self-test reported a failure"
+          fi
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            fail "Limusic exited after the AVPlayer self-test (pid $app_pid)"
+          fi
+          echo "Limusic AVPlayer self-test passed and the app remains alive (pid $app_pid)"
           trap - ERR
 
       - name: Preserve iOS generation and build logs
@@ -182,6 +201,7 @@ jobs:
             ios-init.log
             ios-build.log
             simulator-launch.log
+            ios-player-self-test.json
             simulator-diagnostics
             src-tauri/gen/apple
           if-no-files-found: warn

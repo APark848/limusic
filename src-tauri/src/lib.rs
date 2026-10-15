@@ -59,6 +59,8 @@ mod webview;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 include!("desktop_app.rs");
 
+#[cfg(all(target_os = "ios", debug_assertions))]
+mod ios_player_self_test;
 #[cfg(target_os = "ios")]
 mod mobile_app;
 

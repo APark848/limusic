@@ -207,9 +207,16 @@ final class LimusicPlayerPlugin: Plugin {
 
   @objc public func load(_ invoke: Invoke) throws {
     let args = try invoke.parseArgs(LoadArgs.self)
-    guard let url = URL(string: args.url), let scheme = url.scheme?.lowercased(),
-          scheme == "http" || scheme == "https"
-    else {
+    guard let url = URL(string: args.url), let scheme = url.scheme?.lowercased() else {
+      invoke.reject("Playback requires a valid stream URL")
+      return
+    }
+    #if DEBUG
+      let supportedSchemes = ["http", "https", "file"]
+    #else
+      let supportedSchemes = ["http", "https"]
+    #endif
+    guard supportedSchemes.contains(scheme) else {
       invoke.reject("Playback requires an HTTP or HTTPS stream URL")
       return
     }
