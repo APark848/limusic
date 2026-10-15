@@ -12,7 +12,7 @@ tauri::ios_plugin_binding!(init_plugin_limusic_player);
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("iOS player bridge: {0}")]
-    Plugin(#[from] tauri::plugin::PluginInvokeError),
+    Plugin(#[from] tauri::plugin::mobile::PluginInvokeError),
     #[error("{0} is not supported by the iOS player")]
     Unsupported(&'static str),
     #[error("the required HTTP header '{0}' is not supported by the iOS player")]
@@ -164,26 +164,26 @@ impl<R: Runtime> IosPlayer<R> {
         if let Some(name) = headers.keys().find(|name| !crate::supported_stream_header(name)) {
             return Err(Error::UnsupportedHeader(name.clone()));
         }
-        self.0.run_mobile_plugin("load", LoadArgs { url, headers, start })?;
+        self.0.run_mobile_plugin::<()>("load", LoadArgs { url, headers, start })?;
         IDLE.store(false, Ordering::SeqCst);
         PLAYING.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn play(&self) -> Result<()> {
-        self.0.run_mobile_plugin("play", ())?;
+        self.0.run_mobile_plugin::<()>("play", ())?;
         PLAYING.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn pause(&self) -> Result<()> {
-        self.0.run_mobile_plugin("pause", ())?;
+        self.0.run_mobile_plugin::<()>("pause", ())?;
         PLAYING.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn stop(&self) -> Result<()> {
-        self.0.run_mobile_plugin("stop", ())?;
+        self.0.run_mobile_plugin::<()>("stop", ())?;
         PLAYING.store(false, Ordering::SeqCst);
         IDLE.store(true, Ordering::SeqCst);
         Ok(())
@@ -193,18 +193,18 @@ impl<R: Runtime> IosPlayer<R> {
         if !position.is_finite() || position < 0.0 {
             return Err(Error::Invalid("seek position must be finite and non-negative"));
         }
-        self.0.run_mobile_plugin("seek", SeekArgs { position }).map_err(Into::into)
+        self.0.run_mobile_plugin::<()>("seek", SeekArgs { position }).map_err(Into::into)
     }
 
     pub fn set_volume(&self, volume: i64) -> Result<()> {
         if !(0..=100).contains(&volume) {
             return Err(Error::Invalid("volume must be between 0 and 100"));
         }
-        self.0.run_mobile_plugin("setVolume", VolumeArgs { volume }).map_err(Into::into)
+        self.0.run_mobile_plugin::<()>("setVolume", VolumeArgs { volume }).map_err(Into::into)
     }
 
     pub fn set_loop(&self, enabled: bool) -> Result<()> {
-        self.0.run_mobile_plugin("setLoop", LoopArgs { enabled }).map_err(Into::into)
+        self.0.run_mobile_plugin::<()>("setLoop", LoopArgs { enabled }).map_err(Into::into)
     }
 
     pub fn is_idle(&self) -> bool {

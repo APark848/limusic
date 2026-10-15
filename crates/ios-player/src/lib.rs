@@ -4,6 +4,8 @@
 //! long-lived playback events back through the iOS FFI hook documented by Tauri, because native
 //! plugin command responses are intentionally one-shot.
 
+#[cfg(target_os = "ios")]
+use tauri::Manager;
 use tauri::{plugin::Builder, plugin::TauriPlugin, Runtime};
 
 #[cfg(any(target_os = "ios", test))]
