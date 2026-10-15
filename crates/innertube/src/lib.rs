@@ -9,6 +9,10 @@ pub mod clients;
 pub mod comments_session;
 pub mod endpoints;
 pub mod models;
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+pub mod rustypipe_fallback;
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[path = "rustypipe_fallback_unavailable.rs"]
 pub mod rustypipe_fallback;
 #[cfg(test)]
 mod test_server;
