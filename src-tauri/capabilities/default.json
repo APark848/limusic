@@ -6,6 +6,11 @@
     "main",
     "mini"
   ],
+  "platforms": [
+    "macOS",
+    "windows",
+    "linux"
+  ],
   "permissions": [
     "core:default",
     "core:webview:allow-set-webview-zoom",
