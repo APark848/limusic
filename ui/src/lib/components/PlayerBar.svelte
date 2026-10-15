@@ -325,7 +325,9 @@
 			</Button>
 		</div>
 		<div class="flex w-full max-w-md items-center gap-2 text-xs text-muted-foreground">
-			<span class="tabular-nums">{fmt(shownPosition)}</span>
+			<!-- Fixed slots, or the seek bar twitches as the position ticks: DM Sans has no tabular
+			     figures, so `tabular-nums` does nothing there (#463). -->
+			<span class="min-w-[5ch] text-right tabular-nums">{fmt(shownPosition)}</span>
 			<input
 				type="range"
 				class="range flex-1"
@@ -337,7 +339,7 @@
 				onchange={onSeekCommit}
 				aria-label={t('player.seek')}
 			/>
-			<span class="tabular-nums">{fmt(playback.duration)}</span>
+			<span class="min-w-[5ch] tabular-nums">{fmt(playback.duration)}</span>
 		</div>
 	</div>
 
