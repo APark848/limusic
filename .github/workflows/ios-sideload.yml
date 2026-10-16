@@ -93,26 +93,46 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          mapfile -t source_ipas < <(
-            find src-tauri/gen/apple/build/arm64 -maxdepth 1 -type f -name '*.ipa' -print
+          source_ipa=""
+          source_ipa_count=0
+          while IFS= read -r candidate; do
+            source_ipa="$candidate"
+            source_ipa_count=$((source_ipa_count + 1))
+          done < <(
+            find "src-tauri/gen/apple/build/arm64" -maxdepth 1 \
+              -type f -name '*.ipa' -print
           )
-          if [ "${#source_ipas[@]}" -ne 1 ]; then
-            printf 'Expected exactly one device IPA, found %s\n' "${#source_ipas[@]}" >&2
-            printf '%s\n' "${source_ipas[@]:-}" >&2
+          if [ "$source_ipa_count" -ne 1 ]; then
+            printf 'Expected exactly one device IPA, found %s\n' "$source_ipa_count" >&2
+            if [ "$source_ipa_count" -eq 0 ]; then
+              echo "(none)" >&2
+            else
+              find "src-tauri/gen/apple/build/arm64" -maxdepth 1 \
+                -type f -name '*.ipa' -print >&2
+            fi
             exit 1
           fi
-          source_ipa="${source_ipas[0]}"
-          mapfile -t archive_apps < <(
-            find src-tauri/gen/apple/build/arm64 -type d \
+
+          archive_app=""
+          archive_app_count=0
+          while IFS= read -r candidate; do
+            archive_app="$candidate"
+            archive_app_count=$((archive_app_count + 1))
+          done < <(
+            find "src-tauri/gen/apple/build/arm64" -type d \
               -path '*.xcarchive/Products/Applications/*.app' -print
           )
-          if [ "${#archive_apps[@]}" -ne 1 ]; then
+          if [ "$archive_app_count" -ne 1 ]; then
             printf 'Expected exactly one archived device app, found %s\n' \
-              "${#archive_apps[@]}" >&2
-            printf '%s\n' "${archive_apps[@]:-}" >&2
+              "$archive_app_count" >&2
+            if [ "$archive_app_count" -eq 0 ]; then
+              echo "(none)" >&2
+            else
+              find "src-tauri/gen/apple/build/arm64" -type d \
+                -path '*.xcarchive/Products/Applications/*.app' -print >&2
+            fi
             exit 1
           fi
-          archive_app="${archive_apps[0]}"
           extract_dir="$(mktemp -d "$RUNNER_TEMP/limusic-ipa.XXXXXX")"
 
           python3 - "$source_ipa" "$extract_dir" <<'PY'
