@@ -223,12 +223,12 @@ async fn run_remote(
     .await
     {
         Ok(Ok(data)) => data,
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
             write_remote_failure(
                 &result_path,
                 "external-service",
                 "resolver",
-                "The anonymous production resolver did not return a playable stream",
+                &format!("The anonymous production resolver failed: {error}"),
             );
             return;
         }
