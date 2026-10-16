@@ -45,7 +45,10 @@ pub(crate) fn spawn(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared)
     std::thread::Builder::new()
         .name("ios-player-self-test".to_owned())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_time().build()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -213,14 +216,28 @@ async fn run_remote(
     let _ = write_progress(&result_path, "resolving-public-track");
     while events.try_recv().is_ok() {}
 
-    let data = match state.resolve(PUBLIC_VIDEO_ID, false, 240).await {
-        Ok(data) => data,
-        Err(_) => {
+    let data = match tokio::time::timeout(
+        Duration::from_secs(45),
+        state.resolve(PUBLIC_VIDEO_ID, false, 240),
+    )
+    .await
+    {
+        Ok(Ok(data)) => data,
+        Ok(Err(_)) => {
             write_remote_failure(
                 &result_path,
                 "external-service",
                 "resolver",
                 "The anonymous production resolver did not return a playable stream",
+            );
+            return;
+        }
+        Err(_) => {
+            write_remote_failure(
+                &result_path,
+                "external-service",
+                "resolver-timeout",
+                "The anonymous production resolver did not finish within 45 seconds",
             );
             return;
         }
