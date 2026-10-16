@@ -906,6 +906,8 @@ fn parse_profile(body: &serde_json::Value) -> Option<Profile> {
 pub(crate) fn open_browser(url: &str) -> Result<(), String> {
     let url = web_url(url)?;
     let url = url.as_str();
+    #[cfg(target_os = "ios")]
+    return Err("opening external links is not supported by the iOS playback MVP".into());
     #[cfg(target_os = "linux")]
     let cmd = {
         let mut cmd = std::process::Command::new("xdg-open");
@@ -935,7 +937,8 @@ pub(crate) fn open_browser(url: &str) -> Result<(), String> {
             Err(std::io::Error::last_os_error())
         }
     };
-    cmd.map_err(|e| format!("Couldn't open the browser: {e}"))
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    return cmd.map_err(|e| format!("Couldn't open the browser: {e}"));
 }
 
 /// Only http(s), and re-serialised: the parser percent-encodes quotes, spaces and angle brackets,

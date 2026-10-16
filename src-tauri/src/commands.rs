@@ -211,6 +211,7 @@ pub async fn seek(state: St<'_>, position: f64) -> Result<(), String> {
 #[tauri::command]
 pub async fn set_volume(state: St<'_>, volume: i64) -> Result<(), String> {
     state.player.set_volume(volume).map_err(|e| e.to_string())?;
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     if volume > 0 {
         crate::hotkeys::LAST_NONZERO_VOLUME.store(volume, std::sync::atomic::Ordering::Relaxed);
     }
@@ -404,6 +405,7 @@ pub async fn set_setting(
     // startup repoints an existing entry at the running binary (lib.rs). Before the write, so a
     // failure leaves the setting as it was. A dev build would register itself, and at login its
     // window needs a vite server that isn't running.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     if key == "autostart" {
         if tauri::is_dev() {
             return Err(
@@ -420,6 +422,21 @@ pub async fn set_setting(
             Ok(())
         };
         res.map_err(|e| format!("autostart: {e}"))?;
+    }
+    #[cfg(target_os = "ios")]
+    if matches!(
+        key.as_str(),
+        "autostart"
+            | "system_titlebar"
+            | "discord_rpc"
+            | "discord_rpc_config"
+            | "music_videos"
+            | "videos_first"
+            | "crossfade"
+            | "crossfade_secs"
+            | "normalize_volume"
+    ) {
+        return Err(format!("{key} is not supported on iOS"));
     }
     state.db.set_setting(&key, &value);
     // A music video track already playing gets its picture now rather than from the next track.
@@ -482,7 +499,7 @@ pub async fn set_setting(
     }
     // Hand the frame back to the compositor (or take it again). macOS is not on this path: its
     // titlebar style is fixed at window creation, so the setting is hidden there.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     if key == "system_titlebar" {
         use tauri::Manager;
         if let Some(w) = app.get_webview_window("main") {
@@ -493,6 +510,7 @@ pub async fn set_setting(
 }
 
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn get_global_hotkeys(
     hotkeys: State<'_, Arc<crate::hotkeys::HotkeysManager>>,
 ) -> Result<crate::hotkeys::HotkeysConfig, String> {
@@ -502,11 +520,13 @@ pub async fn get_global_hotkeys(
 /// A Wayland session, where the X11 grab the hotkeys use only fires if the compositor passes keys
 /// on to XWayland (KDE Plasma does, GNOME does not). The GDK backend doesn't matter, the session does.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub fn global_hotkeys_on_wayland() -> bool {
     cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn set_global_hotkeys(
     app: tauri::AppHandle,
     state: St<'_>,
@@ -521,6 +541,7 @@ pub async fn set_global_hotkeys(
 }
 
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn reset_global_hotkeys(
     app: tauri::AppHandle,
     state: St<'_>,
@@ -581,6 +602,7 @@ pub async fn allow_font_file(app: tauri::AppHandle, path: String) -> Result<(), 
 /// Set the app icon to a PNG the user picked, or clear it back to the bundled one with `None`.
 /// The file is copied rather than referenced (see appicon.rs).
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn set_app_icon(app: tauri::AppHandle, path: Option<String>) -> Result<(), String> {
     let dest = crate::appicon::path(&app).ok_or("no app data directory")?;
     match path {
@@ -641,9 +663,17 @@ pub async fn set_app_icon(app: tauri::AppHandle, path: Option<String>) -> Result
     Ok(())
 }
 
+#[tauri::command]
+#[cfg(target_os = "ios")]
+pub async fn set_app_icon(path: Option<String>) -> Result<(), String> {
+    let _ = path;
+    Err("custom application icons are not supported on iOS".into())
+}
+
 /// The custom icon's path, granted to the asset protocol so the in-app logo can render it. `None`
 /// when the bundled icon is in use.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn app_icon_path(app: tauri::AppHandle) -> Result<Option<String>, String> {
     use tauri::Manager;
     let Some(p) = crate::appicon::custom_path(&app) else { return Ok(None) };
@@ -654,6 +684,12 @@ pub async fn app_icon_path(app: tauri::AppHandle) -> Result<Option<String>, Stri
         let _ = scope.allow_file(real);
     }
     Ok(Some(p.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
+#[cfg(target_os = "ios")]
+pub async fn app_icon_path() -> Result<Option<String>, String> {
+    Ok(None)
 }
 
 /// Wipe both cache tiers (URL cache + mpv on-disk audio cache). context/14.
@@ -737,6 +773,7 @@ pub async fn get_playback(state: St<'_>) -> Result<serde_json::Value, String> {
 
 /// Swap the app for the floating widget: the main window hides to the tray behind it.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
     // GTK wants window creation on the main thread, so hop and post the result back rather than
     // logging a failure the user would only see as a click that did nothing.
@@ -752,6 +789,7 @@ pub async fn open_mini(app: tauri::AppHandle) -> Result<(), String> {
 /// Swap back. Same path as the tray, so the widget and the tray can't disagree about what
 /// "show Limusic" means.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn close_mini(app: tauri::AppHandle) -> Result<(), String> {
     crate::tray::show_main(&app);
     Ok(())
@@ -759,6 +797,7 @@ pub async fn close_mini(app: tauri::AppHandle) -> Result<(), String> {
 
 /// The widget's shrink/expand button (#301).
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn set_mini_compact(app: tauri::AppHandle, compact: bool) -> Result<(), String> {
     crate::mini::set_compact(&app, compact)
 }
@@ -766,19 +805,31 @@ pub async fn set_mini_compact(app: tauri::AppHandle, compact: bool) -> Result<()
 /// The arguments this process was launched with, handed over once (#348). See `LAUNCH_ARGS`.
 #[tauri::command]
 pub fn take_launch_args() -> Vec<String> {
-    std::mem::take(&mut *crate::LAUNCH_ARGS.lock().unwrap())
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    return std::mem::take(&mut *crate::LAUNCH_ARGS.lock().unwrap());
+    #[cfg(target_os = "ios")]
+    Vec::new()
 }
 
 #[tauri::command]
 pub async fn show_main(state: St<'_>, window: tauri::WebviewWindow) -> Result<bool, String> {
-    if crate::should_start_minimized(&state.db) {
-        return Ok(false);
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+    {
+        if crate::should_start_minimized(&state.db) {
+            return Ok(false);
+        }
+        window.show().map_err(|e| e.to_string())?;
+        window.unminimize().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+        crate::tray::set_main_visible(window.app_handle(), true);
+        Ok(true)
     }
-    window.show().map_err(|e| e.to_string())?;
-    window.unminimize().map_err(|e| e.to_string())?;
-    window.set_focus().map_err(|e| e.to_string())?;
-    crate::tray::set_main_visible(window.app_handle(), true);
-    Ok(true)
+    #[cfg(target_os = "ios")]
+    {
+        let _ = state;
+        window.show().map_err(|e| e.to_string())?;
+        Ok(true)
+    }
 }
 
 // --- browse / library (context/08) ---------------------------------------------------------
@@ -2452,6 +2503,7 @@ pub async fn release_notes() -> Result<Vec<ReleaseNote>, String> {
 ///
 /// Reads the same `Env::appimage` the updater plugin decides on, so the two cannot disagree.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub fn can_self_update(app: tauri::AppHandle) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -2494,6 +2546,7 @@ pub struct BetaUpdate {
 /// Any different version counts, same as `allowDowngrades` on stable: the pointer only moves forward
 /// by itself, so a lower version there is a beta rollback somebody made on purpose.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn check_beta_update(webview: tauri::Webview) -> Result<Option<BetaUpdate>, String> {
     use tauri::Manager;
     use tauri_plugin_updater::UpdaterExt;
@@ -2520,6 +2573,7 @@ pub async fn check_beta_update(webview: tauri::Webview) -> Result<Option<BetaUpd
 /// Open a link from the UI in the real browser. An `<a href>` inside the webview would navigate
 /// the app itself off the SPA, with no way back.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub async fn open_external(url: String) -> Result<(), String> {
     crate::lastfm::open_browser(&url)
 }
@@ -2651,6 +2705,7 @@ pub async fn listenbrainz_profile(
 /// with SWP_FRAMECHANGED to force one recalculation with the fullscreen flag set. On the main
 /// thread, where the window messages run inline and the order is guaranteed.
 #[tauri::command]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub fn theater_fullscreen(window: tauri::WebviewWindow, on: bool) -> Result<(), String> {
     #[cfg(not(target_os = "windows"))]
     {

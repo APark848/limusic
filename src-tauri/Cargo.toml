@@ -10,6 +10,9 @@ rust-version = "1.80"
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+ios-player-self-test = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -92,6 +95,9 @@ tauri = { version = "2", features = ["test"] }
 # mac-notification-sys and tao already pull in.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+
+[target.'cfg(target_os = "ios")'.dependencies]
+ios-player = { path = "../crates/ios-player" }
 
 # Taskbar thumbnail toolbar (#47). Same `windows` version tauri-runtime-wry already pulls in, so
 # `Window::hwnd()` hands us a matching HWND.

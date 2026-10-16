@@ -1,64 +1,12 @@
 // Limusic desktop app. Wires transport + player + db + orchestrator behind the command boundary.
 
-mod appicon;
-mod audioproxy;
-mod blocked;
-mod cipher;
-mod commands;
-mod db;
-mod diagnostics;
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod discord;
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-use platform::mobile_services::discord;
-mod hotkeys;
-mod http;
-mod import;
-#[cfg(target_os = "linux")]
-mod inhibit;
-mod lastfm;
-mod listenbrainz;
-mod listentogether;
-mod local;
-mod lyrics;
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod media;
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-use platform::mobile_services::media;
-mod mini;
-#[cfg(target_os = "linux")]
-mod nativevideo;
-#[cfg(windows)]
-#[path = "nativevideo_windows.rs"]
-mod nativevideo;
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
-mod notify;
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
-use platform::mobile_services::notify;
-mod orchestrator;
-mod potoken;
-mod romanize;
-mod session;
-mod spotify;
-mod state;
-#[cfg(target_os = "windows")]
-mod taskbar;
-mod tray;
-mod videoproxy;
-mod webview;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use innertube::{Clients, InnerTube, Locale, Session};
-use platform::player::{Player, PlayerEvent};
 use tauri::{Emitter, Manager};
 
-use cipher::{CipherDeobfuscator, PlayerConfigStore};
 use db::Db;
-use orchestrator::Orchestrator;
-use potoken::PoTokenGenerator;
 use state::AppState;
 
 /// Hand glibc's freed-but-retained heap back to the OS every few minutes.
@@ -505,12 +453,10 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // App data dir for the SQLite file and mpv's on-disk audio cache.
+            // App data dir for the SQLite file and player cache.
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
             std::fs::create_dir_all(&data_dir).ok();
             init_logging(&data_dir);
-            let cache_dir = data_dir.join("audio-cache");
-            std::fs::create_dir_all(&cache_dir).ok();
 
             // Shared: the PoToken generator persists its session token through the same file,
             // and it is built before AppState takes ownership of everything else.
@@ -562,128 +508,25 @@ pub fn run() {
                         .build()?;
                 keep_on_screen(&w);
             }
-            let cookie = db.get_setting("session_cookie").filter(|s| !s.is_empty());
-            let data_sync_id = state::persisted_data_sync_id(&db);
-            let visitor_data = db.get_setting("visitor_data").filter(|s| !s.is_empty());
-            // First run (no stored visitorData): bootstrap it in the background after the window is
-            // up, rather than blocking setup on a network GET (up to 60s on a bad connection). See
-            // the spawned task after AppState is created.
-            let needs_visitor_bootstrap = visitor_data.is_none();
-            if cookie.is_some() {
-                tracing::info!("loaded persisted login session");
-            }
-
-            let visitor_for_prewarm = visitor_data.clone();
-            let session = Session { locale: Locale::default(), visitor_data, data_sync_id, cookie };
-            let it = match InnerTube::new(session, proxy.as_deref()) {
-                Ok(it) => it,
-                Err(e) => fatal("Limusic could not start its network client", &e.to_string()),
-            };
-            // Shelf titles, mood chips and playlist subtitles are YouTube's text, so the UI's
-            // language has to go out with the request (#274). Persisted rather than pushed from the
-            // SPA at startup, because the first home fetch is already in flight by the time the
-            // webview could tell us; the SPA writes it whenever it changes (`set_setting`).
-            if let Some(hl) = db.get_setting("locale") {
-                it.set_locale(&hl);
-            }
-            it.set_hide_videos(db.get_setting("hide_videos").as_deref() == Some("true"));
             // Read while `db` is still ours; the window is decorated further down, once the rest of
             // the setup that could fail is out of the way.
             #[cfg_attr(target_os = "macos", allow(unused_variables))]
             let system_titlebar = db.get_setting("system_titlebar").as_deref() == Some("true");
-            it.set_blocked(blocked::block_list(&db));
-            let clients = Clients::bundled();
-
-            let mut player = match Player::new(&cache_dir.to_string_lossy()) {
-                Ok(p) => p,
-                Err(e) => fatal(
-                    "Limusic could not load libmpv, which it uses to play audio",
-                    &format!(
-                        "{e}. On Linux, install your distribution's mpv library \
-                         (Fedora: mpv-libs, Debian/Ubuntu: libmpv2)."
-                    ),
-                ),
+            let core = match shared_app::build(app, &data_dir, db, proxy.as_deref()) {
+                Ok(core) => core,
+                Err(e) => fatal("Limusic could not initialize its playback state", &e.to_string()),
             };
-            // The audio bytes are the one request that never went through the proxy setting (#241).
-            if let Err(e) = player.set_http_proxy(proxy.as_deref()) {
-                tracing::warn!("mpv refused the proxy setting: {e}");
-            }
-            // Before anything can play: the first track of a restored queue has to come out at the
-            // level the user left, not at 100.
+            let db = core.db;
+            let app_state = core.state;
             let volume = state::saved_volume(&db);
-            let _ = player.set_volume(volume);
             if volume > 0 {
                 // The level a mute hotkey returns to, when the app muted before any change.
                 hotkeys::LAST_NONZERO_VOLUME.store(volume, std::sync::atomic::Ordering::Relaxed);
-            }
-            player.set_crossfade(state::saved_crossfade(&db));
-            let events = match player.take_events() {
-                Some(ev) => ev,
-                None => fatal(
-                    "Limusic could not start its audio event loop",
-                    "the player's event channel was already taken, which is a bug",
-                ),
-            };
-
-            // Phase 2 extraction stack: cipher + PoToken hidden webviews behind the orchestrator.
-            let config = Arc::new(PlayerConfigStore::new(&data_dir));
-            let cipher = Arc::new(CipherDeobfuscator::new(handle.clone(), &data_dir, config));
-            let potoken = Arc::new(PoTokenGenerator::new(db.clone()));
-            let orchestrator = Arc::new(Orchestrator::new(
-                it.clone(),
-                clients.clone(),
-                cipher.clone(),
-                potoken.clone(),
-            ));
-
-            // OS media controls (MPRIS/SMTC/NowPlaying). Its callback resolves AppState lazily, so
-            // it's fine to spawn before AppState is managed. context/16, D11.
-            let media = media::spawn(handle.clone());
-            // MPRIS starts at 1.0 and would show 100% until the first change.
-            if let Some(m) = &media {
-                m.set_volume(volume);
             }
             // Taskbar preview buttons (#47). Windows-only, and a different API from the SMTC
             // session above.
             #[cfg(target_os = "windows")]
             taskbar::init(&handle);
-
-            // Discord rich presence — off unless the user opted in; parks on its channel until then.
-            let discord = discord::spawn(
-                db.get_setting("discord_rpc").as_deref() == Some("true"),
-                discord::RpcConfig::parse(db.get_setting("discord_rpc_config").as_deref()),
-            );
-
-            // Scrobbler — one task, one clock for Last.fm + ListenBrainz. Each half parks until
-            // its own credential exists (session key via the titlebar flow, user token via settings).
-            let lastfm = lastfm::spawn(
-                handle.clone(),
-                db.get_setting("lastfm_session_key").filter(|s| !s.is_empty()),
-                db.get_setting("listenbrainz_token").filter(|s| !s.is_empty()),
-                lastfm::ScrobbleConfig::load(&db),
-            );
-
-            // Listen Together session (context/19). Server URL is a DB setting so "home PC → VPS" is
-            // config, not a rebuild. The sync channel feeds the guest-playback bridge below.
-            // Empty means the built-in default, which `LtSession` resolves when it connects. The
-            // URL does not live here so that nothing ever has to hand it to the UI.
-            let lt_url = db.get_setting("lt_server_url").unwrap_or_default();
-            let (lt, lt_sync_rx) = listentogether::LtSession::new(handle.clone(), lt_url);
-
-            let app_state = Arc::new(AppState::new(
-                it,
-                clients,
-                player,
-                db.clone(),
-                handle.clone(),
-                orchestrator,
-                lt,
-                cache_dir.clone(),
-                media,
-                discord,
-                lastfm,
-            ));
-            app.manage(app_state.clone());
 
             // The player view's <video> pulls its bytes from Rust over loopback, so the webview
             // never sees a googlevideo URL (context/11). videoproxy.rs explains why a socket and
@@ -738,144 +581,8 @@ pub fn run() {
                 appicon::apply(&handle);
             }
 
-            // Bridge: apply Listen Together sync commands (guest playback / host seed) to AppState.
-            {
-                let st = app_state.clone();
-                let mut rx = lt_sync_rx;
-                tauri::async_runtime::spawn(async move {
-                    while let Some(cmd) = rx.recv().await {
-                        st.apply_sync(cmd).await;
-                    }
-                });
-            }
-
-            // Restore the last session's queue (paused, not autoplaying). context/11 §state.
-            {
-                let st = app_state.clone();
-                tauri::async_runtime::spawn(async move {
-                    st.restore_queue().await;
-                });
-            }
-
-            // First-run visitorData bootstrap, off the startup path. `set_visitor_data` writes
-            // through the shared session (Arc<RwLock>), so the orchestrator's InnerTube clone sees
-            // it; resolves degrade gracefully (no PoToken) until it lands. context/04 §A.
-            if needs_visitor_bootstrap {
-                let st = app_state.clone();
-                let potoken = potoken.clone();
-                tauri::async_runtime::spawn(async move {
-                    match st.it.fetch_visitor_data().await {
-                        Ok(vd) => {
-                            st.it.set_visitor_data(Some(vd.clone()));
-                            st.db.set_setting("visitor_data", &vd);
-                            tracing::info!("visitorData bootstrapped (background)");
-                            potoken.prewarm(&vd).await;
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "visitorData bootstrap failed (continuing)")
-                        }
-                    }
-                });
-            }
-
-            // Keep the login alive by itself (#165 / KI-2). Two signals from the transport:
-            // `cookie_changed` when a response rotated `__Secure-*SIDTS` (persist it, or the next
-            // launch starts from a dead snapshot again), and `session_rejected` when YouTube
-            // turned the session down (re-mint it from the login webview's own Google session,
-            // instead of leaving the user with a "sign in again" they have to act on).
-            {
-                let st = app_state.clone();
-                let app_handle = handle.clone();
-                let rejected = st.it.session_rejected();
-                let rotated = st.it.cookie_changed();
-                tauri::async_runtime::spawn(async move {
-                    // Ask once, up front, rather than waiting for whatever the UI happens to
-                    // request first: the app can start straight to the tray, with nothing on
-                    // screen to run into the dead session and report it. One request, and the
-                    // 401 it may come back with goes down the same healing path as any other.
-                    if st.it.is_logged_in() {
-                        if let Some(client) = st.clients.get(innertube::METADATA_CLIENT) {
-                            // No heal-waiting for it: this runs *before* the loop below, so
-                            // there is nobody to answer a wait yet, and a dead session would
-                            // stall the healer's own startup for the whole timeout. Its 401
-                            // raises the flag instead, and the loop picks that up on entry.
-                            let _ = innertube::without_healing(st.it.account_menu(client)).await;
-                        }
-                    }
-                    // Google rolls its short-lived tokens on the requests the app makes, so an
-                    // idle night leaves the jar to expire on its own. Half-hourly is well inside
-                    // the window and costs one request.
-                    let mut keepalive = tokio::time::interval(Duration::from_secs(30 * 60));
-                    keepalive.tick().await; // the first tick is immediate; the ping above covered it
-                    loop {
-                        tokio::select! {
-                            _ = rejected.notified() => {
-                                // The guard is what parked requests are watching: while it lives
-                                // they keep waiting however long this takes, and dropping it
-                                // releases them whether or not anything was re-minted. They retry
-                                // either way, so the ones that really are dead can say so instead
-                                // of holding a spinner until the timeout.
-                                let _heal = st.it.begin_heal();
-                                innertube::without_healing(
-                                    session::refresh_session(app_handle.clone(), st.clone()),
-                                )
-                                .await;
-                            }
-                            _ = rotated.notified() => st.persist_rotated_cookie(),
-                            _ = keepalive.tick() => st.keep_session_alive().await,
-                        }
-                    }
-                });
-            }
-
-            // Pump mpv events → UI events + queue advance. context/11 events, context/14 §TrackEnded.
             #[cfg(any(target_os = "linux", windows))]
             let video_state = app_state.clone();
-            spawn_event_pump(app_state, handle, events);
-
-            // Prewarm the webviews off the first-play path (context/04 §startup). The delays let
-            // the event loop come up first (run_on_main_thread needs it pumping).
-            {
-                let cipher = cipher.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
-                    cipher.prewarm().await;
-                });
-            }
-            if let Some(vd) = visitor_for_prewarm {
-                let potoken = potoken.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(2500)).await;
-                    potoken.prewarm(&vd).await;
-                });
-            }
-            // Mint-and-destroy policy (Phase-0 decision), now applied to the BotGuard V8 isolate
-            // rather than a webview. Measured: the live isolate costs ~92 MB RSS, of which a
-            // teardown returns ~39 MB (the rest is V8 platform + arenas, retained for the life of
-            // the process once BotGuard has run at all).
-            //
-            // The idle window has to outlast a track, not a track gap. The gapless lookahead mints
-            // for the next track seconds after the current one starts, so the runtime then sits
-            // idle for the whole song: at 60s it was torn down and rebuilt once per track, and a
-            // cold bootstrap (~0.8-2.3s) landed on the critical path whenever a track started from
-            // a stop. 10 minutes covers any normal song, so continuous playback keeps one isolate,
-            // and the memory still comes back ten minutes after the user stops listening.
-            //
-            // The cipher webview rides the same tick, for the same reason: it is a whole
-            // `WebKitWebProcess` (91 MiB PSS / 234 MiB RSS measured on Fedora) held for two
-            // functions that run once per track resolve. Not on Windows, where rebuilding it
-            // freezes the app: see `CipherDeobfuscator::teardown_if_idle` (issue #288).
-            {
-                let potoken = potoken.clone();
-                let cipher = cipher.clone();
-                tauri::async_runtime::spawn(async move {
-                    loop {
-                        tokio::time::sleep(Duration::from_secs(30)).await;
-                        potoken.teardown_if_idle(Duration::from_secs(600)).await;
-                        cipher.teardown_if_idle(Duration::from_secs(600)).await;
-                    }
-                });
-            }
 
             // Hand the frame to the compositor when the user asked for it (issue #65). The window
             // is created undecorated, so this is the one place that reverses it; macOS never gets
@@ -1156,125 +863,10 @@ fn close_hides(setting: Option<&str>) -> bool {
     setting != Some("false")
 }
 
-/// Decide whether a position tick is worth forwarding to the UI. Passes ~4 Hz of steady
-/// playback through, plus any discontinuity (seek/track change) immediately so the slider
-/// never lags a jump. Pure so it's testable; the pump owns the state.
-// ponytail: fixed 250ms cadence; make it adaptive only if someone ever wants sub-second UI time.
-struct PositionThrottle {
-    last_emit: std::time::Instant,
-    last_pos: f64,
-}
-
-impl PositionThrottle {
-    fn new() -> Self {
-        Self {
-            last_emit: std::time::Instant::now() - std::time::Duration::from_secs(1),
-            last_pos: f64::NAN,
-        }
-    }
-    fn should_emit(&mut self, pos: f64, now: std::time::Instant) -> bool {
-        let dt = now.duration_since(self.last_emit);
-        // A jump is any move that couldn't be normal playback since the last emit (+0.75s slack).
-        let jumped =
-            self.last_pos.is_nan() || (pos - self.last_pos).abs() > dt.as_secs_f64() + 0.75;
-        if jumped || dt >= std::time::Duration::from_millis(250) {
-            self.last_emit = now;
-            self.last_pos = pos;
-            return true;
-        }
-        false
-    }
-}
-
-fn spawn_event_pump(
-    state: Arc<AppState>,
-    app: tauri::AppHandle,
-    mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
-) {
-    tauri::async_runtime::spawn(async move {
-        let mut throttle = PositionThrottle::new();
-        while let Some(ev) = events.recv().await {
-            match ev {
-                PlayerEvent::Position(p) => {
-                    if throttle.should_emit(p, std::time::Instant::now()) {
-                        let _ = app.emit("position", serde_json::json!({ "position": p }));
-                    }
-                    state.on_position(p).await;
-                }
-                PlayerEvent::Duration(d) => {
-                    let _ = app.emit("duration", serde_json::json!({ "duration": d }));
-                    state.on_duration(d).await;
-                }
-                PlayerEvent::Playing(playing) => {
-                    let _ = app.emit("playback-state", if playing { "playing" } else { "paused" });
-                    if !playing {
-                        state.flush_position(); // persist exact resume position on pause
-                        let _ = app.emit(
-                            "position",
-                            serde_json::json!({ "position": state.current_position() }),
-                        );
-                    }
-                    state.media_set_playing(playing);
-                    // Keep the tray's toggle label honest — this arm is the same chokepoint
-                    // MPRIS uses, so tray state can't drift from media-key state.
-                    tray::set_playing(&app, playing);
-                }
-                // Listen Together host: broadcast a pause/resume. Not from `Playing`, which also
-                // flips when a track runs out, and that arrives here after the next track was
-                // announced (`on_track_ended` loads it on this pump), with the old track's end as
-                // the position. Guests then seek the new track to it, past the end of a shorter one.
-                PlayerEvent::Paused(paused) => state.lt_on_play_state(!paused).await,
-                PlayerEvent::TrackEnded => {
-                    state.on_track_ended().await;
-                }
-                PlayerEvent::TrackFailed(msg) => {
-                    // The track died (dead/403 URL etc). on_track_failed records a WEB_REMIX 403
-                    // (context/06 §2), evicts the poisoned cache, and retries the track once via
-                    // the fallback clients — only toast the error if it gave up and advanced.
-                    //
-                    // Read the client before the retry: it advances the queue when it gives up,
-                    // and which client served the dead URL is the one fact a bug report has to
-                    // carry. Nobody can read the log on Windows (no console, no log file), so it
-                    // goes in the message the user can see and copy. Issue #71.
-                    let client = state.current_stream_client().await;
-                    tracing::warn!(error = %msg, client = ?client, "track failed");
-                    if !state.on_track_failed().await {
-                        let msg = match client {
-                            Some(c) => format!("{msg} ({c})"),
-                            None => msg,
-                        };
-                        let _ = app.emit("playback-error", serde_json::json!({ "message": msg }));
-                    }
-                }
-                PlayerEvent::AudioDeviceLost => {
-                    tracing::warn!("audio device unavailable, holding the queue where it is");
-                    state.on_audio_device_lost().await;
-                    let _ = app.emit(
-                        "playback-error",
-                        serde_json::json!({
-                            "message": "Your audio device is unavailable. Press play once it's back."
-                        }),
-                    );
-                }
-                PlayerEvent::LookaheadFailed(msg) => {
-                    // No toast: the user is still hearing the current track and nothing they can
-                    // see has gone wrong. The only thing owed is the eviction.
-                    tracing::warn!(error = %msg, "lookahead preload failed");
-                    state.on_lookahead_failed().await;
-                }
-                PlayerEvent::VideoFailed(audio) => state.on_video_failed(&audio).await,
-                PlayerEvent::Error(msg) => {
-                    tracing::error!(error = %msg, "player error");
-                    let _ = app.emit("playback-error", serde_json::json!({ "message": msg }));
-                }
-            }
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{close_hides, PositionThrottle};
+    use super::close_hides;
+    use crate::shared_app::PositionThrottle;
     use std::time::{Duration, Instant};
 
     #[tauri::command]

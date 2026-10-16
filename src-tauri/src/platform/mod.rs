@@ -10,12 +10,28 @@ pub(crate) mod desktop;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 pub(crate) mod player {
     pub(crate) use ::player::{Player, PlayerEvent};
+
+    pub(crate) fn create(
+        _app: &tauri::AppHandle,
+        cache_dir: &std::path::Path,
+    ) -> Result<Player, ::player::Error> {
+        Player::new(&cache_dir.to_string_lossy())
+    }
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
 pub(crate) mod mobile_services;
 
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "ios")]
+#[path = "ios_player.rs"]
+pub(crate) mod player;
+
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "ios"
+)))]
 pub(crate) mod player {
     use std::collections::HashMap;
 

@@ -101,12 +101,13 @@ impl Bridge {
         let label2 = label.to_string();
         let ready_slot2 = ready_slot.clone();
         app.run_on_main_thread(move || {
-            let res = crate::http::proxied(WebviewWindowBuilder::new(&app2, label2, webview_url))
-                .visible(false)
-                .inner_size(1.0, 1.0)
-                .skip_taskbar(true)
-                .decorations(false)
-                .focused(false)
+            let builder =
+                crate::http::proxied(WebviewWindowBuilder::new(&app2, label2, webview_url))
+                    .visible(false)
+                    .inner_size(1.0, 1.0);
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+            let builder = builder.skip_taskbar(true).decorations(false).focused(false);
+            let res = builder
                 .on_page_load(move |_wv, payload| {
                     if matches!(payload.event(), PageLoadEvent::Finished) {
                         if let Some(tx) = ready_slot2.lock().unwrap().take() {

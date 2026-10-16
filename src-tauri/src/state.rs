@@ -2262,6 +2262,11 @@ impl AppState {
     /// waterfall fails again on the event pump (and used to wedge until a manual skip).
     /// ponytail: at most 3 removals per prime so a network outage can't eat the whole queue.
     async fn prime_lookahead(self: &std::sync::Arc<Self>, gen: u64) {
+        // AVPlayer owns one current item in the iOS MVP. Gapless lookahead is an mpv feature and
+        // deliberately remains unavailable until it has a native design of its own.
+        #[cfg(target_os = "ios")]
+        return;
+
         // A guest plays whatever the host announces next, and a primed entry would let mpv move on
         // by itself into a track the room may not be playing.
         if self.lt.is_guest().await {
@@ -2387,6 +2392,11 @@ impl AppState {
     /// gets no `af` at all, so the master plays exactly as mastered: no attenuation, no boost and
     /// no limiter (#298). Every load path routes through here, so the switch cannot half-apply.
     fn track_gain(&self, loudness_db: Option<f64>) -> Option<f64> {
+        // AVPlayer has no equivalent of mpv's per-track audio filter in the playback MVP.
+        #[cfg(target_os = "ios")]
+        return None;
+
+        #[cfg(not(target_os = "ios"))]
         (self.db.get_setting("normalize_volume").as_deref() != Some("false"))
             .then(|| loudness_gain(loudness_db))
             .flatten()
@@ -4543,6 +4553,11 @@ pub fn native_video() -> bool {
 /// realtime; the proxy re-issues it as bounded ranges, which are served at full speed, so both the
 /// first play and every seek start sooner. audioproxy.rs has the numbers and the kill-switch.
 fn mpv_stream_url(data: &PlaybackData) -> String {
+    // iOS loads the remote asset directly so AVURLAsset can apply the resolved request headers.
+    // The loopback range proxy exists solely to compensate for mpv/ffmpeg behaviour.
+    #[cfg(target_os = "ios")]
+    return data.stream_url.clone();
+
     // A user proxy reaches mpv as `http-proxy` (#241), and ffmpeg would send the loopback request
     // through it, and it cannot reach our 127.0.0.1, so audio would go silent. Hand mpv the
     // googlevideo URL instead and let the user's proxy carry it: no chunked proxy, but working
