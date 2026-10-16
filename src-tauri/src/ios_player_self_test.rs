@@ -14,15 +14,21 @@ use crate::state::AppState;
 const RESULT_FILE: &str = "ios-player-self-test.json";
 const FIXTURE_SECONDS: f64 = 8.0;
 const SEEK_SECONDS: f64 = 4.0;
+const START_DELAY: Duration = Duration::from_secs(2);
 
 static EVENT_TAP: OnceLock<Mutex<Option<UnboundedSender<PlayerEvent>>>> = OnceLock::new();
 
-pub(crate) fn install_event_tap() -> UnboundedReceiver<PlayerEvent> {
+pub(crate) struct Prepared {
+    events: UnboundedReceiver<PlayerEvent>,
+}
+
+pub(crate) fn prepare(data_dir: &Path) -> std::io::Result<Prepared> {
     let (tx, rx) = unbounded_channel();
     if let Ok(mut tap) = EVENT_TAP.get_or_init(|| Mutex::new(None)).lock() {
         *tap = Some(tx);
     }
-    rx
+    write_progress(&data_dir.join(RESULT_FILE), "prepared")?;
+    Ok(Prepared { events: rx })
 }
 
 pub(crate) fn observe_event(event: &PlayerEvent) {
@@ -33,16 +39,12 @@ pub(crate) fn observe_event(event: &PlayerEvent) {
     }
 }
 
-pub(crate) fn spawn(
-    state: Arc<AppState>,
-    data_dir: PathBuf,
-    events: UnboundedReceiver<PlayerEvent>,
-) {
+pub(crate) fn spawn(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared) {
     tauri::async_runtime::spawn(async move {
         let result_path = data_dir.join(RESULT_FILE);
-        let _ = std::fs::remove_file(&result_path);
-        write_progress(&result_path, "starting");
-        let result = run(state, &data_dir, &result_path, events).await;
+        let _ = write_progress(&result_path, "starting");
+        tokio::time::sleep(START_DELAY).await;
+        let result = run(state, &data_dir, &result_path, prepared.events).await;
         let report = match result {
             Ok(observed) => serde_json::json!({
                 "status": "passed",
@@ -72,9 +74,9 @@ async fn run(
         .to_string();
     let mut observed = vec!["constructed"];
 
-    write_progress(result_path, "loading");
+    write_progress(result_path, "loading")?;
     state.player.load(&fixture_url, &HashMap::new(), None, None).context("load failed")?;
-    write_progress(result_path, "waiting-for-duration");
+    write_progress(result_path, "waiting-for-duration")?;
     let duration = wait_for(&mut events, "duration", |event| match event {
         PlayerEvent::Duration(value) if value.is_finite() && *value > 0.0 => Some(*value),
         _ => None,
@@ -85,7 +87,7 @@ async fn run(
     }
     observed.push("duration");
 
-    write_progress(result_path, "playing");
+    write_progress(result_path, "playing")?;
     state.player.play().context("play failed")?;
     wait_for(&mut events, "playing", |event| match event {
         PlayerEvent::Playing(true) => Some(()),
@@ -104,7 +106,7 @@ async fn run(
     .await?;
     observed.extend(["playing", "position-advanced"]);
 
-    write_progress(result_path, "pausing");
+    write_progress(result_path, "pausing")?;
     state.player.pause().context("pause failed")?;
     wait_for(&mut events, "not playing after pause", |event| match event {
         PlayerEvent::Playing(false) => Some(()),
@@ -137,7 +139,7 @@ async fn run(
     }
     observed.extend(["paused", "position-stable"]);
 
-    write_progress(result_path, "seeking");
+    write_progress(result_path, "seeking")?;
     state.player.seek(SEEK_SECONDS).context("seek failed")?;
     wait_for(&mut events, "seek position", |event| match event {
         PlayerEvent::Position(value) if (*value - SEEK_SECONDS).abs() <= 0.5 => Some(*value),
@@ -146,7 +148,7 @@ async fn run(
     .await?;
     observed.push("seeked");
 
-    write_progress(result_path, "resuming");
+    write_progress(result_path, "resuming")?;
     state.player.play().context("resume failed")?;
     wait_for(&mut events, "resumed", |event| match event {
         PlayerEvent::Playing(true) => Some(()),
@@ -160,7 +162,7 @@ async fn run(
     .await?;
     observed.push("resumed");
 
-    write_progress(result_path, "stopping");
+    write_progress(result_path, "stopping")?;
     state.player.stop().context("stop failed")?;
     wait_for(&mut events, "stopped position", |event| match event {
         PlayerEvent::Position(value) if value.abs() <= f64::EPSILON => Some(()),
@@ -176,9 +178,8 @@ async fn run(
     Ok(observed)
 }
 
-fn write_progress(path: &Path, step: &'static str) {
-    let _ =
-        std::fs::write(path, serde_json::json!({ "status": "running", "step": step }).to_string());
+fn write_progress(path: &Path, step: &'static str) -> std::io::Result<()> {
+    std::fs::write(path, serde_json::json!({ "status": "running", "step": step }).to_string())
 }
 
 async fn wait_for<T>(
