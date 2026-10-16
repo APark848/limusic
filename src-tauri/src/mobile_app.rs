@@ -16,7 +16,7 @@ pub fn run() {
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
             std::fs::create_dir_all(&data_dir)?;
             #[cfg(debug_assertions)]
-            let self_test_events = crate::ios_player_self_test::install_event_tap();
+            let self_test_events = crate::ios_player_self_test::install_event_tap(&data_dir);
             let (db, quarantined) = Db::open_or_quarantine(&data_dir.join("limusic.sqlite"))?;
             if let Some(path) = quarantined {
                 tracing::warn!(path = %path.display(), "started with a fresh database");

@@ -19,10 +19,10 @@ const SEEK_SECONDS: f64 = 4.0;
 
 static EVENT_TAP: OnceLock<Mutex<Option<UnboundedSender<PlayerEvent>>>> = OnceLock::new();
 
-pub(crate) fn install_event_tap() -> Option<UnboundedReceiver<PlayerEvent>> {
+pub(crate) fn install_event_tap(data_dir: &Path) -> Option<UnboundedReceiver<PlayerEvent>> {
     let enabled_by_argument =
         std::env::args_os().any(|arg| arg == std::ffi::OsStr::new(ENABLE_ARG));
-    let enabled_by_file = std::env::temp_dir().join(ENABLE_FILE).is_file();
+    let enabled_by_file = data_dir.ancestors().any(|dir| dir.join(ENABLE_FILE).is_file());
     if !enabled_by_argument && !enabled_by_file {
         return None;
     }

@@ -152,7 +152,7 @@ jobs:
           echo "Installing $app_bundle ($bundle_id)"
           xcrun simctl install "$simulator_udid" "$app_bundle"
           data_container="$(xcrun simctl get_app_container "$simulator_udid" "$bundle_id" data)"
-          touch "$data_container/tmp/limusic-ios-player-self-test.enabled"
+          touch "$data_container/limusic-ios-player-self-test.enabled"
           result_file=""
 
           set +e
