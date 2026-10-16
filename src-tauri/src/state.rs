@@ -1172,7 +1172,7 @@ impl AppState {
 
     /// `is_upload` comes off the queue row, never off `/player`: the response that has to be
     /// handled here (LOGIN_REQUIRED) carries no `videoDetails` to read it from. Issue #71.
-    async fn resolve(
+    pub(crate) async fn resolve(
         &self,
         video_id: &str,
         is_upload: bool,

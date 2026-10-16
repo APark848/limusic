@@ -1,12 +1,12 @@
 name: iOS validation
 
-# This is deliberately limited to the playback port branch. It creates no release artifacts, signs nothing,
+# This is deliberately limited to the iOS validation branch. It creates no release artifacts, signs nothing,
 # and has no repository write permission: its job is to make the first real Xcode/Rust error easy
 # to inspect while the iOS implementation is still incomplete.
 on:
   workflow_dispatch:
   push:
-    branches: [ios-playback]
+    branches: [ios-runtime-validation]
 
 permissions:
   contents: read
@@ -196,6 +196,34 @@ jobs:
             fail "Limusic exited after the AVPlayer self-test (pid $app_pid)"
           fi
           echo "Limusic AVPlayer self-test passed and the app remains alive (pid $app_pid)"
+
+          # The network leg is a separate result so the deterministic local-player signal remains
+          # useful when YouTube or the hosted runner's network is having an external failure.
+          remote_result_file=""
+          for _ in $(seq 1 60); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              fail "Limusic exited during the remote-stream self-test (pid $app_pid)"
+            fi
+            remote_result_file="$(find "$data_container" -name ios-remote-stream-self-test.json -print -quit)"
+            if [ -n "$remote_result_file" ]; then
+              remote_status="$(jq -r '.status' "$remote_result_file")"
+              if [ "$remote_status" = "passed" ] || [ "$remote_status" = "failed" ]; then
+                break
+              fi
+            fi
+            sleep 1
+          done
+          if [ -z "$remote_result_file" ]; then
+            fail "Timed out waiting for the remote-stream self-test result"
+          fi
+          cp "$remote_result_file" ios-remote-stream-self-test.json
+          cat ios-remote-stream-self-test.json
+          if [ "$(jq -r '.status' ios-remote-stream-self-test.json)" != "passed" ]; then
+            category="$(jq -r '.category // "unknown"' ios-remote-stream-self-test.json)"
+            stage="$(jq -r '.stage // "unknown"' ios-remote-stream-self-test.json)"
+            fail "Remote-stream validation failed (category=$category, stage=$stage)"
+          fi
+          echo "Limusic anonymous remote stream advanced in AVPlayer"
           trap - ERR
 
       - name: Preserve iOS generation and build logs
@@ -208,6 +236,7 @@ jobs:
             ios-build.log
             simulator-launch.log
             ios-player-self-test.json
+            ios-remote-stream-self-test.json
             simulator-diagnostics
             src-tauri/gen/apple
           if-no-files-found: warn
