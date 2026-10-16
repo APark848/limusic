@@ -1,0 +1,241 @@
+name: iOS sideload artifact
+
+# Produces an unsigned iphoneos IPA for personal re-signing with AltServer.
+# This workflow intentionally has no Apple account, team, certificate, profile,
+# App Store Connect credential, or repository write permission.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-sideload-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unsigned-device-ipa:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Frontend dependencies
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Frontend checks
+        working-directory: ui
+        run: |
+          pnpm check
+          pnpm test
+          pnpm build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Xcode and CocoaPods
+        run: |
+          xcode-select -p
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+          pod --version
+
+      - name: Tauri CLI
+        run: cargo install tauri-cli --version 2.11.5 --locked
+
+      - name: Initialize iOS project
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d src-tauri/gen/apple ]; then
+            echo "existing generated Apple project found"
+          else
+            cargo tauri ios init --ci
+          fi
+
+      - name: Validate generated Cargo Xcode script
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -F "cargo tauri ios xcode-script" src-tauri/gen/apple/project.yml
+          if grep -Fq "node tauri ios xcode-script" src-tauri/gen/apple/project.yml; then
+            echo "generated Xcode project uses the invalid Node launcher" >&2
+            exit 1
+          fi
+
+      # Tauri CLI 2.11.5 implements --no-sign by passing the skip-code-signing
+      # setting to its device archive, then zipping the archived .app directly
+      # as Payload/<app>.app. It does not run Xcode's signed export step.
+      - name: Build unsigned ARM64 device IPA
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo tauri ios build --target aarch64 --no-sign --ci \
+            --config '{"build":{"beforeBuildCommand":""}}'
+
+      - name: Verify and stage sideload artifact
+        id: verify
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mapfile -t source_ipas < <(
+            find src-tauri/gen/apple/build/arm64 -maxdepth 1 -type f -name '*.ipa' -print
+          )
+          if [ "${#source_ipas[@]}" -ne 1 ]; then
+            printf 'Expected exactly one device IPA, found %s\n' "${#source_ipas[@]}" >&2
+            printf '%s\n' "${source_ipas[@]:-}" >&2
+            exit 1
+          fi
+          source_ipa="${source_ipas[0]}"
+          mapfile -t archive_apps < <(
+            find src-tauri/gen/apple/build/arm64 -type d \
+              -path '*.xcarchive/Products/Applications/*.app' -print
+          )
+          if [ "${#archive_apps[@]}" -ne 1 ]; then
+            printf 'Expected exactly one archived device app, found %s\n' \
+              "${#archive_apps[@]}" >&2
+            printf '%s\n' "${archive_apps[@]:-}" >&2
+            exit 1
+          fi
+          archive_app="${archive_apps[0]}"
+          extract_dir="$(mktemp -d "$RUNNER_TEMP/limusic-ipa.XXXXXX")"
+
+          python3 - "$source_ipa" "$extract_dir" <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          ipa = pathlib.Path(sys.argv[1])
+          destination = pathlib.Path(sys.argv[2]).resolve()
+          with zipfile.ZipFile(ipa) as archive:
+              names = archive.namelist()
+              if not names:
+                  raise SystemExit("IPA is empty")
+              if any(not name.startswith("Payload/") for name in names):
+                  raise SystemExit("IPA contains an entry outside Payload/")
+              app_roots = {
+                  "/".join(pathlib.PurePosixPath(name).parts[:2])
+                  for name in names
+                  if len(pathlib.PurePosixPath(name).parts) >= 2
+                  and pathlib.PurePosixPath(name).parts[1].endswith(".app")
+              }
+              if app_roots != {"Payload/limusic.app"}:
+                  raise SystemExit(f"unexpected IPA app roots: {sorted(app_roots)}")
+              for member in archive.infolist():
+                  target = (destination / member.filename).resolve()
+                  if destination != target and destination not in target.parents:
+                      raise SystemExit(f"unsafe IPA path: {member.filename}")
+              archive.extractall(destination)
+          PY
+
+          app="$extract_dir/Payload/limusic.app"
+          plist="$app/Info.plist"
+          test -f "$plist"
+          bundle_id="$(plutil -extract CFBundleIdentifier raw "$plist")"
+          executable_name="$(plutil -extract CFBundleExecutable raw "$plist")"
+          minimum_ios="$(plutil -extract MinimumOSVersion raw "$plist")"
+          test -n "$bundle_id"
+          test -n "$executable_name"
+          executable="$app/$executable_name"
+          test -f "$executable"
+
+          executable_archs="$(lipo -archs "$executable")"
+          if ! grep -Eq '(^|[[:space:]])arm64($|[[:space:]])' <<<"$executable_archs"; then
+            echo "main executable does not contain arm64: $executable_archs" >&2
+            exit 1
+          fi
+          main_build="$(xcrun vtool -show-build "$executable")"
+          if grep -q 'platform IOSSIMULATOR' <<<"$main_build" || \
+             ! grep -Eq 'platform[[:space:]]+IOS($|[[:space:]])' <<<"$main_build"; then
+            echo "main executable is not an iphoneos binary" >&2
+            printf '%s\n' "$main_build" >&2
+            exit 1
+          fi
+
+          if codesign -d "$app" >/dev/null 2>&1; then
+            echo "app bundle is unexpectedly signed" >&2
+            codesign -dvvv "$app" >&2 || true
+            exit 1
+          fi
+          signature_dir="$(find "$app" -type d -name _CodeSignature -print -quit)"
+          if [ -n "$signature_dir" ]; then
+            echo "app contains an unexpected _CodeSignature: $signature_dir" >&2
+            exit 1
+          fi
+
+          nested_report="$RUNNER_TEMP/limusic-nested-code.txt"
+          : > "$nested_report"
+          while IFS= read -r -d '' nested; do
+            if file "$nested" | grep -q 'Mach-O'; then
+              relative="${nested#"$app/"}"
+              nested_archs="$(lipo -archs "$nested")"
+              if ! grep -Eq '(^|[[:space:]])arm64($|[[:space:]])' <<<"$nested_archs"; then
+                echo "nested code is missing arm64: $relative ($nested_archs)" >&2
+                exit 1
+              fi
+              nested_build="$(xcrun vtool -show-build "$nested")"
+              if grep -q 'platform IOSSIMULATOR' <<<"$nested_build" || \
+                 ! grep -Eq 'platform[[:space:]]+IOS($|[[:space:]])' <<<"$nested_build"; then
+                echo "nested code is not for iphoneos: $relative" >&2
+                exit 1
+              fi
+              if codesign -d "$nested" >/dev/null 2>&1; then
+                echo "nested code is unexpectedly signed: $relative" >&2
+                codesign -dvvv "$nested" >&2 || true
+                exit 1
+              fi
+              printf '%s: unsigned (%s, iphoneos)\n' "$relative" "$nested_archs" \
+                >> "$nested_report"
+            fi
+          done < <(find "$app/Frameworks" "$app/PlugIns" -type f -print0 2>/dev/null || true)
+
+          mkdir -p artifacts
+          cp "$source_ipa" artifacts/limusic-ios-sideload.ipa
+          if [ ! -s "$nested_report" ]; then
+            echo "none" > "$nested_report"
+          fi
+          {
+            echo "app_name: limusic"
+            echo "bundle_identifier: $bundle_id"
+            echo "target_architecture: $executable_archs"
+            echo "minimum_ios_version: $minimum_ios"
+            echo "platform: iphoneos"
+            echo "signing_state: unsigned"
+            echo "_CodeSignature_present: no"
+            echo "build_sha: $GITHUB_SHA"
+            echo "source_app: $archive_app"
+            echo "ipa_filename: limusic-ios-sideload.ipa"
+            echo "ipa_layout: Payload/limusic.app/"
+            echo "nested_code:"
+            sed 's/^/  /' "$nested_report"
+            echo "resigning_expectation: AltServer must re-sign the main executable and all nested code"
+          } > artifacts/limusic-ios-sideload-report.txt
+
+          python3 -m zipfile -t artifacts/limusic-ios-sideload.ipa
+          zipinfo -1 artifacts/limusic-ios-sideload.ipa | sed -n '1,40p'
+          cat artifacts/limusic-ios-sideload-report.txt
+
+      - name: Upload unsigned sideload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: limusic-ios-sideload-${{ github.sha }}
+          path: |
+            artifacts/limusic-ios-sideload.ipa
+            artifacts/limusic-ios-sideload-report.txt
+          if-no-files-found: error
+          retention-days: 14
