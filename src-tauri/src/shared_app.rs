@@ -49,6 +49,9 @@ pub(crate) fn build(
     let volume = crate::state::saved_volume(&db);
     // Preserve the desktop startup contract: a backend refusing a persisted volume must not keep
     // the application from opening. The saved value is clamped, so this is diagnostic only.
+    // On iOS, native plugin commands cannot run until Tauri's setup callback has returned. AVPlayer
+    // starts at full volume, and the normal runtime volume command applies subsequent changes.
+    #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
     if let Err(error) = player.set_volume(volume) {
         tracing::warn!(%error, "player refused the saved volume");
     }
