@@ -216,7 +216,7 @@ pub(crate) fn spawn_event_pump(
     tauri::async_runtime::spawn(async move {
         let mut throttle = PositionThrottle::new();
         while let Some(event) = events.recv().await {
-            #[cfg(all(target_os = "ios", debug_assertions))]
+            #[cfg(all(target_os = "ios", feature = "ios-player-self-test"))]
             crate::ios_player_self_test::observe_event(&event);
             match event {
                 PlayerEvent::Position(position) => {

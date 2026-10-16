@@ -15,8 +15,8 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
             std::fs::create_dir_all(&data_dir)?;
-            #[cfg(debug_assertions)]
-            let self_test_events = crate::ios_player_self_test::install_event_tap(&data_dir);
+            #[cfg(feature = "ios-player-self-test")]
+            let self_test_events = crate::ios_player_self_test::install_event_tap();
             let (db, quarantined) = Db::open_or_quarantine(&data_dir.join("limusic.sqlite"))?;
             if let Some(path) = quarantined {
                 tracing::warn!(path = %path.display(), "started with a fresh database");
@@ -28,10 +28,12 @@ pub fn run() {
                 .filter(|value| reqwest::Proxy::all(value).is_ok());
             http::set_proxy(proxy.as_deref());
             let runtime = shared_app::build(app, &data_dir, db, proxy.as_deref())?;
-            #[cfg(debug_assertions)]
-            if let Some(events) = self_test_events {
-                crate::ios_player_self_test::spawn(runtime.state.clone(), data_dir.clone(), events);
-            }
+            #[cfg(feature = "ios-player-self-test")]
+            crate::ios_player_self_test::spawn(
+                runtime.state.clone(),
+                data_dir.clone(),
+                self_test_events,
+            );
             Ok(())
         })
         .invoke_handler(only_main(tauri::generate_handler![

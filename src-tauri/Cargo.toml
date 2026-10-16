@@ -10,6 +10,9 @@ rust-version = "1.80"
 name = "app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+ios-player-self-test = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

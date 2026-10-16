@@ -11,24 +11,18 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::platform::player::PlayerEvent;
 use crate::state::AppState;
 
-const ENABLE_ARG: &str = "--limusic-ios-player-self-test";
-const ENABLE_FILE: &str = "limusic-ios-player-self-test.enabled";
 const RESULT_FILE: &str = "ios-player-self-test.json";
 const FIXTURE_SECONDS: f64 = 8.0;
 const SEEK_SECONDS: f64 = 4.0;
 
 static EVENT_TAP: OnceLock<Mutex<Option<UnboundedSender<PlayerEvent>>>> = OnceLock::new();
 
-pub(crate) fn install_event_tap(data_dir: &Path) -> Option<UnboundedReceiver<PlayerEvent>> {
-    let enabled_by_argument =
-        std::env::args_os().any(|arg| arg == std::ffi::OsStr::new(ENABLE_ARG));
-    let enabled_by_file = data_dir.ancestors().any(|dir| dir.join(ENABLE_FILE).is_file());
-    if !enabled_by_argument && !enabled_by_file {
-        return None;
-    }
+pub(crate) fn install_event_tap() -> UnboundedReceiver<PlayerEvent> {
     let (tx, rx) = unbounded_channel();
-    *EVENT_TAP.get_or_init(|| Mutex::new(None)).lock().ok()? = Some(tx);
-    Some(rx)
+    if let Ok(mut tap) = EVENT_TAP.get_or_init(|| Mutex::new(None)).lock() {
+        *tap = Some(tx);
+    }
+    rx
 }
 
 pub(crate) fn observe_event(event: &PlayerEvent) {
