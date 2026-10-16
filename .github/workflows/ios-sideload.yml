@@ -119,7 +119,7 @@ jobs:
             archive_app="$candidate"
             archive_app_count=$((archive_app_count + 1))
           done < <(
-            find "src-tauri/gen/apple/build/arm64" -type d \
+            find "src-tauri/gen/apple/build" -type d \
               -path '*.xcarchive/Products/Applications/*.app' -print
           )
           if [ "$archive_app_count" -ne 1 ]; then
@@ -128,7 +128,7 @@ jobs:
             if [ "$archive_app_count" -eq 0 ]; then
               echo "(none)" >&2
             else
-              find "src-tauri/gen/apple/build/arm64" -type d \
+              find "src-tauri/gen/apple/build" -type d \
                 -path '*.xcarchive/Products/Applications/*.app' -print >&2
             fi
             exit 1
