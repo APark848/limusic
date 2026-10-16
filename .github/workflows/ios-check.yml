@@ -1,12 +1,14 @@
 name: iOS validation
 
-# This is deliberately limited to the iOS validation branch. It creates no release artifacts, signs nothing,
-# and has no repository write permission: its job is to make the first real Xcode/Rust error easy
-# to inspect while the iOS implementation is still incomplete.
+# This creates no release artifacts, signs nothing, and has no repository write permission. It
+# keeps the deterministic simulator path blocking while reporting upstream service availability
+# separately from application regressions.
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [master]
   push:
-    branches: [ios-runtime-validation]
+    branches: [master]
 
 permissions:
   contents: read
@@ -206,8 +208,12 @@ jobs:
             fi
             remote_result_file="$(find "$data_container" -name ios-remote-stream-self-test.json -print -quit)"
             if [ -n "$remote_result_file" ]; then
+              if ! jq -e 'type == "object" and (.status | type == "string")' \
+                "$remote_result_file" >/dev/null 2>&1; then
+                break
+              fi
               remote_status="$(jq -r '.status' "$remote_result_file")"
-              if [ "$remote_status" = "passed" ] || [ "$remote_status" = "failed" ]; then
+              if [ "$remote_status" != "running" ]; then
                 break
               fi
             fi
@@ -218,12 +224,57 @@ jobs:
           fi
           cp "$remote_result_file" ios-remote-stream-self-test.json
           cat ios-remote-stream-self-test.json
-          if [ "$(jq -r '.status' ios-remote-stream-self-test.json)" != "passed" ]; then
-            category="$(jq -r '.category // "unknown"' ios-remote-stream-self-test.json)"
-            stage="$(jq -r '.stage // "unknown"' ios-remote-stream-self-test.json)"
-            fail "Remote-stream validation failed (category=$category, stage=$stage)"
+
+          if ! jq -e 'type == "object" and (.status | type == "string")' \
+            ios-remote-stream-self-test.json >/dev/null; then
+            fail "The remote-stream self-test produced malformed JSON"
           fi
-          echo "Limusic anonymous remote stream advanced in AVPlayer"
+          remote_status="$(jq -r '.status' ios-remote-stream-self-test.json)"
+          case "$remote_status" in
+            passed)
+              echo "Limusic anonymous remote stream advanced in AVPlayer"
+              ;;
+            running)
+              fail "Timed out while the remote-stream self-test was running"
+              ;;
+            failed)
+              if ! jq -e \
+                '(.category | type == "string") and (.stage | type == "string") and (.error | type == "string")' \
+                ios-remote-stream-self-test.json >/dev/null; then
+                fail "The remote-stream self-test failure result was malformed"
+              fi
+              category="$(jq -r '.category' ios-remote-stream-self-test.json)"
+              stage="$(jq -r '.stage' ios-remote-stream-self-test.json)"
+              diagnostic="$(jq -r '.error' ios-remote-stream-self-test.json)"
+              case "$category" in
+                external-service)
+                  # A resolver timeout is a harness/availability timeout, not an advisory result.
+                  # Other external stages currently represent AVPlayer's playback timeout and
+                  # remain blocking until the result contract can distinguish a prompt HTTP
+                  # refusal from a hung test.
+                  if [ "$stage" != "resolver" ]; then
+                    fail "Remote-stream validation timed out or failed in the harness (category=$category, stage=$stage)"
+                  fi
+                  diagnostic="${diagnostic//'%'/'%25'}"
+                  diagnostic="${diagnostic//$'\r'/'%0D'}"
+                  diagnostic="${diagnostic//$'\n'/'%0A'}"
+                  echo "::warning title=iOS remote stream unavailable::category=$category; stage=$stage; diagnostic=$diagnostic"
+                  ;;
+                application)
+                  fail "Remote-stream application failure (category=$category, stage=$stage)"
+                  ;;
+                *)
+                  fail "The remote-stream self-test returned an unknown category (category=$category, stage=$stage)"
+                  ;;
+              esac
+              ;;
+            *)
+              fail "The remote-stream self-test returned an unknown status"
+              ;;
+          esac
+          if ! kill -0 "$app_pid" 2>/dev/null; then
+            fail "Limusic exited after the remote-stream self-test (pid $app_pid)"
+          fi
           trap - ERR
 
       - name: Preserve iOS generation and build logs
