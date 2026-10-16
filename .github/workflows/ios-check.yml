@@ -174,7 +174,10 @@ jobs:
             fi
             result_file="$(find "$data_container" -name ios-player-self-test.json -print -quit)"
             if [ -n "$result_file" ]; then
-              break
+              result_status="$(jq -r '.status' "$result_file")"
+              if [ "$result_status" = "passed" ] || [ "$result_status" = "failed" ]; then
+                break
+              fi
             fi
             sleep 1
           done
@@ -183,6 +186,9 @@ jobs:
           fi
           cp "$result_file" ios-player-self-test.json
           cat ios-player-self-test.json
+          if [ "$(jq -r '.status' ios-player-self-test.json)" = "running" ]; then
+            fail "Timed out while the AVPlayer self-test was running"
+          fi
           if [ "$(jq -r '.status' ios-player-self-test.json)" != "passed" ]; then
             fail "The AVPlayer self-test reported a failure"
           fi
