@@ -40,25 +40,44 @@ pub(crate) fn observe_event(event: &PlayerEvent) {
 }
 
 pub(crate) fn spawn(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared) {
-    tauri::async_runtime::spawn(async move {
-        let result_path = data_dir.join(RESULT_FILE);
-        let _ = write_progress(&result_path, "starting");
-        tokio::time::sleep(START_DELAY).await;
-        let result = run(state, &data_dir, &result_path, prepared.events).await;
-        let report = match result {
-            Ok(observed) => serde_json::json!({
-                "status": "passed",
-                "observed": observed,
-            }),
-            Err(error) => serde_json::json!({
-                "status": "failed",
-                "error": format!("{error:#}"),
-            }),
-        };
-        if let Err(error) = std::fs::write(&result_path, report.to_string()) {
-            tracing::error!(%error, "could not write iOS player self-test result");
-        }
-    });
+    std::thread::Builder::new()
+        .name("ios-player-self-test".to_owned())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread().enable_time().build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let report = serde_json::json!({
+                        "status": "failed",
+                        "error": format!("could not create self-test runtime: {error}"),
+                    });
+                    let _ = std::fs::write(data_dir.join(RESULT_FILE), report.to_string());
+                    return;
+                }
+            };
+            runtime.block_on(run_spawned(state, data_dir, prepared));
+        })
+        .expect("could not start iOS player self-test thread");
+}
+
+async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared) {
+    let result_path = data_dir.join(RESULT_FILE);
+    let _ = write_progress(&result_path, "starting");
+    tokio::time::sleep(START_DELAY).await;
+    let result = run(state, &data_dir, &result_path, prepared.events).await;
+    let report = match result {
+        Ok(observed) => serde_json::json!({
+            "status": "passed",
+            "observed": observed,
+        }),
+        Err(error) => serde_json::json!({
+            "status": "failed",
+            "error": format!("{error:#}"),
+        }),
+    };
+    if let Err(error) = std::fs::write(&result_path, report.to_string()) {
+        tracing::error!(%error, "could not write iOS player self-test result");
+    }
 }
 
 async fn run(
