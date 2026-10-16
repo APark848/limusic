@@ -12,6 +12,8 @@ use crate::platform::player::PlayerEvent;
 use crate::state::AppState;
 
 const RESULT_FILE: &str = "ios-player-self-test.json";
+const REMOTE_RESULT_FILE: &str = "ios-remote-stream-self-test.json";
+const PUBLIC_VIDEO_ID: &str = "xl9cFAOKg_Y";
 const FIXTURE_SECONDS: f64 = 8.0;
 const SEEK_SECONDS: f64 = 4.0;
 const START_DELAY: Duration = Duration::from_secs(2);
@@ -43,7 +45,10 @@ pub(crate) fn spawn(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared)
     std::thread::Builder::new()
         .name("ios-player-self-test".to_owned())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread().enable_time().build()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_io()
+                .enable_time()
+                .build()
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
@@ -64,7 +69,9 @@ async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared
     let result_path = data_dir.join(RESULT_FILE);
     let _ = write_progress(&result_path, "starting");
     tokio::time::sleep(START_DELAY).await;
-    let result = run(state, &data_dir, &result_path, prepared.events).await;
+    let mut events = prepared.events;
+    let result = run(state.clone(), &data_dir, &result_path, &mut events).await;
+    let local_passed = result.is_ok();
     let report = match result {
         Ok(observed) => serde_json::json!({
             "status": "passed",
@@ -78,13 +85,16 @@ async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared
     if let Err(error) = std::fs::write(&result_path, report.to_string()) {
         tracing::error!(%error, "could not write iOS player self-test result");
     }
+    if local_passed {
+        run_remote(state, &data_dir, &mut events).await;
+    }
 }
 
 async fn run(
     state: Arc<AppState>,
     data_dir: &Path,
     result_path: &Path,
-    mut events: UnboundedReceiver<PlayerEvent>,
+    events: &mut UnboundedReceiver<PlayerEvent>,
 ) -> anyhow::Result<Vec<&'static str>> {
     let fixture = data_dir.join("ios-player-self-test.wav");
     write_wav_fixture(&fixture)?;
@@ -96,7 +106,7 @@ async fn run(
     write_progress(result_path, "loading")?;
     state.player.load(&fixture_url, &HashMap::new(), None, None).context("load failed")?;
     write_progress(result_path, "waiting-for-duration")?;
-    let duration = wait_for(&mut events, "duration", |event| match event {
+    let duration = wait_for(events, "duration", |event| match event {
         PlayerEvent::Duration(value) if value.is_finite() && *value > 0.0 => Some(*value),
         _ => None,
     })
@@ -108,17 +118,17 @@ async fn run(
 
     write_progress(result_path, "playing")?;
     state.player.play().context("play failed")?;
-    wait_for(&mut events, "playing", |event| match event {
+    wait_for(events, "playing", |event| match event {
         PlayerEvent::Playing(true) => Some(()),
         _ => None,
     })
     .await?;
-    let first = wait_for(&mut events, "positive position", |event| match event {
+    let first = wait_for(events, "positive position", |event| match event {
         PlayerEvent::Position(value) if *value > 0.0 => Some(*value),
         _ => None,
     })
     .await?;
-    let advanced = wait_for(&mut events, "advancing position", |event| match event {
+    let advanced = wait_for(events, "advancing position", |event| match event {
         PlayerEvent::Position(value) if *value > first + 0.2 => Some(*value),
         _ => None,
     })
@@ -127,12 +137,12 @@ async fn run(
 
     write_progress(result_path, "pausing")?;
     state.player.pause().context("pause failed")?;
-    wait_for(&mut events, "not playing after pause", |event| match event {
+    wait_for(events, "not playing after pause", |event| match event {
         PlayerEvent::Playing(false) => Some(()),
         _ => None,
     })
     .await?;
-    wait_for(&mut events, "paused", |event| match event {
+    wait_for(events, "paused", |event| match event {
         PlayerEvent::Paused(true) => Some(()),
         _ => None,
     })
@@ -160,7 +170,7 @@ async fn run(
 
     write_progress(result_path, "seeking")?;
     state.player.seek(SEEK_SECONDS).context("seek failed")?;
-    wait_for(&mut events, "seek position", |event| match event {
+    wait_for(events, "seek position", |event| match event {
         PlayerEvent::Position(value) if (*value - SEEK_SECONDS).abs() <= 0.5 => Some(*value),
         _ => None,
     })
@@ -169,12 +179,12 @@ async fn run(
 
     write_progress(result_path, "resuming")?;
     state.player.play().context("resume failed")?;
-    wait_for(&mut events, "resumed", |event| match event {
+    wait_for(events, "resumed", |event| match event {
         PlayerEvent::Playing(true) => Some(()),
         _ => None,
     })
     .await?;
-    wait_for(&mut events, "position after resume", |event| match event {
+    wait_for(events, "position after resume", |event| match event {
         PlayerEvent::Position(value) if *value > SEEK_SECONDS + 0.2 => Some(*value),
         _ => None,
     })
@@ -183,18 +193,162 @@ async fn run(
 
     write_progress(result_path, "stopping")?;
     state.player.stop().context("stop failed")?;
-    wait_for(&mut events, "stopped position", |event| match event {
+    wait_for(events, "stopped position", |event| match event {
         PlayerEvent::Position(value) if value.abs() <= f64::EPSILON => Some(()),
         _ => None,
     })
     .await?;
-    wait_for(&mut events, "stopped state", |event| match event {
+    wait_for(events, "stopped state", |event| match event {
         PlayerEvent::Playing(false) => Some(()),
         _ => None,
     })
     .await?;
     observed.push("stopped");
     Ok(observed)
+}
+
+async fn run_remote(
+    state: Arc<AppState>,
+    data_dir: &Path,
+    events: &mut UnboundedReceiver<PlayerEvent>,
+) {
+    let result_path = data_dir.join(REMOTE_RESULT_FILE);
+    let _ = write_progress(&result_path, "resolving-public-track");
+    while events.try_recv().is_ok() {}
+
+    let data = match tokio::time::timeout(
+        Duration::from_secs(45),
+        state.resolve(PUBLIC_VIDEO_ID, false, 240),
+    )
+    .await
+    {
+        Ok(Ok(data)) => data,
+        Ok(Err(error)) => {
+            write_remote_failure(
+                &result_path,
+                "external-service",
+                "resolver",
+                &format!("The anonymous production resolver failed: {error}"),
+            );
+            return;
+        }
+        Err(_) => {
+            write_remote_failure(
+                &result_path,
+                "external-service",
+                "resolver-timeout",
+                "The anonymous production resolver did not finish within 45 seconds",
+            );
+            return;
+        }
+    };
+
+    if !matches!(
+        tauri::Url::parse(&data.stream_url).ok().map(|url| url.scheme().to_owned()).as_deref(),
+        Some("http" | "https")
+    ) {
+        write_remote_failure(
+            &result_path,
+            "application",
+            "resolved-contract",
+            "The production resolver returned a non-HTTP stream URL",
+        );
+        return;
+    }
+    if let Some(header) = data
+        .headers
+        .keys()
+        .find(|name| !matches!(name.to_ascii_lowercase().as_str(), "user-agent" | "cookie"))
+    {
+        write_remote_failure(
+            &result_path,
+            "application",
+            "resolved-contract",
+            &format!("The resolver requires unsupported header {header}"),
+        );
+        return;
+    }
+
+    let header_names: Vec<String> =
+        data.headers.keys().map(|name| name.to_ascii_lowercase()).collect();
+    if !header_names.iter().any(|name| name == "user-agent") {
+        write_remote_failure(
+            &result_path,
+            "application",
+            "resolved-contract",
+            "The anonymous production resolver returned no User-Agent header",
+        );
+        return;
+    }
+    let client = data.stream_client.clone();
+    let itag = data.itag;
+    let _ = write_progress(&result_path, "loading-remote-stream");
+    if let Err(error) = state.player.load(&data.stream_url, &data.headers, None, None) {
+        write_remote_failure(
+            &result_path,
+            "application",
+            "player-load",
+            &format!("The iOS player rejected the resolved request: {error}"),
+        );
+        return;
+    }
+
+    let playback = tokio::time::timeout(Duration::from_secs(25), async {
+        wait_for(events, "remote duration", |event| match event {
+            PlayerEvent::Duration(value) if value.is_finite() && *value > 0.0 => Some(()),
+            _ => None,
+        })
+        .await?;
+        state.player.play().context("remote play command failed")?;
+        wait_for(events, "remote playing state", |event| match event {
+            PlayerEvent::Playing(true) => Some(()),
+            _ => None,
+        })
+        .await?;
+        let first = wait_for(events, "remote positive position", |event| match event {
+            PlayerEvent::Position(value) if *value > 0.0 => Some(*value),
+            _ => None,
+        })
+        .await?;
+        wait_for(events, "remote advancing position", |event| match event {
+            PlayerEvent::Position(value) if *value > first + 0.2 => Some(()),
+            _ => None,
+        })
+        .await
+    })
+    .await;
+
+    let _ = state.player.stop();
+    match playback {
+        Ok(Ok(())) => {
+            let report = serde_json::json!({
+                "status": "passed",
+                "observed": ["production-resolved", "headers-forwarded", "duration", "playing", "position-advanced"],
+                "streamClient": client,
+                "itag": itag,
+                "headerNames": header_names,
+            });
+            let _ = std::fs::write(result_path, report.to_string());
+        }
+        Ok(Err(_)) | Err(_) => write_remote_failure(
+            &result_path,
+            "external-service",
+            "remote-playback",
+            "AVPlayer did not begin advancing the resolved remote stream within the timeout",
+        ),
+    }
+}
+
+fn write_remote_failure(path: &Path, category: &str, stage: &str, message: &str) {
+    let report = serde_json::json!({
+        "status": "failed",
+        "category": category,
+        "stage": stage,
+        "error": message,
+    });
+    if let Err(error) = std::fs::write(path, report.to_string()) {
+        tracing::error!(%error, "could not write iOS remote-stream self-test result");
+    }
 }
 
 fn write_progress(path: &Path, step: &'static str) -> std::io::Result<()> {
