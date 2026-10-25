@@ -363,13 +363,12 @@ pub async fn forget_video_stream(state: St<'_>, video_id: String) -> Result<(), 
 }
 
 /// Who draws the window frame, as the SPA needs to know it (issue #65). Read-only, derived: the
-/// stored `system_titlebar` preference on Linux/Windows, `overlay` on macOS, and `mobile` on iOS.
-/// Anything but `off` means the app hides its own desktop window buttons, drops its desktop corner
-/// rounding and leaves resizing to the platform.
+/// stored `system_titlebar` preference on Linux/Windows, and always `overlay` on macOS, where the
+/// traffic lights come from `tauri.macos.conf.json`'s `titleBarStyle: Overlay` and there is no
+/// preference to make. Anything but `off` means the app hides its own window buttons, drops its
+/// corner rounding and leaves resizing to the compositor.
 fn native_chrome(db: &crate::db::Db) -> &'static str {
-    if cfg!(target_os = "ios") {
-        "mobile"
-    } else if cfg!(target_os = "macos") {
+    if cfg!(target_os = "macos") {
         "overlay"
     } else if db.get_setting("system_titlebar").as_deref() == Some("true") {
         "on"

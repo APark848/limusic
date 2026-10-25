@@ -247,12 +247,10 @@
 	const trackNotificationsFocusedOn = $derived(settings.track_notifications_focused === 'true');
 	const autostartOn = $derived(settings.autostart === 'true');
 	const startMinimizedOn = $derived(settings.start_minimized === 'true');
-	// `native_chrome` is read-only and platform-derived (commands.rs). `overlay` is macOS and
-	// `mobile` is iOS; neither has a user-selectable desktop frame.
+	// `native_chrome` is read-only and platform-derived (commands.rs). `overlay` is macOS, where the
+	// traffic lights are fixed at window creation and there is nothing to offer the user (#65).
 	const systemTitlebarOn = $derived(settings.native_chrome !== 'off');
-	const systemTitlebarFixed = $derived(
-		settings.native_chrome === 'overlay' || settings.native_chrome === 'mobile'
-	);
+	const systemTitlebarFixed = $derived(settings.native_chrome === 'overlay');
 	const disabled = $derived(
 		new Set(
 			(settings.disabled_stream_clients ?? '')
