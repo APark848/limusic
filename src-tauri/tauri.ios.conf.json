@@ -1,5 +1,18 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Limusic",
+        "create": true,
+        "visible": true,
+        "decorations": true,
+        "transparent": false,
+        "dragDropEnabled": false
+      }
+    ]
+  },
   "bundle": {
     "iOS": {
       "minimumSystemVersion": "16.0"

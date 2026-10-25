@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use tauri::Manager;
+use tauri::{Manager, WebviewWindow};
 
 use crate::{commands, db::Db, http, shared_app};
 
@@ -115,10 +115,28 @@ pub fn run() {
             commands::set_lyrics_offset,
             commands::lyrics_providers,
             commands::log_ui,
+            frontend_ready,
         ]))
         .build(tauri::generate_context!())
         .expect("error while building the Limusic iOS application")
         .run(|_, _| {});
+}
+
+/// Written only after Svelte's root layout mounts inside the configured `main` WKWebView. The iOS
+/// simulator check reads this marker from the app data container, so a live native process with no
+/// webview (or a webview that never reached frontend startup) cannot pass CI.
+#[tauri::command]
+fn frontend_ready(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), String> {
+    let marker = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?
+        .join("ios-frontend-ready.json");
+    let payload = serde_json::json!({
+        "status": "ready",
+        "window": window.label(),
+    });
+    std::fs::write(&marker, payload.to_string()).map_err(|error| error.to_string())
 }
 
 fn only_main<R: tauri::Runtime>(
