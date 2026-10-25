@@ -155,6 +155,8 @@ jobs:
           echo "Installing $app_bundle ($bundle_id)"
           xcrun simctl install "$simulator_udid" "$app_bundle"
           data_container="$(xcrun simctl get_app_container "$simulator_udid" "$bundle_id" data)"
+          # Do not let a marker from a previous install on a reused simulator satisfy this run.
+          find "$data_container" -name ios-frontend-ready.json -delete
           result_file=""
 
           set +e
@@ -169,6 +171,31 @@ jobs:
           if ! [[ "$app_pid" =~ ^[0-9]+$ ]]; then
             fail "Could not parse the launched process id"
           fi
+
+          # A running process is not enough: `create: false` can leave the app alive with no
+          # WKWebView. This file is written by a command invoked from Svelte's root onMount in the
+          # configured `main` webview, proving both native window creation and frontend startup.
+          frontend_ready_file=""
+          for _ in $(seq 1 30); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              fail "Limusic exited before frontend startup (pid $app_pid)"
+            fi
+            frontend_ready_file="$(find "$data_container" -name ios-frontend-ready.json -print -quit)"
+            if [ -n "$frontend_ready_file" ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$frontend_ready_file" ]; then
+            fail "Timed out waiting for the main iOS WebView to reach frontend startup"
+          fi
+          cp "$frontend_ready_file" ios-frontend-ready.json
+          cat ios-frontend-ready.json
+          if ! jq -e '.status == "ready" and .window == "main"' \
+            ios-frontend-ready.json >/dev/null; then
+            fail "The iOS frontend-ready marker was malformed or came from the wrong window"
+          fi
+          echo "Main iOS WebView reached frontend startup"
 
           for _ in $(seq 1 60); do
             if ! kill -0 "$app_pid" 2>/dev/null; then
@@ -286,6 +313,7 @@ jobs:
             ios-init.log
             ios-build.log
             simulator-launch.log
+            ios-frontend-ready.json
             ios-player-self-test.json
             ios-remote-stream-self-test.json
             simulator-diagnostics

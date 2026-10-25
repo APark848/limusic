@@ -132,7 +132,7 @@
      an open dialog sets `pointer-events: none` on <body>; `data-window-control` marks the buttons
      that don't dismiss it (`onWindowChrome`). -->
 <header
-	data-tauri-drag-region
+	data-tauri-drag-region={win.chrome === 'off' ? '' : undefined}
 	class="pointer-events-auto relative {ui.theaterOpen ? 'z-0' : 'z-50'} flex h-9 shrink-0 select-none items-center justify-between border-b border-border/60 bg-background"
 >
 	<span
