@@ -98,6 +98,7 @@ objc2 = "0.6"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 ios-player = { path = "../crates/ios-player" }
+souvlaki = { version = "0.8.3", default-features = false }
 
 # Taskbar thumbnail toolbar (#47). Same `windows` version tauri-runtime-wry already pulls in, so
 # `Window::hwnd()` hands us a matching HWND.

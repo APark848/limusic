@@ -6,6 +6,11 @@ export function isMobileShell(chrome: WindowChrome): boolean {
 	return chrome === 'mobile';
 }
 
+export function zoomPolicy(chrome: WindowChrome, ready: boolean): 'pending' | 'fixed' | 'desktop' {
+	if (!ready) return 'pending';
+	return isMobileShell(chrome) ? 'fixed' : 'desktop';
+}
+
 export function showMobileMiniPlayer(
 	chrome: WindowChrome,
 	hasTrack: boolean,

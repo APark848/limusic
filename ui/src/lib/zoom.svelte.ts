@@ -34,7 +34,24 @@ function step(by: number) {
 	setZoom(LEVELS[Math.min(Math.max(nearest(zoom.level) + by, 0), LEVELS.length - 1)]);
 }
 
-export function initZoom() {
+export function initZoom(fixed = false) {
+	if (fixed) {
+		zoom.level = 1;
+		getCurrentWebview()
+			.setZoom(1)
+			.catch(() => {});
+		const viewport = document.querySelector<HTMLMetaElement>('meta[name="viewport"]');
+		const previousViewport = viewport?.content;
+		viewport?.setAttribute(
+			'content',
+			'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover'
+		);
+		document.documentElement.classList.add('mobile-fixed-zoom');
+		return () => {
+			if (viewport && previousViewport) viewport.content = previousViewport;
+			document.documentElement.classList.remove('mobile-fixed-zoom');
+		};
+	}
 	const stored = Number(localStorage.getItem(KEY));
 	setZoom(LEVELS.includes(stored) ? stored : 1);
 	const onKey = (e: KeyboardEvent) => {
