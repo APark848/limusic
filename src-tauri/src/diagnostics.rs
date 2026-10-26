@@ -19,6 +19,30 @@ use tauri::{AppHandle, Manager};
 
 use crate::db::Db;
 
+/// Logs to stdout and to `<app data>/limusic.log`, keeping the previous launch as
+/// `limusic.log.1`. Both desktop and iOS initialize this before building shared application state
+/// so diagnostics always have the same persistent source.
+pub(crate) fn init_logging(dir: &Path) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    use tracing_subscriber::Layer;
+
+    let filter = || {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| "info,app_lib=debug,ios_player=debug".into())
+    };
+    let path = dir.join("limusic.log");
+    let _ = std::fs::rename(&path, dir.join("limusic.log.1"));
+    let file = std::fs::File::create(&path).ok().map(std::sync::Mutex::new);
+    let file_layer = file.map(|file| {
+        tracing_subscriber::fmt::layer().with_ansi(false).with_writer(file).with_filter(filter())
+    });
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_filter(filter()))
+        .with(file_layer)
+        .init();
+}
+
 /// Ceiling on the whole report. A GitHub issue comment tops out at 65,536 characters and the point
 /// of this is that it can be pasted into one.
 const MAX_CHARS: usize = 60_000;

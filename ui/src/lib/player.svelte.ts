@@ -19,6 +19,7 @@ import type { Personal } from './personal';
 import { appearance } from './theme.svelte';
 import { currentLocale, pushLocaleToRust, t } from './i18n.svelte';
 import { friendlyNetError } from './neterr';
+import { logUi } from './errlog';
 import { parseScrobbleConfig } from './scrobble';
 
 export const playback = $state({
@@ -138,6 +139,7 @@ export const openPlayer = () => {
 
 /** Play one track (a search row, a song card, a shelf), and show it. */
 export function playSong(song: SongItem) {
+	logUi('info', `frontend play requested video_id=${song.video_id}`);
 	openPlayer();
 	return api.play(song);
 }

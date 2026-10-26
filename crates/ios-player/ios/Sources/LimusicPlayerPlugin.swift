@@ -13,6 +13,7 @@ private enum EventKind {
   static let ended: UInt32 = 4
   static let failed: UInt32 = 5
   static let error: UInt32 = 6
+  static let diagnostic: UInt32 = 7
 }
 
 private struct LoadArgs: Decodable {
@@ -37,6 +38,7 @@ final class LimusicPlayerPlugin: Plugin {
   private let player = AVPlayer()
   private var periodicObserver: Any?
   private var statusObservation: NSKeyValueObservation?
+  private var timeControlObservation: NSKeyValueObservation?
   private var endedObserver: NSObjectProtocol?
   private var failedObserver: NSObjectProtocol?
   private var loopsCurrentItem = false
@@ -77,6 +79,8 @@ final class LimusicPlayerPlugin: Plugin {
     }
     statusObservation?.invalidate()
     statusObservation = nil
+    timeControlObservation?.invalidate()
+    timeControlObservation = nil
     if let observer = endedObserver {
       NotificationCenter.default.removeObserver(observer)
       endedObserver = nil
@@ -91,6 +95,16 @@ final class LimusicPlayerPlugin: Plugin {
     guard !failureEmitted else { return }
     failureEmitted = true
     emit(EventKind.failed, message: message)
+  }
+
+  private func diagnostic(_ stage: String) {
+    emit(EventKind.diagnostic, message: stage)
+  }
+
+  private func safeFailure(_ error: Error?, fallback: String) -> String {
+    guard let error else { return fallback }
+    let nsError = error as NSError
+    return "\(fallback) (domain=\(nsError.domain), code=\(nsError.code))"
   }
 
   private func cookies(from header: String, for url: URL) throws -> [HTTPCookie] {
@@ -167,16 +181,37 @@ final class LimusicPlayerPlugin: Plugin {
       guard let self else { return }
       switch observed.status {
       case .readyToPlay:
+        self.diagnostic("item-ready-to-play")
         let seconds = observed.duration.seconds
         if seconds.isFinite && seconds >= 0 {
           self.emit(EventKind.duration, value: seconds)
         }
       case .failed:
-        self.emitFailure(item?.error?.localizedDescription ?? "AVPlayer could not load this track")
+        self.diagnostic("item-failed")
+        self.emitFailure(self.safeFailure(item?.error, fallback: "AVPlayer could not load this track"))
       case .unknown:
-        break
+        self.diagnostic("item-status-unknown")
       @unknown default:
         self.emit(EventKind.error, message: "AVPlayer reported an unknown item status")
+      }
+    }
+
+    timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) {
+      [weak self] observed, _ in
+      guard let self else { return }
+      switch observed.timeControlStatus {
+      case .playing:
+        self.diagnostic("time-control-playing")
+        self.emit(EventKind.playing, value: 1)
+        self.emit(EventKind.paused, value: 0)
+      case .paused:
+        self.diagnostic("time-control-paused")
+        self.emit(EventKind.playing, value: 0)
+        self.emit(EventKind.paused, value: 1)
+      case .waitingToPlayAtSpecifiedRate:
+        self.diagnostic("time-control-waiting")
+      @unknown default:
+        self.diagnostic("time-control-unknown")
       }
     }
 
@@ -200,8 +235,17 @@ final class LimusicPlayerPlugin: Plugin {
       object: item,
       queue: .main
     ) { [weak self] notification in
+      guard let self else { return }
       let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
-      self?.emitFailure(error?.localizedDescription ?? "AVPlayer failed before the track ended")
+      self.emitFailure(self.safeFailure(error, fallback: "AVPlayer failed before the track ended"))
+    }
+
+    DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self, weak item] in
+      guard let self, let item, item === self.player.currentItem, item.status == .unknown else {
+        return
+      }
+      self.diagnostic("item-status-timeout")
+      self.emitFailure("AVPlayer could not prepare this track")
     }
   }
 
@@ -227,8 +271,10 @@ final class LimusicPlayerPlugin: Plugin {
       guard let self else { return }
       self.removeObservers()
       self.failureEmitted = false
+      self.diagnostic("load-received")
       let item = AVPlayerItem(asset: asset)
       self.player.replaceCurrentItem(with: item)
+      self.diagnostic("item-installed")
       self.observe(item)
       if let start, start > 0 {
         self.player.seek(to: CMTime(seconds: start, preferredTimescale: 600))
@@ -245,9 +291,12 @@ final class LimusicPlayerPlugin: Plugin {
           code: 6,
           userInfo: [NSLocalizedDescriptionKey: "No track is loaded"])
       }
+      let session = AVAudioSession.sharedInstance()
+      try session.setCategory(.playback, mode: .default)
+      try session.setActive(true)
+      self.diagnostic("audio-session-active")
       self.player.play()
-      self.emit(EventKind.playing, value: 1)
-      self.emit(EventKind.paused, value: 0)
+      self.diagnostic("play-requested")
     }
   }
 

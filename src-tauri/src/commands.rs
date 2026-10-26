@@ -84,9 +84,14 @@ pub async fn search_cards(
 /// with its metadata without another round-trip.
 #[tauri::command]
 pub async fn play(state: St<'_>, item: SongItem) -> Result<(), String> {
+    tracing::info!(video_id = %item.video_id, "play command received");
     let state = state.inner().clone();
-    state.play_song(item).await;
-    Ok(())
+    let result = state.play_song(item).await;
+    match &result {
+        Ok(()) => tracing::info!("play command completed"),
+        Err(error) => tracing::warn!(%error, "play command failed"),
+    }
+    result
 }
 
 #[tauri::command]
@@ -197,6 +202,7 @@ pub async fn set_repeat(state: St<'_>, mode: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn toggle_pause(state: St<'_>) -> Result<(), String> {
+    tracing::info!("toggle_pause command received");
     let state = state.inner().clone();
     state.resume_or_toggle().await;
     Ok(())
@@ -204,6 +210,7 @@ pub async fn toggle_pause(state: St<'_>) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn seek(state: St<'_>, position: f64) -> Result<(), String> {
+    tracing::info!(position, "seek command received");
     // Routed through AppState so a Listen Together host broadcasts the seek and a guest is blocked.
     state.user_seek(position).await
 }

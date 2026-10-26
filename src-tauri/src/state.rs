@@ -1267,12 +1267,12 @@ impl AppState {
 
     /// Start a fresh queue from one track (a search-result click), then hydrate the radio via
     /// `next` (skipped when autoplay is off) and prime the gapless lookahead.
-    pub async fn play_song(self: &std::sync::Arc<Self>, seed: SongItem) {
+    pub async fn play_song(self: &std::sync::Arc<Self>, seed: SongItem) -> Result<(), String> {
         if self.lt.is_guest().await {
             // Guests follow the host; clicking a song adds it to the shared queue instead
             // (Spotify-Jam-style). The host client auto-approves and stamps who added it.
             self.lt.suggest(song_to_track(&seed)).await;
-            return;
+            return Ok(());
         }
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let video_id = seed.video_id.clone();
@@ -1313,12 +1313,15 @@ impl AppState {
 
         if !self.start_current(gen).await {
             self.end_hydration(gen).await;
-            return;
+            return Err(
+                "Playback could not start; open Settings > About > Diagnostics for details"
+                    .to_owned(),
+            );
         }
 
         if no_radio {
             self.prime_lookahead(gen).await;
-            return;
+            return Ok(());
         }
 
         // Hydrate up-next radio (context/08) — non-fatal if it fails. Seed the radio playlist
@@ -1338,7 +1341,7 @@ impl AppState {
             Ok(next) => {
                 let mut q = self.queue.lock().await;
                 if self.generation.load(Ordering::SeqCst) != gen {
-                    return; // superseded
+                    return Ok(()); // superseded
                 }
                 // Deduped against the queue, not just against the seed: a carried manual add can
                 // be in the radio page too, and it should stay where the user put it.
@@ -1389,6 +1392,7 @@ impl AppState {
         }
 
         self.prime_lookahead(gen).await;
+        Ok(())
     }
 
     /// Play a finite list of tracks (a playlist/album). `start` is the clicked track; `None`
@@ -1746,6 +1750,7 @@ impl AppState {
             return; // guest playback is host-driven
         }
         if self.player.is_idle() {
+            tracing::info!("transport toggle found no native track loaded");
             let (idx, has_items) = {
                 let q = self.queue.lock().await;
                 (q.current, !q.items.is_empty())
@@ -1755,7 +1760,17 @@ impl AppState {
                 return;
             }
         }
-        let _ = self.player.toggle();
+        tracing::info!("sending transport toggle to native player");
+        let error = match self.player.toggle() {
+            Ok(()) => return,
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!(%error, "native transport toggle failed");
+        {
+            if let Some(item) = self.current_item().await {
+                self.emit_error(&item.video_id, &error);
+            }
+        }
     }
 
     /// Jump to a specific queue index.
@@ -2096,6 +2111,7 @@ impl AppState {
     /// Resolve + load the current track into mpv (replace). Returns false if resolve failed or the
     /// request was superseded.
     async fn start_current(self: &std::sync::Arc<Self>, gen: u64) -> bool {
+        tracing::info!(generation = gen, "playback startup entered");
         // Resolve the current track, auto-skipping any that no client can play (dead / region-locked
         // videos — context/06 "no client could resolve") instead of stalling the queue on them.
         // Bounded: each failure advances current by one, so the loop terminates at the queue tail.
@@ -2104,6 +2120,7 @@ impl AppState {
                 return false; // user moved on
             }
             let Some(item) = self.current_item().await else { return false };
+            tracing::info!(video_id = %item.video_id, "resolving current track");
             let resolved = self
                 .resolve(
                     &item.video_id,
@@ -2119,7 +2136,16 @@ impl AppState {
                 return false;
             }
             match resolved {
-                Ok(d) => break (item, d),
+                Ok(d) => {
+                    tracing::info!(
+                        video_id = %item.video_id,
+                        client = %d.stream_client,
+                        itag = d.itag,
+                        header_count = d.headers.len(),
+                        "current track resolved"
+                    );
+                    break (item, d);
+                }
                 // A deleted local file is gone for good, so it leaves the queue outright rather
                 // than being skipped over — a row that can only ever fail again is noise. Every
                 // other failure is transient in principle (network, region, a cipher self-heal),
@@ -2156,6 +2182,7 @@ impl AppState {
                     // queue in a couple of seconds, toast once per track and persist the new
                     // position, so stay exactly where we are and say what happened.
                     self.emit_error(&item.video_id, &e.to_string());
+                    tracing::warn!(video_id = %item.video_id, category = "resolve", error = %e, "playback startup failed");
                     return false;
                 }
                 Err(e) => {
@@ -2165,6 +2192,7 @@ impl AppState {
                     if q.current + 1 >= q.items.len() {
                         drop(q);
                         self.emit_error(&item.video_id, &e.to_string()); // nothing left to skip to
+                        tracing::warn!(video_id = %item.video_id, category = "resolve", error = %e, "playback startup failed");
                         return false;
                     }
                     let next = q.current + 1;
@@ -2192,17 +2220,34 @@ impl AppState {
             .filter(|(vid, _)| *vid == item.video_id)
             .map(|(_, pos)| pos);
         let stream_url = mpv_stream_url(&data);
+        let mut header_names: Vec<&str> = data.headers.keys().map(String::as_str).collect();
+        header_names.sort_unstable();
+        tracing::info!(
+            video_id = %item.video_id,
+            client = %data.stream_client,
+            itag = data.itag,
+            headers = ?header_names,
+            "loading resolved stream into native player"
+        );
         if let Err(e) =
             self.player.load(&stream_url, &data.headers, self.track_gain(data.loudness_db), seek)
         {
+            tracing::warn!(video_id = %item.video_id, category = "player-load", error = %e, "playback startup failed");
             self.emit_error(&item.video_id, &e.to_string());
             return false;
         }
+        tracing::info!(video_id = %item.video_id, "native player load command completed");
         // Listen Together host: announce the track before `play`, whose pause-flag change is the
         // room's Play. Sent after, a skip while paused reaches guests as "play" on the old track
         // first. At the position mpv starts at, so a retry or a restored context isn't sent as 0.
         self.lt_broadcast_current_track((seek.unwrap_or(0.0) * 1000.0) as i64, true).await;
-        let _ = self.player.play();
+        tracing::info!(video_id = %item.video_id, "sending play command to native player");
+        if let Err(e) = self.player.play() {
+            tracing::warn!(video_id = %item.video_id, category = "player-play", error = %e, "playback startup failed");
+            self.emit_error(&item.video_id, &e.to_string());
+            return false;
+        }
+        tracing::info!(video_id = %item.video_id, "native player play command completed");
         // Items played from cards/radio can arrive without a duration; the player response knows
         // the exact length of the cut we stream. Backfill before emitting — lyrics matching keys
         // on it (a wrong-cut LRCLIB match plays lyrics seconds off the audio).
