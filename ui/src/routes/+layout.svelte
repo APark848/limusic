@@ -31,6 +31,8 @@
 	import Titlebar from '$lib/components/Titlebar.svelte';
 	import ResizeBorders from '$lib/components/ResizeBorders.svelte';
 	import PlayerBar from '$lib/components/PlayerBar.svelte';
+	import MobilePlayerBar from '$lib/components/MobilePlayerBar.svelte';
+	import MobileNav from '$lib/components/MobileNav.svelte';
 	import QueuePanel from '$lib/components/QueuePanel.svelte';
 	import LyricsPanel from '$lib/components/LyricsPanel.svelte';
 	import CommentsPanel from '$lib/components/CommentsPanel.svelte';
@@ -54,6 +56,7 @@
 	import { isLocalId } from '$lib/api';
 	import { video } from '$lib/video.svelte';
 	import { win, initWin } from '$lib/win.svelte';
+	import { isMobileShell, showMobileMiniPlayer } from '$lib/mobile-shell';
 	import { initZoom } from '$lib/zoom.svelte';
 	import { initShortcuts } from '$lib/shortcuts';
 	import { initErrorLog } from '$lib/errlog';
@@ -198,6 +201,7 @@
 	// what tells the two apart: `mini` gets the widget instead of the app chrome, and none of the
 	// routes below it are ever rendered. Constant for the window's lifetime.
 	const isMini = browser && getCurrentWindow().label === 'mini';
+	const mobile = $derived(isMobileShell(win.chrome));
 
 	// Apply the saved accent color before the first paint (ssr=false → nothing renders until now).
 	if (browser) initTheme();
@@ -267,7 +271,12 @@
 	     Invisible while theater mode shows mpv's picture: theater is transparent over the hole, and
 	     the titlebar, sidebar or player bar under it would paint over the video. -->
 	<div
-		class="relative flex h-screen flex-col overflow-hidden text-foreground {video.hole
+		style={mobile
+			? 'padding-right:env(safe-area-inset-right);padding-left:env(safe-area-inset-left)'
+			: undefined}
+		class="relative flex flex-col overflow-hidden text-foreground {mobile
+			? 'mobile-shell h-[100dvh]'
+			: 'h-screen'} {video.hole
 			? ''
 			: 'bg-background'} {win.maximized ||
 		ui.theaterOpen ||
@@ -287,15 +296,19 @@
 					.h}px;box-shadow:0 0 0 100vmax var(--background)"
 			></div>
 		{/if}
-		<ResizeBorders />
-		<Titlebar />
+		{#if !mobile}
+			<ResizeBorders />
+			<Titlebar />
+		{/if}
 		<!-- relative: the queue and lyrics panels are absolute overlays inside it (see QueuePanel). -->
 		<div class="relative flex min-h-0 flex-1">
-			<Sidebar />
+			{#if !mobile}<Sidebar />{/if}
 			<!-- dragScroll: dragging a card up to home's Shortcuts grid has to be possible from anywhere in
 			     the feed, so aiming at the top edge scrolls this container while the drag is in flight. -->
 			<main
-				class="min-w-0 flex-1 overflow-y-auto {video.hole ? 'invisible' : ''}"
+				class="min-w-0 flex-1 overflow-x-hidden overflow-y-auto {mobile
+					? 'pt-[env(safe-area-inset-top)]'
+					: ''} {video.hole ? 'invisible' : ''}"
 				bind:this={scroller}
 				{@attach dragScroll}
 			>
@@ -313,16 +326,19 @@
 			{#if np.open && playback.now}<NowPlaying
 					queueOpen={showQueue}
 					lyricsOpen={showLyrics || showComments}
+					{mobile}
 				/>{/if}
 			<!-- Lyrics before queue: side by side over the page, lyrics on the left, queue on the right. -->
-			{#if showLyrics}<LyricsPanel onClose={() => (lyricsOpen = false)} queueOpen={showQueue} />{/if}
-			{#if showComments}<CommentsPanel
+			{#if !mobile && showLyrics}<LyricsPanel onClose={() => (lyricsOpen = false)} queueOpen={showQueue} />{/if}
+			{#if !mobile && showComments}<CommentsPanel
 					onClose={() => (commentsOpen = false)}
 					queueOpen={showQueue}
 				/>{/if}
-			{#if showQueue}<QueuePanel onClose={() => (queueOpen = false)} />{/if}
+			{#if !mobile && showQueue}<QueuePanel onClose={() => (queueOpen = false)} />{/if}
 		</div>
-		{#if playback.now}
+		{#if showMobileMiniPlayer(win.chrome, !!playback.now, np.open)}
+			<MobilePlayerBar />
+		{:else if playback.now && !mobile}
 			<!-- Slides up from its own height on first play; leaves instantly (bar removal is rare).
 			     z-20 on the wrapper, not the bar: the intro's transform makes this a stacking context,
 			     so a z on the footer inside would be trapped under it. The now-playing view is z-20 and
@@ -350,15 +366,18 @@
 				/>
 			</div>
 		{/if}
+		{#if mobile && !np.open}<MobileNav />{/if}
 	</div>
 
 	<!-- Theater mode covers everything, titlebar included, and puts the window in fullscreen for as
 	     long as it is mounted. Nothing playing means nothing to show, and that guard is also what
 	     closes it (and leaves fullscreen) when the queue runs out. -->
-	{#if ui.theaterOpen && playback.now}<TheaterMode />{/if}
+	{#if !mobile && ui.theaterOpen && playback.now}<TheaterMode />{/if}
 
-	<CommandPalette />
-	<KeyboardShortcuts />
+	{#if !mobile}
+		<CommandPalette />
+		<KeyboardShortcuts />
+	{/if}
 	<AddToPlaylist />
 	<NewPlaylistDialog />
 	<ShareDialog />

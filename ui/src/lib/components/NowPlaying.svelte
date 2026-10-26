@@ -11,6 +11,8 @@
 		Minimize01Icon,
 		Mic01Icon,
 		MusicNote01Icon,
+		PreviousIcon,
+		NextIcon,
 		PlayIcon,
 		PauseIcon,
 		Queue01Icon,
@@ -58,7 +60,11 @@
 	// a scrimmed overlay and there's nothing to shrink into. In tabbed mode both are always closed.
 	// `lyricsOpen` is the lyrics/comments slot: the comments panel takes the lyrics' place, so either
 	// one open counts as that one panel.
-	let { queueOpen, lyricsOpen }: { queueOpen: boolean; lyricsOpen: boolean } = $props();
+	let {
+		queueOpen,
+		lyricsOpen,
+		mobile = false
+	}: { queueOpen: boolean; lyricsOpen: boolean; mobile?: boolean } = $props();
 	const tabbed = $derived(appearance.tabbedPlayer);
 	// The two layouts (Settings > Appearance > New player layout). One component, so both share
 	// every behaviour below: the video hole, the backdrop click, the wheel volume, Esc. Only the
@@ -148,6 +154,28 @@
 		clearTimeout(flashTimer);
 		flashTimer = setTimeout(() => (flash = null), 220);
 		api.togglePause();
+	}
+
+	const fmt = (secs: number) => {
+		if (!secs || secs < 0) return '0:00';
+		const whole = Math.floor(secs);
+		const hours = Math.floor(whole / 3600);
+		const minutes = Math.floor((whole % 3600) / 60);
+		const seconds = whole % 60;
+		return `${hours ? `${hours}:${minutes.toString().padStart(2, '0')}` : minutes}:${seconds
+			.toString()
+			.padStart(2, '0')}`;
+	};
+	let seekDrag = $state<number | null>(null);
+	const shownPosition = $derived(seekDrag ?? playback.position);
+	function onSeekInput(e: Event) {
+		seekDrag = Number((e.target as HTMLInputElement).value);
+	}
+	function onSeekCommit(e: Event) {
+		const position = Number((e.target as HTMLInputElement).value);
+		playback.position = position;
+		seekDrag = null;
+		api.seek(position);
 	}
 
 	// Scrolling the artwork is the volume, same step as the slider. The level only draws while the
@@ -242,6 +270,48 @@
 	>
 		{label}
 	</button>
+{/snippet}
+
+{#snippet mobileTabs()}
+	<div
+		class="flex min-h-[22rem] shrink-0 flex-col border-t px-4 pt-3"
+		style="padding-bottom:max(env(safe-area-inset-bottom),1rem)"
+		data-np-keep
+	>
+		<Tabs.Root
+			value={np.tab}
+			onValueChange={(value) => (np.tab = value as typeof np.tab)}
+			class="flex min-h-0 flex-1 flex-col gap-2"
+		>
+			<Tabs.List class="grid min-h-12 shrink-0 grid-cols-3">
+				<Tabs.Trigger value="queue" class="gap-1 px-2">
+					<HugeiconsIcon icon={Queue01Icon} class="h-4 w-4" />
+					{t('player.queue')}
+				</Tabs.Trigger>
+				<Tabs.Trigger value="lyrics" class="gap-1 px-2">
+					<HugeiconsIcon icon={Mic01Icon} class="h-4 w-4" />
+					{t('player.lyrics')}
+				</Tabs.Trigger>
+				<Tabs.Trigger value="comments" class="gap-1 px-2" disabled={local}>
+					<HugeiconsIcon icon={Comment01Icon} class="h-4 w-4" />
+					{t('player.comments')}
+				</Tabs.Trigger>
+			</Tabs.List>
+			{#if np.tab === 'queue'}
+				<Tabs.Content value="queue" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+					<QueueList />
+				</Tabs.Content>
+			{:else if np.tab === 'comments' && !local}
+				<Tabs.Content value="comments" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+					<CommentsView />
+				</Tabs.Content>
+			{:else}
+				<Tabs.Content value="lyrics" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+					<LyricsView />
+				</Tabs.Content>
+			{/if}
+		</Tabs.Root>
+	</div>
 {/snippet}
 
 <!-- Both layouts: the volume level while the wheel is live, middle left of the picture, on a plate:
@@ -463,12 +533,97 @@
 	onpointerup={(e) => (releasedKeep = keeps(e.target))}
 	onclick={onBackdropClick}
 	data-np-view
-	class="absolute inset-y-0 left-16 right-0 z-20 flex overflow-hidden inert:bg-background {video.hole
+	class="absolute right-0 flex inert:bg-background {mobile
+		? 'inset-0 left-0 z-40 flex-col overflow-y-auto'
+		: `inset-y-0 left-16 z-20 overflow-hidden ${ui.sidebarCollapsed ? '' : 'lg:left-60'} ${inset}`} {video.hole
 		? ''
-		: 'bg-background'} {stage ? '' : 'justify-center px-4 py-4 sm:px-6 sm:py-6 lg:px-10'} {ui.sidebarCollapsed
-		? ''
-		: 'lg:left-60'} {inset}"
+		: 'bg-background'} {mobile || stage ? '' : 'justify-center px-4 py-4 sm:px-6 sm:py-6 lg:px-10'}"
 >
+	{#if mobile}
+		<section
+			class="flex shrink-0 flex-col px-5 pb-5"
+			style="padding-top:max(env(safe-area-inset-top),0.5rem)"
+			data-np-keep
+		>
+			<div class="flex min-h-12 items-center">
+				<button
+					type="button"
+					onclick={() => (np.open = false)}
+					class="flex h-11 w-11 items-center justify-center rounded-full active:bg-muted"
+					aria-label={t('player.minimize_player')}
+				>
+					<HugeiconsIcon icon={ArrowDown01Icon} class="h-6 w-6" />
+				</button>
+				<h1 class="flex-1 pr-11 text-center text-sm font-semibold">{t('player.now_playing')}</h1>
+			</div>
+
+			<div class="mx-auto mt-3 w-full max-w-[min(78vw,22rem)]" data-ctx>
+				<div bind:this={picBox} class="relative">
+					{@render picture()}
+				</div>
+			</div>
+
+			<div class="mt-5 min-w-0">
+				<h2 class="truncate font-heading text-xl font-bold">{playback.now?.title}</h2>
+				<ArtistLine
+					runs={playback.now?.artistRuns}
+					text={playback.now?.artists ?? ''}
+					class="mt-1 block truncate text-sm text-muted-foreground"
+				/>
+			</div>
+
+			<div class="mt-4">
+				<input
+					type="range"
+					class="range w-full"
+					style="--pct:{playback.duration ? (shownPosition / playback.duration) * 100 : 0}%"
+					min="0"
+					max={playback.duration || 0}
+					value={shownPosition}
+					oninput={onSeekInput}
+					onchange={onSeekCommit}
+					aria-label={t('player.seek')}
+				/>
+				<div class="flex justify-between text-xs tabular-nums text-muted-foreground">
+					<span>{fmt(shownPosition)}</span>
+					<span>{fmt(playback.duration)}</span>
+				</div>
+			</div>
+
+			<div class="mt-3 flex items-center justify-center gap-7">
+				<button
+					type="button"
+					onclick={() => api.prevTrack()}
+					class="flex h-12 w-12 items-center justify-center rounded-full active:bg-muted"
+					aria-label={t('player.previous')}
+				>
+					<HugeiconsIcon icon={PreviousIcon} class="h-7 w-7" />
+				</button>
+				<button
+					type="button"
+					onclick={() => api.togglePause()}
+					class="flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground active:opacity-80"
+					aria-label={playback.paused ? t('player.play') : t('player.pause')}
+				>
+					<HugeiconsIcon
+						icon={PauseIcon}
+						altIcon={PlayIcon}
+						showAlt={playback.paused}
+						class="h-7 w-7"
+					/>
+				</button>
+				<button
+					type="button"
+					onclick={() => api.nextTrack()}
+					class="flex h-12 w-12 items-center justify-center rounded-full active:bg-muted"
+					aria-label={t('player.next')}
+				>
+					<HugeiconsIcon icon={NextIcon} class="h-7 w-7" />
+				</button>
+			</div>
+		</section>
+		{@render mobileTabs()}
+	{:else}
 	<!-- The ambient light (Settings > Video): the video's colours spilling into the view around it. Not
 	     under theater mode, which covers this view. -->
 	{#if prefs.ambient && showVideo() && picBox && !ui.theaterOpen}
@@ -718,5 +873,6 @@
 			{/if}
 			{#if tabbed}{@render tabs()}{/if}
 		</div>
+	{/if}
 	{/if}
 </div>

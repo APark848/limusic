@@ -391,11 +391,11 @@
 		<div class="absolute inset-0 bg-gradient-to-b from-transparent to-background"></div>
 	</div>
 
-	<h1 class="px-6 pt-10 font-heading text-4xl font-bold tracking-tight">{t('common.search')}</h1>
+	<h1 class="mobile-search-title px-6 pt-10 font-heading text-4xl font-bold tracking-tight">{t('common.search')}</h1>
 
 	<div class="h-px" {@attach stickWatch}></div>
 	<div
-		class="sticky top-0 z-20 px-6 pb-3 pt-4 transition-colors duration-200 {stuck
+		class="mobile-page-x sticky top-0 z-20 px-6 pb-3 pt-4 transition-colors duration-200 {stuck
 			? 'bg-background'
 			: ''}"
 	>
@@ -461,7 +461,7 @@
 		{/if}
 	</div>
 
-	<div class="px-6 pb-10 pt-4">
+	<div class="mobile-page-x px-6 pb-10 pt-4">
 		{#if error}
 			<ErrorState message={error} onRetry={runSearch} />
 		{:else if searching}

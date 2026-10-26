@@ -255,12 +255,12 @@
             ></div>
         </div>
 
-        <div class="absolute right-6 top-6 z-10">
+        <div class="mobile-album-filter absolute right-6 top-6 z-10">
             <TrackFilter bind:value={query} placeholder={t("common.search_this_album")} />
         </div>
 
-        <div class="relative flex flex-col gap-5 p-6 pt-10">
-            <div class="flex items-end gap-5">
+        <div class="mobile-album-content relative flex flex-col gap-5 p-6 pt-10">
+            <div class="mobile-album-header flex items-end gap-5">
                 <!-- Inline width/height so the size holds even against a stale dev-server CSS that -->
                 <!-- hasn't regenerated a newly-used spacing utility (would fall back to intrinsic size). -->
                 {#if album.thumbnail}
@@ -283,7 +283,7 @@
                         {album.subtitle ?? "Album"}
                     </div>
                     <h1
-                        class="mt-1 font-heading text-4xl font-bold tracking-tight drop-shadow"
+                        class="mobile-page-title mt-1 font-heading text-4xl font-bold tracking-tight drop-shadow"
                     >
                         {album.title ?? "Album"}
                     </h1>
@@ -337,7 +337,7 @@
             {/if}
 
             <!-- Controls -->
-            <div class="relative flex items-center gap-3">
+            <div class="mobile-wrap relative flex items-center gap-3">
                 <button
                     class="flex cursor-pointer items-center gap-2 rounded-full text-foreground bg-primary px-6 py-2.5 text-sm font-semibold transition hover:opacity-90 disabled:opacity-50"
                     onclick={() => playAll(null)}
@@ -503,7 +503,7 @@
     <!-- Other versions of this release, and what sits near it. Ruled off from the tracks so the
          page reads as the album first and its surroundings second. -->
     {#if album.sections?.length}
-        <div class="content-in mt-2 flex flex-col gap-8 border-t px-6 pb-8 pt-8">
+        <div class="mobile-page-x content-in mt-2 flex flex-col gap-8 border-t px-6 pb-8 pt-8">
             {#each album.sections as section, i (i + ":" + section.title)}
                 <Shelf
                     title={section.title}
