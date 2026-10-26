@@ -101,6 +101,25 @@ jobs:
             --features ios-player-self-test \
             --config '{"build":{"beforeBuildCommand":""}}' 2>&1 | tee ios-build.log
 
+      # Tauri merges src-tauri/Info.ios.plist into the generated bundle. Check the built product,
+      # not only the source fragment, so a generator/configuration regression cannot silently drop
+      # background playback support.
+      - name: Verify iOS background audio mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_bundle="$(find src-tauri/gen/apple/build/arm64-sim -maxdepth 1 \
+            -type d -name '*.app' -print -quit)"
+          if [ -z "$app_bundle" ]; then
+            echo "Could not locate the generated simulator app bundle" >&2
+            exit 1
+          fi
+          plutil -extract UIBackgroundModes json -o ios-background-modes.json \
+            "$app_bundle/Info.plist"
+          cat ios-background-modes.json
+          jq -e 'type == "array" and length == 1 and .[0] == "audio"' \
+            ios-background-modes.json >/dev/null
+
       # Headless debug validation: drives the production Rust -> plugin -> AVPlayer -> callback
       # event path with a deterministic local WAV. It does not use an account or network stream.
       - name: Smoke test iOS AVPlayer
