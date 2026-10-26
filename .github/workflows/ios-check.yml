@@ -49,6 +49,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Deterministic host tests for the iOS stream boundary. This does not claim that YouTube is
+      # reachable; it protects the AVPlayer-compatible AAC choice and header allowlist.
+      - name: iOS playback boundary tests
+        run: |
+          cargo test -p innertube ios_format_prefers_native_aac_over_higher_ranked_opus
+          cargo test -p ios-player
+
       - name: Xcode and CocoaPods
         run: |
           xcode-select -p
@@ -196,6 +203,17 @@ jobs:
             fail "The iOS frontend-ready marker was malformed or came from the wrong window"
           fi
           echo "Main iOS WebView reached frontend startup"
+
+          # Diagnostics reads this exact persistent file. Requiring the frontend marker in it
+          # proves iOS initialized the shared logger early enough to capture WebView/playback logs.
+          persistent_log="$(find "$data_container" -name limusic.log -print -quit)"
+          if [ -z "$persistent_log" ]; then
+            fail "iOS did not create the persistent diagnostics log"
+          fi
+          if ! grep -Fq "iOS frontend ready" "$persistent_log"; then
+            fail "The persistent iOS log did not capture frontend startup"
+          fi
+          echo "Persistent iOS diagnostics logging is active"
 
           for _ in $(seq 1 60); do
             if ! kill -0 "$app_pid" 2>/dev/null; then

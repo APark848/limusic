@@ -15,6 +15,8 @@ pub fn run() {
         .setup(|app| {
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
             std::fs::create_dir_all(&data_dir)?;
+            crate::diagnostics::init_logging(&data_dir);
+            tracing::info!("iOS application logging initialized");
             #[cfg(feature = "ios-player-self-test")]
             let self_test = crate::ios_player_self_test::prepare(&data_dir)?;
             let (db, quarantined) = Db::open_or_quarantine(&data_dir.join("limusic.sqlite"))?;
@@ -114,6 +116,9 @@ pub fn run() {
             commands::choose_lyrics_source,
             commands::set_lyrics_offset,
             commands::lyrics_providers,
+            commands::diagnostics,
+            commands::diagnostics_summary,
+            commands::save_diagnostics,
             commands::log_ui,
             frontend_ready,
         ]))
@@ -127,6 +132,7 @@ pub fn run() {
 /// webview (or a webview that never reached frontend startup) cannot pass CI.
 #[tauri::command]
 fn frontend_ready(app: tauri::AppHandle, window: WebviewWindow) -> Result<(), String> {
+    tracing::info!(window = window.label(), "iOS frontend ready");
     let marker = app
         .path()
         .app_data_dir()

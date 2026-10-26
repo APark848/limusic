@@ -65,6 +65,11 @@ impl Player {
         Ok(())
     }
 
+    /// Preserve startup state without invoking the mobile plugin from Tauri's setup callback.
+    pub(crate) fn remember_volume(&self, volume: i64) {
+        self.volume.store(volume, Ordering::Relaxed);
+    }
+
     pub(crate) fn volume(&self) -> i64 {
         self.volume.load(Ordering::Relaxed)
     }
@@ -110,10 +115,16 @@ impl Player {
     }
 
     pub(crate) fn play(&self) -> Result<(), Error> {
-        self.native.play()
+        tracing::info!("iOS Player::play entered");
+        let result = self.native.play();
+        if let Err(error) = &result {
+            tracing::warn!(%error, "iOS Player::play failed");
+        }
+        result
     }
 
     pub(crate) fn pause(&self) -> Result<(), Error> {
+        tracing::info!("iOS Player::pause entered");
         self.native.pause()
     }
 
@@ -130,6 +141,7 @@ impl Player {
     }
 
     pub(crate) fn seek(&self, position: f64) -> Result<(), Error> {
+        tracing::info!(position, "iOS Player::seek entered");
         self.native.seek(position)
     }
 
@@ -144,13 +156,21 @@ impl Player {
         gain: Option<f64>,
         start: Option<f64>,
     ) -> Result<(), Error> {
+        tracing::info!(
+            header_count = headers.len(),
+            has_gain = gain.is_some(),
+            has_start = start.is_some(),
+            "iOS Player::load entered"
+        );
         if gain.is_some_and(|gain| gain.abs() > f64::EPSILON) {
             return Err(Error::Unsupported("loudness gain"));
         }
         self.native.load(url, headers, start)?;
+        self.native.set_volume(self.volume())?;
         if let Ok(mut path) = self.current_path.lock() {
             *path = Some(url.to_owned());
         }
+        tracing::info!("iOS Player::load completed");
         Ok(())
     }
 }

@@ -233,9 +233,33 @@ pub enum AudioQuality {
 /// adaptive audio: a podcast added to the library by RSS feed is not hosted by YouTube, and WEB_REMIX
 /// answers with one progressive `audio/mpeg` entry pointing at the feed's own enclosure (#294).
 pub fn find_format(data: &StreamingData, quality: AudioQuality) -> Option<&Format> {
-    let mut audio: Vec<&Format> = data.adaptive_formats.iter().filter(|f| f.is_audio()).collect();
+    find_format_where(data, quality, |_| true)
+}
+
+/// Pick a format AVPlayer can decode on iOS. Desktop mpv deliberately prefers Opus/WebM for
+/// quality, but handing that same choice to AVPlayer leaves the item at time zero. YouTube's
+/// MP4/AAC (normally itag 140), MP3 podcast enclosures, and raw AAC are supported native inputs.
+pub fn find_ios_format(data: &StreamingData, quality: AudioQuality) -> Option<&Format> {
+    let aac = find_format_where(data, quality, |format| {
+        let mime = format.mime_type.to_ascii_lowercase();
+        mime.contains("audio/mp4") || mime.contains("mp4a") || mime.contains("audio/aac")
+    });
+    aac.or_else(|| {
+        find_format_where(data, quality, |format| {
+            format.mime_type.to_ascii_lowercase().contains("audio/mpeg")
+        })
+    })
+}
+
+fn find_format_where(
+    data: &StreamingData,
+    quality: AudioQuality,
+    compatible: impl Fn(&Format) -> bool,
+) -> Option<&Format> {
+    let mut audio: Vec<&Format> =
+        data.adaptive_formats.iter().filter(|f| f.is_audio() && compatible(f)).collect();
     if audio.is_empty() {
-        audio = data.formats.iter().flatten().filter(|f| f.is_audio()).collect();
+        audio = data.formats.iter().flatten().filter(|f| f.is_audio() && compatible(f)).collect();
     }
     if audio.is_empty() {
         return None;
@@ -355,6 +379,41 @@ mod tests {
         assert_eq!(sd.expires_in_seconds, Some(21540));
         assert_eq!(sd.adaptive_formats[0].bitrate, 141210);
         assert!(find_format(&sd, AudioQuality::High).is_some());
+    }
+
+    #[test]
+    fn ios_format_prefers_native_aac_over_higher_ranked_opus() {
+        let json = r#"{
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": 251, "url": "opus", "mimeType": "audio/webm; codecs=\"opus\"", "bitrate": 150000, "audioQuality": "AUDIO_QUALITY_HIGH" },
+                { "itag": 140, "url": "aac", "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 129000, "audioQuality": "AUDIO_QUALITY_MEDIUM" }
+            ] }
+        }"#;
+        let sd = serde_json::from_str::<PlayerResponse>(json).unwrap().streaming_data.unwrap();
+
+        assert_eq!(find_format(&sd, AudioQuality::High).unwrap().itag, 251);
+        assert_eq!(find_ios_format(&sd, AudioQuality::High).unwrap().itag, 140);
+    }
+
+    #[test]
+    fn ios_format_uses_mp3_only_when_aac_is_absent() {
+        let json = r#"{
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "formats": [
+                { "itag": 15, "url": "mp3", "mimeType": "audio/mpeg", "bitrate": 256000, "audioQuality": "AUDIO_QUALITY_HIGH" },
+                { "itag": 140, "url": "aac", "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 129000, "audioQuality": "AUDIO_QUALITY_MEDIUM" }
+            ] }
+        }"#;
+        let sd = serde_json::from_str::<PlayerResponse>(json).unwrap().streaming_data.unwrap();
+        assert_eq!(find_ios_format(&sd, AudioQuality::High).unwrap().itag, 140);
+
+        let mp3_only = StreamingData {
+            formats: Some(vec![sd.formats.unwrap()[0].clone()]),
+            adaptive_formats: Vec::new(),
+            expires_in_seconds: None,
+        };
+        assert_eq!(find_ios_format(&mp3_only, AudioQuality::High).unwrap().itag, 15);
     }
 
     /// A dubbed video lists each language at the same qualities; the higher-bitrate dub must not
