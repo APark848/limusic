@@ -12,8 +12,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "ios"))]
+use innertube::find_format;
+#[cfg(target_os = "ios")]
+use innertube::find_ios_format;
 use innertube::{
-    find_format, find_video_format, rustypipe_fallback, AudioQuality, Clients, Format, InnerTube,
+    find_video_format, rustypipe_fallback, AudioQuality, Clients, Format, InnerTube,
     PlayerResponse, StreamingData, YouTubeClient, MAIN_CLIENT, STREAM_FALLBACK_ORDER,
     UPLOAD_FALLBACK_ORDER,
 };
@@ -213,6 +217,13 @@ impl Orchestrator {
         quality: AudioQuality,
         disabled: &HashSet<String>,
     ) -> Result<PlaybackData, ResolveError> {
+        tracing::info!(
+            video_id,
+            upload = is_upload,
+            quality = ?quality,
+            disabled_clients = disabled.len(),
+            "stream resolution started"
+        );
         let prefer_high = matches!(quality, AudioQuality::High | AudioQuality::Auto);
         let logged_in = self.it.is_logged_in();
         let visitor = self.it.visitor_data();
@@ -342,6 +353,7 @@ impl Orchestrator {
                     continue;
                 }
                 let Some(client) = self.clients.get(key) else { continue };
+                tracing::debug!(video_id, client = key, "trying stream client");
                 if client.login_required && !logged_in {
                     continue;
                 }
@@ -380,7 +392,14 @@ impl Orchestrator {
 
             let Some(streaming) = resp.streaming_data.as_ref() else { continue };
             let Some(expires) = streaming.expires_in_seconds else { continue };
-            let Some(format) = find_format(streaming, quality) else { continue };
+            #[cfg(target_os = "ios")]
+            let format = find_ios_format(streaming, quality);
+            #[cfg(not(target_os = "ios"))]
+            let format = find_format(streaming, quality);
+            let Some(format) = format else {
+                tracing::debug!(client = %key, "no platform-compatible audio format");
+                continue;
+            };
             if audio_config_loudness.is_none() {
                 audio_config_loudness = main_loudness(&resp);
             }
@@ -795,7 +814,13 @@ impl Orchestrator {
         headers: HashMap<String, String>,
     ) -> PlaybackData {
         let vd = main_resp.as_ref().and_then(|r| r.video_details.as_ref());
-        tracing::info!(video_id, client, itag = format.itag, "resolved stream");
+        tracing::info!(
+            video_id,
+            client,
+            itag = format.itag,
+            mime = %format.mime_type,
+            "resolved stream"
+        );
         PlaybackData {
             video_id: video_id.to_owned(),
             stream_url: url,

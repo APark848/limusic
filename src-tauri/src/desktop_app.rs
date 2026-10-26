@@ -203,40 +203,6 @@ fn keep_on_screen(w: &tauri::WebviewWindow) {
     }
 }
 
-/// Logs to stdout **and** to `<app data>/limusic.log`, truncated each launch (the previous run is
-/// kept as `limusic.log.1`).
-///
-/// The filter names `app_lib`, the `[lib]` name, because that is what every tracing target in this
-/// crate carries (`app_lib::orchestrator`). It said `limusic_app` until 2026-08-29, which only ever
-/// matched `main.rs`, so every `debug!` in the app was dropped.
-///
-/// The file is the only way a Windows or macOS user can produce a log at all: `main.rs` sets
-/// `windows_subsystem = "windows"` in release, so there is no console to print to, and a bug that
-/// only reproduces on their machine (issue #71) otherwise has to be debugged by guessing.
-/// `RUST_LOG` still overrides the default filter for both.
-fn init_logging(dir: &std::path::Path) {
-    use tracing_subscriber::layer::SubscriberExt;
-    use tracing_subscriber::util::SubscriberInitExt;
-    use tracing_subscriber::Layer;
-
-    let filter = || {
-        tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "info,app_lib=debug".into())
-    };
-    let path = dir.join("limusic.log");
-    let _ = std::fs::rename(&path, dir.join("limusic.log.1"));
-    // ponytail: one file per launch, no size cap. A run long enough to matter is a run whose log
-    // someone wants anyway; add rotation if that stops being true.
-    let file = std::fs::File::create(&path).ok().map(std::sync::Mutex::new);
-    let file_layer = file.map(|f| {
-        tracing_subscriber::fmt::layer().with_ansi(false).with_writer(f).with_filter(filter())
-    });
-    tracing_subscriber::registry()
-        .with(tracing_subscriber::fmt::layer().with_filter(filter()))
-        .with(file_layer)
-        .init();
-}
-
 /// Raise the open-file soft limit to the hard limit, capped.
 ///
 /// WebKitGTK's DMABUF renderer spends a file descriptor per buffer, so a busy page can hold
@@ -456,7 +422,7 @@ pub fn run() {
             // App data dir for the SQLite file and player cache.
             let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir());
             std::fs::create_dir_all(&data_dir).ok();
-            init_logging(&data_dir);
+            diagnostics::init_logging(&data_dir);
 
             // Shared: the PoToken generator persists its session token through the same file,
             // and it is built before AppState takes ownership of everything else.

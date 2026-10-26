@@ -42,6 +42,7 @@ pub enum PlayerEvent {
 static EVENT_TX: OnceLock<Mutex<Option<UnboundedSender<PlayerEvent>>>> = OnceLock::new();
 static IDLE: AtomicBool = AtomicBool::new(true);
 static PLAYING: AtomicBool = AtomicBool::new(false);
+static REPORTED_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 fn event_sink() -> &'static Mutex<Option<UnboundedSender<PlayerEvent>>> {
     EVENT_TX.get_or_init(|| Mutex::new(None))
@@ -69,11 +70,25 @@ pub unsafe extern "C" fn limusic_ios_player_emit(kind: u32, value: f64, message:
         CStr::from_ptr(message).to_string_lossy().into_owned()
     };
 
+    if kind == 7 {
+        tracing::info!(stage = %message, "iOS AVPlayer stage");
+        return;
+    }
+
     let event = match kind {
-        0 => PlayerEvent::Position(value),
-        1 => PlayerEvent::Duration(value),
+        0 => {
+            if value > 0.0 && !REPORTED_PROGRESS.swap(true, Ordering::SeqCst) {
+                tracing::info!(position = value, "iOS AVPlayer reported first playback progress");
+            }
+            PlayerEvent::Position(value)
+        }
+        1 => {
+            tracing::info!(duration = value, "iOS AVPlayer item ready with duration");
+            PlayerEvent::Duration(value)
+        }
         2 => {
             let playing = value != 0.0;
+            tracing::info!(playing, "iOS AVPlayer time-control state changed");
             PLAYING.store(playing, Ordering::SeqCst);
             PlayerEvent::Playing(playing)
         }
@@ -84,11 +99,15 @@ pub unsafe extern "C" fn limusic_ios_player_emit(kind: u32, value: f64, message:
             PlayerEvent::TrackEnded
         }
         5 => {
+            tracing::warn!(category = "item-failed", error = %message, "iOS AVPlayer track failed");
             PLAYING.store(false, Ordering::SeqCst);
             IDLE.store(true, Ordering::SeqCst);
             PlayerEvent::TrackFailed(message)
         }
-        6 => PlayerEvent::Error(message),
+        6 => {
+            tracing::error!(category = "player", error = %message, "iOS AVPlayer error");
+            PlayerEvent::Error(message)
+        }
         _ => PlayerEvent::Error(format!("unknown iOS player event {kind}")),
     };
     send_event(event);
@@ -162,17 +181,24 @@ impl<R: Runtime> IosPlayer<R> {
             return Err(Error::Invalid("start position must be finite and non-negative"));
         }
         if let Some(name) = headers.keys().find(|name| !crate::supported_stream_header(name)) {
+            tracing::warn!(header = %name, "iOS player rejected unsupported stream header");
             return Err(Error::UnsupportedHeader(name.clone()));
         }
+        let mut header_names: Vec<&str> = headers.keys().map(String::as_str).collect();
+        header_names.sort_unstable();
+        tracing::info!(headers = ?header_names, has_start = start.is_some(), "calling Swift player load");
         self.0.run_mobile_plugin::<()>("load", LoadArgs { url, headers, start })?;
+        tracing::info!("Swift player load returned successfully");
         IDLE.store(false, Ordering::SeqCst);
         PLAYING.store(false, Ordering::SeqCst);
+        REPORTED_PROGRESS.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn play(&self) -> Result<()> {
+        tracing::info!("calling Swift player play");
         self.0.run_mobile_plugin::<()>("play", ())?;
-        PLAYING.store(true, Ordering::SeqCst);
+        tracing::info!("Swift player play returned successfully; awaiting AVPlayer state callback");
         Ok(())
     }
 
