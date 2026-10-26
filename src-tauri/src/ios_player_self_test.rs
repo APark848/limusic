@@ -105,24 +105,16 @@ async fn run(
 
     write_progress(result_path, "loading")?;
     state.player.load(&fixture_url, &HashMap::new(), None, None).context("load failed")?;
-    write_progress(result_path, "waiting-for-duration")?;
-    let duration = wait_for(events, "duration", |event| match event {
-        PlayerEvent::Duration(value) if value.is_finite() && *value > 0.0 => Some(*value),
-        _ => None,
-    })
-    .await?;
+    // Deliberately do not wait for AVPlayerItem.readyToPlay. This is the production song-tap
+    // sequence and protects the pending-play intent in the Swift bridge.
+    write_progress(result_path, "playing-before-ready")?;
+    state.player.play().context("play before ready failed")?;
+    let duration = wait_for_ready_and_playing(events).await?;
     if (duration - FIXTURE_SECONDS).abs() > 0.25 {
         bail!("unexpected fixture duration {duration:.3}s");
     }
     observed.push("duration");
 
-    write_progress(result_path, "playing")?;
-    state.player.play().context("play failed")?;
-    wait_for(events, "playing", |event| match event {
-        PlayerEvent::Playing(true) => Some(()),
-        _ => None,
-    })
-    .await?;
     let first = wait_for(events, "positive position", |event| match event {
         PlayerEvent::Position(value) if *value > 0.0 => Some(*value),
         _ => None,
@@ -292,19 +284,18 @@ async fn run_remote(
         );
         return;
     }
+    if let Err(error) = state.player.play() {
+        write_remote_failure(
+            &result_path,
+            "application",
+            "player-play",
+            &format!("The iOS player rejected play before readiness: {error}"),
+        );
+        return;
+    }
 
     let playback = tokio::time::timeout(Duration::from_secs(25), async {
-        wait_for(events, "remote duration", |event| match event {
-            PlayerEvent::Duration(value) if value.is_finite() && *value > 0.0 => Some(()),
-            _ => None,
-        })
-        .await?;
-        state.player.play().context("remote play command failed")?;
-        wait_for(events, "remote playing state", |event| match event {
-            PlayerEvent::Playing(true) => Some(()),
-            _ => None,
-        })
-        .await?;
+        wait_for_ready_and_playing(events).await?;
         let first = wait_for(events, "remote positive position", |event| match event {
             PlayerEvent::Position(value) if *value > 0.0 => Some(*value),
             _ => None,
@@ -353,6 +344,31 @@ fn write_remote_failure(path: &Path, category: &str, stage: &str, message: &str)
 
 fn write_progress(path: &Path, step: &'static str) -> std::io::Result<()> {
     std::fs::write(path, serde_json::json!({ "status": "running", "step": step }).to_string())
+}
+
+async fn wait_for_ready_and_playing(
+    events: &mut UnboundedReceiver<PlayerEvent>,
+) -> anyhow::Result<f64> {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        let mut duration = None;
+        let mut playing = false;
+        loop {
+            let event = events.recv().await.ok_or_else(|| anyhow!("event channel closed"))?;
+            reject_failure(&event)?;
+            match event {
+                PlayerEvent::Duration(value) if value.is_finite() && value > 0.0 => {
+                    duration = Some(value);
+                }
+                PlayerEvent::Playing(true) => playing = true,
+                _ => {}
+            }
+            if let (Some(duration), true) = (duration, playing) {
+                return Ok(duration);
+            }
+        }
+    })
+    .await
+    .map_err(|_| anyhow!("timed out waiting for ready autoplay"))?
 }
 
 async fn wait_for<T>(

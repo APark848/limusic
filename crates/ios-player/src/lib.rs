@@ -53,4 +53,20 @@ mod tests {
         assert!(!supported_stream_header("Authorization"));
         assert!(!supported_stream_header("Referer"));
     }
+
+    #[test]
+    fn swift_bridge_keeps_autoplay_intent_until_the_same_item_is_ready() {
+        let swift = include_str!("../ios/Sources/LimusicPlayerPlugin.swift");
+        assert!(swift.contains("private var wantsPlayback = false"));
+        assert!(swift.contains("guard item === player.currentItem, wantsPlayback else"));
+        assert!(swift.contains("self.startPlaybackIfReady(observed, stage: \"ready-autoplay\")"));
+        for method in ["pause", "stop"] {
+            let body = swift
+                .split(&format!("@objc public func {method}"))
+                .nth(1)
+                .and_then(|rest| rest.split("@objc public func").next())
+                .expect("Swift transport method");
+            assert!(body.contains("self.wantsPlayback = false"), "{method} must cancel autoplay");
+        }
+    }
 }

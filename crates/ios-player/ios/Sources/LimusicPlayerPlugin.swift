@@ -43,6 +43,7 @@ final class LimusicPlayerPlugin: Plugin {
   private var failedObserver: NSObjectProtocol?
   private var loopsCurrentItem = false
   private var failureEmitted = false
+  private var wantsPlayback = false
 
   deinit {
     removeObservers()
@@ -99,6 +100,16 @@ final class LimusicPlayerPlugin: Plugin {
 
   private func diagnostic(_ stage: String) {
     emit(EventKind.diagnostic, message: stage)
+  }
+
+  private func startPlaybackIfReady(_ item: AVPlayerItem, stage: String) {
+    guard item === player.currentItem, wantsPlayback else { return }
+    guard item.status == .readyToPlay else {
+      diagnostic("play-deferred-until-ready")
+      return
+    }
+    player.play()
+    diagnostic(stage)
   }
 
   private func safeFailure(_ error: Error?, fallback: String) -> String {
@@ -179,6 +190,7 @@ final class LimusicPlayerPlugin: Plugin {
     statusObservation = item.observe(\.status, options: [.initial, .new]) {
       [weak self, weak item] observed, _ in
       guard let self else { return }
+      guard observed === self.player.currentItem else { return }
       switch observed.status {
       case .readyToPlay:
         self.diagnostic("item-ready-to-play")
@@ -186,12 +198,15 @@ final class LimusicPlayerPlugin: Plugin {
         if seconds.isFinite && seconds >= 0 {
           self.emit(EventKind.duration, value: seconds)
         }
+        self.startPlaybackIfReady(observed, stage: "ready-autoplay")
       case .failed:
+        self.wantsPlayback = false
         self.diagnostic("item-failed")
         self.emitFailure(self.safeFailure(item?.error, fallback: "AVPlayer could not load this track"))
       case .unknown:
         self.diagnostic("item-status-unknown")
       @unknown default:
+        self.wantsPlayback = false
         self.emit(EventKind.error, message: "AVPlayer reported an unknown item status")
       }
     }
@@ -223,8 +238,9 @@ final class LimusicPlayerPlugin: Plugin {
       guard let self else { return }
       if self.loopsCurrentItem {
         self.player.seek(to: .zero)
-        self.player.play()
+        self.startPlaybackIfReady(item, stage: "loop-restart")
       } else {
+        self.wantsPlayback = false
         self.emit(EventKind.playing, value: 0)
         self.emit(EventKind.ended)
       }
@@ -236,6 +252,8 @@ final class LimusicPlayerPlugin: Plugin {
       queue: .main
     ) { [weak self] notification in
       guard let self else { return }
+      guard item === self.player.currentItem else { return }
+      self.wantsPlayback = false
       let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
       self.emitFailure(self.safeFailure(error, fallback: "AVPlayer failed before the track ended"))
     }
@@ -244,6 +262,7 @@ final class LimusicPlayerPlugin: Plugin {
       guard let self, let item, item === self.player.currentItem, item.status == .unknown else {
         return
       }
+      self.wantsPlayback = false
       self.diagnostic("item-status-timeout")
       self.emitFailure("AVPlayer could not prepare this track")
     }
@@ -270,6 +289,7 @@ final class LimusicPlayerPlugin: Plugin {
     resolveOnMain(invoke) { [weak self] in
       guard let self else { return }
       self.removeObservers()
+      self.wantsPlayback = false
       self.failureEmitted = false
       self.diagnostic("load-received")
       let item = AVPlayerItem(asset: asset)
@@ -295,14 +315,27 @@ final class LimusicPlayerPlugin: Plugin {
       try session.setCategory(.playback, mode: .default)
       try session.setActive(true)
       self.diagnostic("audio-session-active")
-      self.player.play()
-      self.diagnostic("play-requested")
+      self.wantsPlayback = true
+      if let item = self.player.currentItem {
+        if item.status == .failed {
+          self.wantsPlayback = false
+          throw NSError(
+            domain: "LimusicPlayer",
+            code: 8,
+            userInfo: [
+              NSLocalizedDescriptionKey:
+                self.safeFailure(item.error, fallback: "AVPlayer could not play this track")
+            ])
+        }
+        self.startPlaybackIfReady(item, stage: "play-requested")
+      }
     }
   }
 
   @objc public func pause(_ invoke: Invoke) {
     resolveOnMain(invoke) { [weak self] in
       guard let self else { return }
+      self.wantsPlayback = false
       self.player.pause()
       self.emit(EventKind.playing, value: 0)
       self.emit(EventKind.paused, value: 1)
@@ -312,6 +345,7 @@ final class LimusicPlayerPlugin: Plugin {
   @objc public func stop(_ invoke: Invoke) {
     resolveOnMain(invoke) { [weak self] in
       guard let self else { return }
+      self.wantsPlayback = false
       self.player.pause()
       self.removeObservers()
       self.player.replaceCurrentItem(with: nil)
