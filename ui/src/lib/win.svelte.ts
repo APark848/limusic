@@ -13,7 +13,8 @@ import { invoke } from '@tauri-apps/api/core';
  *  (`native_chrome` in commands.rs) so the SPA needs no user-agent platform check. */
 export const win = $state({
 	maximized: false,
-	chrome: 'off' as 'off' | 'on' | 'overlay' | 'mobile'
+	chrome: 'off' as 'off' | 'on' | 'overlay' | 'mobile',
+	ready: false
 });
 
 let started = false;
@@ -36,6 +37,7 @@ export function initWin(): () => void {
 	// of window buttons on its way to the system frame. The catch still reveals desktop if settings
 	// fail, or a backend hiccup would leave the app with no window at all (#122).
 	const startDesktopWindow = () => {
+		win.ready = true;
 		invoke<boolean>('show_main')
 			.then((visible) => setUiVisible(visible))
 			.catch((e) => console.error('window show failed', e));
@@ -51,6 +53,7 @@ export function initWin(): () => void {
 		.then((s) => {
 			if (s.native_chrome === 'mobile') {
 				win.chrome = 'mobile';
+				win.ready = true;
 				setUiVisible(true);
 				void invoke('frontend_ready').catch((e) => console.error('frontend ready failed', e));
 				return;

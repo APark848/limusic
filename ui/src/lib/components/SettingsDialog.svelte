@@ -471,17 +471,20 @@
 	     transitioning the width relayouts the whole modal every frame, and WebKitGTK is the webview
 	     that would pay for it. -->
 	<Dialog.Content
-		class="gap-0 overflow-hidden p-0 {tab === 'discord' || tab === 'scrobbling' || tab === 'themes' ? 'sm:max-w-5xl' : tab === 'hotkeys' ? 'sm:max-w-4xl' : 'sm:max-w-3xl'}"
+		class="gap-0 overflow-hidden p-0 {win.chrome === 'mobile' ? 'mobile-settings-dialog' : ''} {tab === 'discord' || tab === 'scrobbling' || tab === 'themes' ? 'sm:max-w-5xl' : tab === 'hotkeys' ? 'sm:max-w-4xl' : 'sm:max-w-3xl'}"
+		style={win.chrome === 'mobile'
+			? 'height:calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 1rem);max-height:calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 1rem)'
+			: undefined}
 	>
 		<Dialog.Description class="sr-only">{t('settings.title')}</Dialog.Description>
 
-		<div class="flex min-w-0 h-[min(38rem,80vh)] {win.chrome === 'mobile' ? 'flex-col' : ''}">
+		<div class="flex min-h-0 min-w-0 {win.chrome === 'mobile' ? 'h-full flex-col' : 'h-[min(38rem,80vh)]'}">
 			<!-- Tab rail -->
 			<nav class="flex shrink-0 flex-col bg-muted/40 p-3 {win.chrome === 'mobile' ? 'w-full border-b' : 'w-52 border-r'}">
 				<Dialog.Title class="px-3 pt-1 pb-4 font-heading text-base font-semibold">
 					{t('settings.title')}
 				</Dialog.Title>
-				<div class="flex gap-0.5 {win.chrome === 'mobile' ? 'overflow-x-auto' : 'flex-col'}">
+				<div class="flex gap-0.5 {win.chrome === 'mobile' ? 'overflow-x-auto overflow-y-hidden overscroll-x-contain touch-pan-x' : 'flex-col'}">
 					{#each TABS as tb (tb.id)}
 						<button
 							onclick={() => (tab = tb.id)}
@@ -510,7 +513,7 @@
 
 			<!-- Content pane. min-w-0: a flex child's min-width is auto, so without it one wide row
 			     (a long font name, a long path) widens the pane and pushes every tab off the modal. -->
-			<div class="flex min-w-0 flex-1 flex-col">
+			<div class="flex min-h-0 min-w-0 flex-1 flex-col">
 				<!-- h-14 also keeps the dialog's close button clear of the first row. -->
 				<header class="flex h-14 shrink-0 flex-col justify-center border-b px-6 pr-14">
 					<h2 class="text-sm font-semibold">{currentTab.label}</h2>
@@ -527,7 +530,7 @@
 				<!-- relative: an absolute child (the lyrics sources' sr-only live region) would otherwise
 				     be laid out against the dialog, outside this pane, and make the overflow-hidden dialog
 				     scrollable. scrollIntoView then scrolls the dialog too and clips its rail (#406). -->
-				<div class="relative min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-5">
+				<div class="relative min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-6 py-5 {win.chrome === 'mobile' ? 'mobile-settings-scroll touch-pan-y overscroll-contain' : ''}">
 					{#if !loaded}
 						<p class="text-sm text-muted-foreground">{t('common.loading')}</p>
 					{:else if tab === 'general'}

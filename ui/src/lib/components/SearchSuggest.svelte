@@ -172,7 +172,7 @@
 			id="search-suggest"
 			role="listbox"
 			aria-label={t('a11y.search_preview')}
-			class="absolute top-full z-50 mt-2 overflow-hidden rounded-xl border bg-popover text-popover-foreground shadow-xl animate-in fade-in-0 zoom-in-95 duration-150 {panelClass}"
+			class="mobile-search-suggest absolute top-full z-50 mt-2 overflow-hidden rounded-xl border bg-popover text-popover-foreground shadow-xl animate-in fade-in-0 zoom-in-95 duration-150 {panelClass}"
 		>
 			{#if loading && !items.length && !queries.length}
 				{#each Array(4) as _, i (i)}

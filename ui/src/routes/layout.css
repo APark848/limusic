@@ -723,8 +723,23 @@ html.art-tint.theme-amoled {
 .mobile-shell .mood-grid.genres {
 	grid-template-columns: minmax(0, 1fr);
 }
-.mobile-shell .rail {
-	touch-action: pan-x;
+.mobile-shell {
+	/* Allow native axis locking for shelves and the page while excluding page-scale gestures. */
+	touch-action: pan-x pan-y;
+}
+.mobile-shell .mobile-search-suggest {
+	-webkit-overflow-scrolling: touch;
+	max-height: min(60dvh, calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 7rem));
+	overflow-x: hidden;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+	touch-action: pan-y;
+}
+.mobile-settings-dialog {
+	overscroll-behavior: contain;
+}
+.mobile-settings-scroll {
+	-webkit-overflow-scrolling: touch;
 }
 .mobile-shell .mobile-page-x {
 	padding-left: 1rem;

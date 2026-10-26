@@ -56,7 +56,7 @@
 	import { isLocalId } from '$lib/api';
 	import { video } from '$lib/video.svelte';
 	import { win, initWin } from '$lib/win.svelte';
-	import { isMobileShell, showMobileMiniPlayer } from '$lib/mobile-shell';
+	import { isMobileShell, showMobileMiniPlayer, zoomPolicy } from '$lib/mobile-shell';
 	import { initZoom } from '$lib/zoom.svelte';
 	import { initShortcuts } from '$lib/shortcuts';
 	import { initErrorLog } from '$lib/errlog';
@@ -202,6 +202,11 @@
 	// routes below it are ever rendered. Constant for the window's lifetime.
 	const isMini = browser && getCurrentWindow().label === 'mini';
 	const mobile = $derived(isMobileShell(win.chrome));
+	const currentZoomPolicy = $derived(zoomPolicy(win.chrome, win.ready));
+	$effect(() => {
+		if (!browser || isMini || currentZoomPolicy === 'pending') return;
+		return initZoom(currentZoomPolicy === 'fixed');
+	});
 
 	// Apply the saved accent color before the first paint (ssr=false → nothing renders until now).
 	if (browser) initTheme();
@@ -229,14 +234,12 @@
 		// mounted for days and a mount-only check would never see a release published in between.
 		const updateTimer = setInterval(checkForUpdatesQuiet, QUIET_INTERVAL_MS);
 		const teardownApp = initApp();
-		const teardownZoom = initZoom();
 		const teardownShortcuts = initShortcuts();
 		initImport();
 		return () => {
 			clearInterval(updateTimer);
 			teardownApp();
 			teardownWin();
-			teardownZoom();
 			teardownShortcuts();
 		};
 	});

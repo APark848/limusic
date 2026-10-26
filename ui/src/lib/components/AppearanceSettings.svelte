@@ -36,6 +36,7 @@
 	import { thumb } from '$lib/thumb';
 	import { appIcon, chooseAppIcon } from '$lib/appicon.svelte';
 	import { t, type TranslationKey } from '$lib/i18n.svelte';
+	import { win } from '$lib/win.svelte';
 	import {
 		THEMES,
 		FONTS,
@@ -383,11 +384,13 @@
 					control: radiusValue,
 					below: radiusSlider
 				})}
-				{@render row({
-					title: t('settings.themes.zoom'),
-					desc: t('settings.themes.zoom_hint'),
-					control: zoomStepper
-				})}
+				{#if win.chrome !== 'mobile'}
+					{@render row({
+						title: t('settings.themes.zoom'),
+						desc: t('settings.themes.zoom_hint'),
+						control: zoomStepper
+					})}
+				{/if}
 				{@render row({
 					title: t('settings.themes.app_icon'),
 					desc: t('settings.themes.app_icon_hint'),
