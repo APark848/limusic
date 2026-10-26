@@ -5,6 +5,7 @@
 //! a channel ([`MediaHandle`]); OS control presses route back into [`AppState`] through the
 //! captured `AppHandle`. The two share the same commands the UI uses, so they never drift.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -19,10 +20,24 @@ use crate::state::AppState;
 
 /// Update messages: app → media-controls owner thread.
 enum MediaUpdate {
-    Metadata { title: String, artist: String, album: Option<String>, cover: Option<String> },
+    Metadata {
+        generation: u64,
+        title: String,
+        artist: String,
+        album: Option<String>,
+        cover: Option<String>,
+    },
+    #[cfg(target_os = "ios")]
+    Artwork {
+        generation: u64,
+        path: String,
+    },
     Album(String), // learned after the track's metadata went out; keeps the duration
     Duration(f64),
-    Playback { playing: bool, pos: f64 },
+    Playback {
+        playing: bool,
+        pos: f64,
+    },
     Volume(i64), // slider percent, 0-100
 }
 
@@ -30,6 +45,7 @@ enum MediaUpdate {
 /// integration failed to initialize (e.g. no session bus) — every push is then a no-op.
 pub struct MediaHandle {
     tx: Sender<MediaUpdate>,
+    generation: Arc<AtomicU64>,
 }
 
 impl MediaHandle {
@@ -40,12 +56,32 @@ impl MediaHandle {
         album: Option<&str>,
         cover: Option<&str>,
     ) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        #[cfg(target_os = "ios")]
+        let (cover, remote_cover) = match cover {
+            Some(url) if url.starts_with("http://") || url.starts_with("https://") => {
+                (None, Some(url.to_owned()))
+            }
+            _ => (cover.map(str::to_owned), None),
+        };
+        #[cfg(not(target_os = "ios"))]
+        let cover = cover.map(str::to_owned);
         let _ = self.tx.send(MediaUpdate::Metadata {
+            generation,
             title: title.to_owned(),
             artist: artist.to_owned(),
             album: album.map(str::to_owned),
-            cover: cover.map(str::to_owned),
+            cover,
         });
+        #[cfg(target_os = "ios")]
+        if let Some(url) = remote_cover {
+            let tx = self.tx.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Some(path) = cache_ios_artwork(&url, generation).await {
+                    let _ = tx.send(MediaUpdate::Artwork { generation, path });
+                }
+            });
+        }
     }
 
     /// A search or home card starts playing with no album name; the radio fetched behind it
@@ -71,10 +107,11 @@ impl MediaHandle {
 /// created (integration simply absent then — MPRIS-only fallback is blessed, context/16).
 pub fn spawn(app: AppHandle) -> Option<MediaHandle> {
     let (tx, rx) = channel::<MediaUpdate>();
+    let generation = Arc::new(AtomicU64::new(0));
     let spawned =
         std::thread::Builder::new().name("media-controls".into()).spawn(move || run(app, rx));
     match spawned {
-        Ok(_) => Some(MediaHandle { tx }),
+        Ok(_) => Some(MediaHandle { tx, generation }),
         Err(e) => {
             tracing::warn!(error = %e, "media-controls thread spawn failed");
             None
@@ -122,19 +159,42 @@ fn run(app: AppHandle, rx: std::sync::mpsc::Receiver<MediaUpdate>) {
     let mut album: Option<String> = None;
     let mut cover: Option<String> = None;
     let mut duration: Option<f64> = None;
+    #[cfg(target_os = "ios")]
+    let mut generation = 0;
     #[cfg(target_os = "linux")]
     let mut volume: Option<i64> = None;
 
     // `recv` blocks until the sender drops (app shutdown), keeping `controls` alive.
     while let Ok(update) = rx.recv() {
         match update {
-            MediaUpdate::Metadata { title: t, artist: a, album: al, cover: c } => {
+            MediaUpdate::Metadata {
+                generation: next_generation,
+                title: t,
+                artist: a,
+                album: al,
+                cover: c,
+            } => {
+                #[cfg(target_os = "ios")]
+                {
+                    generation = next_generation;
+                }
+                #[cfg(not(target_os = "ios"))]
+                {
+                    let _ = next_generation;
+                }
                 title = t;
                 artist = a;
                 album = al;
                 cover = c;
                 duration = None; // new track — length not known until mpv reports it
                 apply_metadata(&mut controls, &title, &artist, &album, &cover, duration);
+            }
+            #[cfg(target_os = "ios")]
+            MediaUpdate::Artwork { generation: artwork_generation, path } => {
+                if artwork_generation == generation {
+                    cover = Some(path);
+                    apply_metadata(&mut controls, &title, &artist, &album, &cover, duration);
+                }
             }
             MediaUpdate::Album(al) => {
                 album = Some(al);
@@ -166,6 +226,48 @@ fn run(app: AppHandle, rx: std::sync::mpsc::Receiver<MediaUpdate>) {
             MediaUpdate::Volume(_) => {}
         }
     }
+}
+
+#[cfg(target_os = "ios")]
+async fn cache_ios_artwork(url: &str, generation: u64) -> Option<String> {
+    const MAX_ARTWORK_BYTES: u64 = 10 * 1024 * 1024;
+    let response = match reqwest::get(url).await {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::warn!(status = %response.status(), "iOS media artwork request failed");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(category = "request", error = %error.without_url(), "iOS media artwork request failed");
+            return None;
+        }
+    };
+    if response.content_length().is_some_and(|size| size > MAX_ARTWORK_BYTES) {
+        tracing::warn!("iOS media artwork exceeded the size limit");
+        return None;
+    }
+    let bytes = match response.bytes().await {
+        Ok(bytes) if bytes.len() as u64 <= MAX_ARTWORK_BYTES => bytes,
+        Ok(_) => {
+            tracing::warn!("iOS media artwork exceeded the size limit");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(category = "body", error = %error.without_url(), "iOS media artwork request failed");
+            return None;
+        }
+    };
+    let directory = std::env::temp_dir().join("limusic-now-playing");
+    if let Err(error) = std::fs::create_dir_all(&directory) {
+        tracing::warn!(%error, "could not create iOS media artwork cache");
+        return None;
+    }
+    let path = directory.join(format!("artwork-{generation}"));
+    if let Err(error) = std::fs::write(&path, bytes) {
+        tracing::warn!(%error, "could not cache iOS media artwork");
+        return None;
+    }
+    Some(path.to_string_lossy().into_owned())
 }
 
 fn apply_metadata(
@@ -213,11 +315,13 @@ pub(crate) fn handle_event(app: &AppHandle, event: MediaControlEvent) {
         let Some(state) = app.try_state::<Arc<AppState>>() else { return };
         let state = state.inner().clone();
         match event {
-            MediaControlEvent::Play | MediaControlEvent::Toggle => state.resume_or_toggle().await,
+            MediaControlEvent::Play => state.resume().await,
+            MediaControlEvent::Toggle => state.resume_or_toggle().await,
             MediaControlEvent::Pause | MediaControlEvent::Stop => {
                 let _ = state.player.pause();
             }
             // GNOME's panel media widget calls MPRIS Raise when the entry itself is clicked.
+            #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
             MediaControlEvent::Raise => crate::tray::show_main(&app),
             MediaControlEvent::Next => state.next_in_queue().await,
             MediaControlEvent::Previous => state.prev_in_queue().await,
@@ -239,7 +343,10 @@ pub(crate) fn handle_event(app: &AppHandle, event: MediaControlEvent) {
             // An MPRIS widget or KDE Connect (#220). Same path as a volume hotkey, which also
             // pushes the new level back: without that the widget snaps to the old one.
             MediaControlEvent::SetVolume(v) => {
-                crate::hotkeys::change_volume(&state, &app, |_| (v * 100.0).round() as i64)
+                #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+                crate::hotkeys::change_volume(&state, &app, |_| (v * 100.0).round() as i64);
+                #[cfg(target_os = "ios")]
+                let _ = v;
             }
             _ => {}
         }

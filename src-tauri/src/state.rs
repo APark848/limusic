@@ -1776,6 +1776,32 @@ impl AppState {
         }
     }
 
+    /// Idempotent play/resume for OS media controls. Unlike the UI's toggle, a repeated Play
+    /// command must never pause a track that is already playing.
+    pub async fn resume(self: &std::sync::Arc<Self>) {
+        if self.lt.is_guest().await || self.is_playing.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.player.is_idle() {
+            let (idx, has_items) = {
+                let q = self.queue.lock().await;
+                (q.current, !q.items.is_empty())
+            };
+            if has_items {
+                self.play_index(idx).await;
+            }
+            return;
+        }
+        let error = match self.player.play() {
+            Ok(()) => return,
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!(%error, "native transport play failed");
+        if let Some(item) = self.current_item().await {
+            self.emit_error(&item.video_id, &error);
+        }
+    }
+
     /// Jump to a specific queue index.
     pub async fn play_index(self: &std::sync::Arc<Self>, index: usize) {
         if self.lt.is_guest().await {
@@ -2568,10 +2594,14 @@ impl AppState {
         let _ = self.app.emit("playback-state", "playing");
         // Push the same metadata to the OS media widget (context/16) and Discord.
         if let Some(m) = &self.media {
-            // MPRIS/SMTC want a URL; a local track's artwork is a path, so hand it a file:// one.
-            // Scheme, not leading slash: a Windows cover path is `C:\...`, and SMTC drops the whole
-            // metadata update (cover included) when the thumbnail URI won't parse.
+            // Desktop integrations want a URL; a local track's artwork is a path, so hand them a
+            // file:// one. Souvlaki's iOS backend instead reads local artwork as a filesystem path;
+            // remote artwork is downloaded by media.rs before being published to Now Playing.
             let cover = item.thumbnail.as_ref().map(|t| {
+                #[cfg(target_os = "ios")]
+                if !t.contains("://") {
+                    return t.to_owned();
+                }
                 if t.contains("://") {
                     crate::media::cover_url(t)
                 } else {

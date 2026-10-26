@@ -26,9 +26,14 @@ mod listenbrainz;
 mod listentogether;
 mod local;
 mod lyrics;
-#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux", target_os = "ios"))]
 mod media;
-#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(
+    target_os = "windows",
+    target_os = "macos",
+    target_os = "linux",
+    target_os = "ios"
+)))]
 use platform::mobile_services::media;
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 mod mini;
