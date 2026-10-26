@@ -374,7 +374,7 @@
 	     is the one thing WebKitGTK reliably chokes on. Under it, a short fade instead of a rule. -->
 	<div class="h-px" {@attach stickWatch}></div>
 	<div
-		class="sticky top-0 z-20 flex items-start gap-2 px-6 py-2.5 transition-colors duration-200 {stuck
+		class="mobile-page-x sticky top-0 z-20 flex items-start gap-2 px-6 py-2.5 transition-colors duration-200 {stuck
 			? 'bg-background'
 			: ''}"
 	>
@@ -425,7 +425,7 @@
 			></div>
 		{/if}
 	</div>
-	<div class="px-6 pb-8 pt-4">
+	<div class="mobile-page-x px-6 pb-8 pt-4">
 		{#snippet shelfSkeletons(n: number)}
 			{#each Array(n) as _, s (s)}
 				<section aria-hidden="true">

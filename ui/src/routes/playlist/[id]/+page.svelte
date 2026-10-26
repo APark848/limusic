@@ -979,8 +979,8 @@
 
 <div class="flex h-full flex-col">
 	{#if loading}
-		<div class="flex items-end gap-6 border-b p-6">
-			<Skeleton class="h-40 w-40 shrink-0 rounded-xl" />
+		<div class="mobile-playlist-header flex items-end gap-6 border-b p-6">
+			<Skeleton class="mobile-playlist-art h-40 w-40 shrink-0 rounded-xl" />
 			<div class="flex-1 space-y-3">
 				<Skeleton class="h-3 w-16 rounded" />
 				<Skeleton class="h-10 w-2/3 rounded-lg" />
@@ -999,7 +999,7 @@
 		<!-- One scroller for the whole page: the header scrolls away above the rows, same as the
 		     album page. -->
 		<div class="content-in min-h-0 flex-1 overflow-y-auto" {@attach sc.attach}>
-			<div class="relative flex min-h-[38vh] shrink-0 items-end gap-6 overflow-hidden border-b p-6">
+			<div class="mobile-playlist-header relative flex min-h-[38vh] shrink-0 items-end gap-6 overflow-hidden border-b p-6">
 				<!-- The backdrop and its fade share one layer (`art-wash` on the wrapper): see HomeHero. -->
 				<div class="art-wash pointer-events-none absolute inset-0 overflow-hidden">
 					{#if backdrop}
@@ -1020,14 +1020,14 @@
 				</div>
 				{#if isOnRepeat}
 					<div
-						class="relative flex h-40 w-40 items-center justify-center rounded-xl bg-primary/10 text-primary shadow-lg"
+						class="mobile-playlist-art relative flex h-40 w-40 items-center justify-center rounded-xl bg-primary/10 text-primary shadow-lg"
 					>
 						<HugeiconsIcon icon={ListRestartIcon} class="h-20 w-20" />
 					</div>
 				{:else if art}
-					<img src={art} alt="" class="relative h-40 w-40 rounded-xl object-cover shadow-lg" />
+					<img src={art} alt="" class="mobile-playlist-art relative h-40 w-40 rounded-xl object-cover shadow-lg" />
 				{:else}
-					<div class="relative h-40 w-40 rounded-xl bg-muted"></div>
+					<div class="mobile-playlist-art relative h-40 w-40 rounded-xl bg-muted"></div>
 				{/if}
 				<div class="relative min-w-0 flex-1">
 					<div class="flex items-center gap-2 text-xs font-medium uppercase text-muted-foreground">
@@ -1060,7 +1060,7 @@
 							</button>
 						{/if}
 					</div>
-					<h1 class="mt-1 font-heading text-4xl font-bold tracking-tight drop-shadow-lg">
+					<h1 class="mobile-page-title mt-1 font-heading text-4xl font-bold tracking-tight drop-shadow-lg">
 						{pl.title ?? t('common.playlist_singular')}
 					</h1>
 					{#if subtitle}<p class="mt-2 text-sm text-muted-foreground">{subtitle}</p>{/if}
@@ -1080,7 +1080,7 @@
 							{/if}
 						</div>
 					{/if}
-					<div class="mt-4 flex items-center justify-between gap-2">
+					<div class="mobile-wrap mt-4 flex items-center justify-between gap-2">
 						<div class="flex items-center gap-2">
 							<Button
 								class="gap-2"
@@ -1128,7 +1128,7 @@
 						</div>
 					</div>
 				</div>
-				<div class="absolute right-6 top-6">
+				<div class="mobile-playlist-filter absolute right-6 top-6">
 					<TrackFilter
 						bind:value={query}
 						placeholder={t('common.search_this_playlist')}

@@ -219,8 +219,8 @@
 		<div
 			class="absolute inset-0 bg-gradient-to-t from-background via-background/60 to-background/10"
 		></div>
-		<div class="relative max-w-3xl p-8">
-			<h1 class="font-heading text-5xl font-bold tracking-tight drop-shadow-lg">{artist.name}</h1>
+		<div class="mobile-artist-hero relative max-w-3xl p-8">
+			<h1 class="mobile-artist-title font-heading text-5xl font-bold tracking-tight drop-shadow-lg">{artist.name}</h1>
 			{#if artist.subscribers || artist.monthlyListeners}
 				<p class="mt-2 text-sm text-muted-foreground">
 					{#if artist.subscribers}{artist.subscribers}{/if}
@@ -239,7 +239,7 @@
 					{expanded ? t('common.less') : t('common.more')}
 				</button>
 			{/if}
-			<div class="mt-5 flex items-center gap-3">
+			<div class="mobile-wrap mt-5 flex items-center gap-3">
 				<button
 					class="flex items-center gap-2 rounded-full bg-foreground px-5 py-2.5 text-sm font-semibold text-background transition hover:opacity-90 disabled:opacity-50"
 					onclick={shuffle}
@@ -298,7 +298,7 @@
 		</div>
 	</div>
 
-	<div class="content-in flex flex-col gap-8 p-6">
+	<div class="mobile-page-pad content-in flex flex-col gap-8 p-6">
 		{#if artist.topSongs.length}
 			<section>
 				<!-- Same header shape as Shelf: title and "See all" both navigate. -->

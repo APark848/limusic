@@ -151,10 +151,10 @@
 	{/if}
 {/snippet}
 
-<div class="p-6">
-	<div class="mb-6 flex items-center justify-between">
+<div class="mobile-page-pad p-6">
+	<div class="mobile-library-header mb-6 flex items-center justify-between">
 		<h1 class="font-heading text-2xl font-bold">{t('library.title')}</h1>
-		<div class="flex items-center gap-2">
+		<div class="mobile-wrap flex items-center gap-2">
 			<!-- Only with something to push: saves made before signing in, which live on this
 			     machine until this button puts them on the account. -->
 			{#if auth.account?.signedIn && toSync.length}
@@ -218,7 +218,7 @@
 
 	<!-- The tabs always render: Local music needs neither an account nor a connection. -->
 	<Tabs.Root bind:value={tab}>
-		<Tabs.List class="mb-4">
+		<Tabs.List class="mobile-tabs-list mb-4">
 			<Tabs.Trigger value="all">
 				<HugeiconsIcon icon={SquareStackIcon} class="h-4 w-4" /> {t('common.all')}
 			</Tabs.Trigger>

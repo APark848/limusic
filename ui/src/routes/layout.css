@@ -708,6 +708,107 @@ html.art-tint.theme-amoled {
 	}
 }
 
+/* The phone shell is selected from Rust's platform state, not viewport width. Desktop windows can
+   be narrow while being resized, so these rules must never be plain media queries. */
+.mobile-shell .card-grid {
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	grid-auto-rows: auto;
+}
+.mobile-shell .card-grid > * {
+	min-width: 0;
+	contain-intrinsic-size: auto 12.75rem;
+}
+.mobile-shell .mood-grid.for-you,
+.mobile-shell .mood-grid.moods,
+.mobile-shell .mood-grid.genres {
+	grid-template-columns: minmax(0, 1fr);
+}
+.mobile-shell .rail {
+	touch-action: pan-x;
+}
+.mobile-shell .mobile-page-x {
+	padding-left: 1rem;
+	padding-right: 1rem;
+}
+.mobile-shell .mobile-page-pad {
+	padding: 1rem;
+}
+.mobile-shell .mobile-page-title,
+.mobile-shell .mobile-home-hero-title,
+.mobile-shell .mobile-search-title {
+	font-size: 1.875rem;
+	line-height: 2.25rem;
+}
+.mobile-shell .mobile-search-title {
+	padding-left: 1rem;
+	padding-right: 1rem;
+	padding-top: 1.5rem;
+}
+.mobile-shell .mobile-home-hero-header,
+.mobile-shell .mobile-library-header,
+.mobile-shell .mobile-album-header,
+.mobile-shell .mobile-playlist-header {
+	align-items: stretch;
+	flex-direction: column;
+}
+.mobile-shell .mobile-home-hero-header {
+	gap: 1rem;
+	padding: 1.5rem 1rem 1rem;
+}
+.mobile-shell .mobile-home-search {
+	max-width: none;
+}
+.mobile-shell .mobile-search-panel {
+	width: min(26rem, calc(100vw - 2rem));
+}
+.mobile-shell .mobile-library-header {
+	gap: 0.75rem;
+}
+.mobile-shell .mobile-wrap {
+	flex-wrap: wrap;
+}
+.mobile-shell .mobile-tabs-list {
+	max-width: 100%;
+	justify-content: flex-start;
+	overflow-x: auto;
+}
+.mobile-shell .mobile-album-filter {
+	position: relative;
+	right: auto;
+	top: auto;
+	padding: 1rem 1rem 0;
+}
+.mobile-shell .mobile-album-content {
+	padding: 1.25rem 1rem 1rem;
+}
+.mobile-shell .mobile-album-header {
+	gap: 1rem;
+}
+.mobile-shell .mobile-artist-hero {
+	padding: 1rem;
+}
+.mobile-shell .mobile-artist-title {
+	font-size: 1.875rem;
+	line-height: 2.25rem;
+}
+.mobile-shell .mobile-playlist-header {
+	align-items: flex-start;
+	gap: 1rem;
+	justify-content: flex-end;
+	padding: 1rem;
+}
+.mobile-shell .mobile-playlist-art {
+	height: 7rem;
+	width: 7rem;
+}
+.mobile-shell .mobile-playlist-filter {
+	position: relative;
+	right: auto;
+	top: auto;
+	z-index: 10;
+	width: 100%;
+}
+
 /* --- Motion & interaction polish --- */
 
 /* Loaded page content fades in over the skeleton/route swap it replaces. Opacity-only —

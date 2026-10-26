@@ -78,7 +78,7 @@
 		></div>
 	</div>
 
-	<div class="flex items-center justify-between gap-6 px-6 pb-4 pt-10">
+	<div class="mobile-home-hero-header flex items-center justify-between gap-6 px-6 pb-4 pt-10">
 		<div class="flex min-w-0 items-center gap-4">
 			{#if auth.account?.signedIn && auth.account.thumbnail}
 				<!-- max-width:none defeats Tailwind Preflight's `img{max-width:100%}`, which in a tight box
@@ -91,7 +91,7 @@
 					class="shrink-0 rounded-full object-cover shadow-md"
 				/>
 			{/if}
-			<h1 class="truncate font-heading text-4xl font-bold tracking-tight drop-shadow-sm">
+			<h1 class="mobile-home-hero-title truncate font-heading text-4xl font-bold tracking-tight drop-shadow-sm">
 				{daypart}{auth.account?.name ? `, ${auth.account.name.split(' ')[0]}` : ''}
 			</h1>
 		</div>
@@ -106,7 +106,7 @@
 			>
 				<HugeiconsIcon icon={HistoryIcon} class="h-5 w-5" />
 			</button>
-			<form class="relative w-full max-w-xs" onsubmit={(e) => { e.preventDefault(); goSearch(); }}>
+			<form class="mobile-home-search relative w-full max-w-xs" onsubmit={(e) => { e.preventDefault(); goSearch(); }}>
 				<HugeiconsIcon
 					icon={Search01Icon}
 					class="pointer-events-none absolute left-3 top-1/2 z-10 h-4 w-4 -translate-y-1/2 text-muted-foreground"
@@ -117,7 +117,7 @@
 					bind:value={searchQuery}
 					placeholder={t('common.search')}
 					inputClass="rounded-full pl-9"
-					panelClass="right-0 w-[26rem]"
+					panelClass="mobile-search-panel right-0 w-[26rem]"
 				/>
 			</form>
 		</div>

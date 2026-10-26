@@ -59,7 +59,7 @@
 		| 'scrobbling'
 		| 'data'
 		| 'about';
-	const TABS = $derived<{ id: TabId; label: string; hint: string; icon: typeof Settings02Icon }[]>([
+	const TABS = $derived(([
 		{ id: 'general', label: t('settings.tabs.general'), hint: t('settings.tabs.general_hint'), icon: Settings02Icon },
 		{ id: 'themes', label: t('settings.tabs.themes'), hint: t('settings.tabs.themes_hint'), icon: PaintBoardIcon },
 		{ id: 'playback', label: t('settings.tabs.playback'), hint: t('settings.tabs.playback_hint'), icon: PlayCircleIcon },
@@ -68,7 +68,9 @@
 		{ id: 'scrobbling', label: t('settings.tabs.scrobbling'), hint: t('settings.tabs.scrobbling_hint'), icon: LastFmIcon },
 		{ id: 'data', label: t('settings.tabs.data'), hint: t('settings.tabs.data_hint'), icon: Database02Icon },
 		{ id: 'about', label: t('settings.tabs.about'), hint: t('settings.tabs.about_hint'), icon: InformationCircleIcon }
-	]);
+	] satisfies { id: TabId; label: string; hint: string; icon: typeof Settings02Icon }[]).filter(
+		(item) => win.chrome !== 'mobile' || (item.id !== 'hotkeys' && item.id !== 'discord')
+	));
 
 	// Shared shapes for the settings rows. Kept as strings so the markup below stays readable and
 	// every group looks identical without a wrapper component per row.
@@ -473,18 +475,20 @@
 	>
 		<Dialog.Description class="sr-only">{t('settings.title')}</Dialog.Description>
 
-		<div class="flex min-w-0 h-[min(38rem,80vh)]">
+		<div class="flex min-w-0 h-[min(38rem,80vh)] {win.chrome === 'mobile' ? 'flex-col' : ''}">
 			<!-- Tab rail -->
-			<nav class="flex w-52 shrink-0 flex-col border-r bg-muted/40 p-3">
+			<nav class="flex shrink-0 flex-col bg-muted/40 p-3 {win.chrome === 'mobile' ? 'w-full border-b' : 'w-52 border-r'}">
 				<Dialog.Title class="px-3 pt-1 pb-4 font-heading text-base font-semibold">
 					{t('settings.title')}
 				</Dialog.Title>
-				<div class="flex flex-col gap-0.5">
+				<div class="flex gap-0.5 {win.chrome === 'mobile' ? 'overflow-x-auto' : 'flex-col'}">
 					{#each TABS as tb (tb.id)}
 						<button
 							onclick={() => (tab = tb.id)}
 							aria-current={tab === tb.id}
-							class="flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors {tab ===
+							class="flex cursor-pointer items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm font-medium transition-colors {win.chrome === 'mobile'
+								? 'min-h-11 w-auto shrink-0'
+								: 'w-full'} {tab ===
 							tb.id
 								? 'bg-background text-foreground shadow-sm ring-1 ring-border/70'
 								: 'text-muted-foreground hover:bg-foreground/5 hover:text-foreground'}"
@@ -499,7 +503,7 @@
 						</button>
 					{/each}
 				</div>
-				{#if version}
+				{#if version && win.chrome !== 'mobile'}
 					<span class="mt-auto px-3 pb-1 text-[11px] text-muted-foreground">v{version}</span>
 				{/if}
 			</nav>
@@ -529,7 +533,7 @@
 					{:else if tab === 'general'}
 						<!-- The shortcuts list has no other entry point in the chrome. Closing settings
 						     first: two stacked dialogs would trap focus in the wrong one. -->
-						<button
+						{#if win.chrome !== 'mobile'}<button
 							type="button"
 							class="mb-5 inline-flex items-center gap-2 rounded-full border bg-muted/50 px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
 							onclick={() => {
@@ -542,7 +546,7 @@
 								>{shortcutsHint[0]}<kbd class="font-mono font-medium">{HELP_COMBO}</kbd>{shortcutsHint[1] ??
 									''}</span
 							>
-						</button>
+						</button>{/if}
 						<section class={GROUP}>
 							<h3 class={LABEL}>{t('settings.sections.language')}</h3>
 							<div class={CARD}>
