@@ -1313,6 +1313,9 @@ impl AppState {
 
         if !self.start_current(gen).await {
             self.end_hydration(gen).await;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return Ok(()); // superseded by a newer play/skip request
+            }
             return Err(
                 "Playback could not start; open Settings > About > Diagnostics for details"
                     .to_owned(),

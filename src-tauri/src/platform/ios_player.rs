@@ -65,6 +65,11 @@ impl Player {
         Ok(())
     }
 
+    /// Preserve startup state without invoking the mobile plugin from Tauri's setup callback.
+    pub(crate) fn remember_volume(&self, volume: i64) {
+        self.volume.store(volume, Ordering::Relaxed);
+    }
+
     pub(crate) fn volume(&self) -> i64 {
         self.volume.load(Ordering::Relaxed)
     }
@@ -161,6 +166,7 @@ impl Player {
             return Err(Error::Unsupported("loudness gain"));
         }
         self.native.load(url, headers, start)?;
+        self.native.set_volume(self.volume())?;
         if let Ok(mut path) = self.current_path.lock() {
             *path = Some(url.to_owned());
         }
