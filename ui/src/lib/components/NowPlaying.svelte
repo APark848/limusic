@@ -89,6 +89,49 @@
 	const keeps = (t: EventTarget | null) => !!(t as Element | null)?.closest?.('[data-np-keep]');
 	let pressedKeep = false;
 	let releasedKeep = false;
+	let swipeStart: { id: number; x: number; y: number; at: number } | null = null;
+	let swipeOffset = $state(0);
+	let swiping = $state(false);
+	let swipeVertical = false;
+	const swipeBlocked = (target: EventTarget | null) =>
+		!!(target as Element | null)?.closest?.('button,input,[data-np-scroll]');
+	function onPointerDown(e: PointerEvent) {
+		pressedKeep = keeps(e.target);
+		releasedKeep = false;
+		if (!mobile || e.pointerType === 'mouse' || swipeBlocked(e.target)) return;
+		swipeStart = { id: e.pointerId, x: e.clientX, y: e.clientY, at: performance.now() };
+		swipeVertical = false;
+		view.setPointerCapture(e.pointerId);
+	}
+	function onPointerMove(e: PointerEvent) {
+		if (!swipeStart || e.pointerId !== swipeStart.id) return;
+		const dx = e.clientX - swipeStart.x;
+		const dy = e.clientY - swipeStart.y;
+		if (!swipeVertical && Math.hypot(dx, dy) > 8) {
+			if (Math.abs(dx) >= Math.abs(dy) || dy < 0) {
+				swipeStart = null;
+				return;
+			}
+			swipeVertical = true;
+			swiping = true;
+		}
+		if (swipeVertical) {
+			e.preventDefault();
+			swipeOffset = Math.max(0, dy);
+		}
+	}
+	function finishSwipe(e: PointerEvent) {
+		releasedKeep = keeps(e.target);
+		if (!swipeStart || e.pointerId !== swipeStart.id) return;
+		const elapsed = Math.max(1, performance.now() - swipeStart.at);
+		const velocity = swipeOffset / elapsed;
+		const dismiss = swipeVertical && (swipeOffset >= 96 || (swipeOffset >= 44 && velocity >= 0.65));
+		swipeStart = null;
+		swipeVertical = false;
+		swiping = false;
+		swipeOffset = 0;
+		if (dismiss) np.open = false;
+	}
 	function onBackdropClick(e: MouseEvent) {
 		if (pressedKeep || releasedKeep || keeps(e.target)) return;
 		np.open = false;
@@ -277,6 +320,7 @@
 		class="flex min-h-[22rem] shrink-0 flex-col border-t px-4 pt-3"
 		style="padding-bottom:max(env(safe-area-inset-bottom),1rem)"
 		data-np-keep
+		data-np-scroll
 	>
 		<Tabs.Root
 			value={np.tab}
@@ -529,11 +573,16 @@
 	onoutrostart={() => ((settled = false), setHole(null))}
 	onintroend={() => (settled = true)}
 	bind:this={view}
-	onpointerdown={(e) => ((pressedKeep = keeps(e.target)), (releasedKeep = false))}
-	onpointerup={(e) => (releasedKeep = keeps(e.target))}
+	onpointerdown={onPointerDown}
+	onpointermove={onPointerMove}
+	onpointerup={finishSwipe}
+	onpointercancel={finishSwipe}
 	onclick={onBackdropClick}
 	data-np-view
-	class="absolute right-0 flex inert:bg-background {mobile
+	style={mobile
+		? `translate:0 ${swipeOffset}px;transition:${swiping ? 'none' : 'translate 180ms ease-out'}`
+		: undefined}
+	class="absolute right-0 flex motion-reduce:!transition-none inert:bg-background {mobile
 		? 'inset-0 left-0 z-40 flex-col overflow-y-auto'
 		: `inset-y-0 left-16 z-20 overflow-hidden ${ui.sidebarCollapsed ? '' : 'lg:left-60'} ${inset}`} {video.hole
 		? ''
@@ -541,7 +590,7 @@
 >
 	{#if mobile}
 		<section
-			class="flex shrink-0 flex-col px-5 pb-5"
+			class="flex shrink-0 touch-none flex-col px-5 pb-5"
 			style="padding-top:max(env(safe-area-inset-top),0.5rem)"
 			data-np-keep
 		>
