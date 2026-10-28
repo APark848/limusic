@@ -2405,13 +2405,13 @@ impl AppState {
     /// still playing — deferring it to the track boundary pauses playback while the whole client
     /// waterfall fails again on the event pump (and used to wedge until a manual skip).
     /// ponytail: at most 3 removals per prime so a network outage can't eat the whole queue.
+    #[cfg(target_os = "ios")]
     async fn prime_lookahead(self: &std::sync::Arc<Self>, gen: u64) {
-        #[cfg(target_os = "ios")]
-        {
-            self.prepare_ios_lookahead(gen).await;
-            return;
-        }
+        self.prepare_ios_lookahead(gen).await;
+    }
 
+    #[cfg(not(target_os = "ios"))]
+    async fn prime_lookahead(self: &std::sync::Arc<Self>, gen: u64) {
         // A guest plays whatever the host announces next, and a primed entry would let mpv move on
         // by itself into a track the room may not be playing.
         if self.lt.is_guest().await {
@@ -3589,13 +3589,24 @@ impl AppState {
             if playing { position_ms + t0.elapsed().as_millis() as i64 } else { position_ms };
         let pos = target_ms as f64 / 1000.0;
         let stream_url = mpv_stream_url(&data);
-        if let Err(e) = self.player.load(
+        #[cfg(target_os = "ios")]
+        let load_result = self.player.load(
             &stream_url,
             &data.headers,
             self.track_gain(data.loudness_db),
             (pos > 0.5).then_some(pos),
-        ) {
-            self.emit_error(&track.id, &e.to_string());
+            data.duration.as_deref().and_then(|value| value.parse::<f64>().ok()),
+        );
+        #[cfg(not(target_os = "ios"))]
+        let load_result = self.player.load(
+            &stream_url,
+            &data.headers,
+            self.track_gain(data.loudness_db),
+            (pos > 0.5).then_some(pos),
+        );
+        let load_error = load_result.err().map(|error| error.to_string());
+        if let Some(error) = load_error {
+            self.emit_error(&track.id, &error);
             return;
         }
         let _ = if playing { self.player.play() } else { self.player.pause() };
@@ -5431,6 +5442,20 @@ mod tests {
             .expect("track-failed handler");
         assert!(ended.contains("prime_lookahead_after_player_event(gen).await"));
         assert!(failed.contains("prime_lookahead_after_player_event(gen).await"));
+    }
+
+    #[test]
+    fn ios_listen_together_load_keeps_authoritative_duration() {
+        let source = include_str!("state.rs");
+        let sync = source
+            .split("let target_ms =")
+            .nth(1)
+            .and_then(|rest| rest.split("let _ = if playing").next())
+            .expect("Listen Together player load");
+        assert!(sync.contains("#[cfg(target_os = \"ios\")]"));
+        assert!(sync.contains("data.duration.as_deref()"));
+        assert!(sync.contains("value.parse::<f64>().ok()"));
+        assert!(sync.contains("#[cfg(not(target_os = \"ios\"))]"));
     }
 
     // The one that silently breaks: a duplicate sitting *before* the playing track. Removing it
