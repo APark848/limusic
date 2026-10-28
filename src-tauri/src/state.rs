@@ -4,6 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use std::sync::Arc;
 
@@ -311,6 +312,10 @@ struct QueueState {
     hydrating: Option<u64>,
     /// The queue index we've already appended to mpv for gapless lookahead (if any).
     lookahead_loaded: Option<usize>,
+    /// iOS has no native playlist handoff yet, but resolving the immediate next stream while the
+    /// current one plays removes the network waterfall from the track boundary. This remains a
+    /// single, validated cache entry; `items`/`current` are still the only queue authority.
+    prepared_next: Option<PreparedTrack>,
     /// Which client served the currently-loaded track (for the WEB_REMIX-403 feedback). context/06.
     current_client: Option<String>,
     /// The client that served the primed lookahead track — promoted to `current_client` on a
@@ -343,6 +348,14 @@ struct QueueState {
     /// during the walk used to stop it for good, leaving a shuffled 4,000-track playlist playing
     /// out of its first page or two (issue #316).
     epoch: u64,
+}
+
+struct PreparedTrack {
+    epoch: u64,
+    index: usize,
+    video_id: String,
+    resolved_at: Instant,
+    data: PlaybackData,
 }
 
 /// What was playing before a click replaced the whole queue, so Previous can go back to it.
@@ -1300,6 +1313,7 @@ impl AppState {
             q.epoch += 1;
             q.current = 0;
             q.lookahead_loaded = None;
+            q.prepared_next = None;
             q.radio_seed = None; // single-song queue → autoplay re-seeds from the last track
             q.source_id = None;
             q.radio = false;
@@ -2140,6 +2154,7 @@ impl AppState {
     /// Resolve + load the current track into mpv (replace). Returns false if resolve failed or the
     /// request was superseded.
     async fn start_current(self: &std::sync::Arc<Self>, gen: u64) -> bool {
+        let startup_started = Instant::now();
         tracing::info!(generation = gen, "playback startup entered");
         // Resolve the current track, auto-skipping any that no client can play (dead / region-locked
         // videos — context/06 "no client could resolve") instead of stalling the queue on them.
@@ -2150,13 +2165,33 @@ impl AppState {
             }
             let Some(item) = self.current_item().await else { return false };
             tracing::info!(video_id = %item.video_id, "resolving current track");
-            let resolved = self
-                .resolve(
+            let prepared = {
+                let mut q = self.queue.lock().await;
+                let matches = q.prepared_next.as_ref().is_some_and(|prepared| {
+                    prepared.epoch == q.epoch
+                        && prepared.index == q.current
+                        && prepared.video_id == item.video_id
+                        && prepared.resolved_at.elapsed().as_secs()
+                            < u64::try_from(prepared.data.expires_in_seconds.saturating_sub(60))
+                                .unwrap_or(0)
+                });
+                matches.then(|| q.prepared_next.take().expect("prepared entry was present"))
+            };
+            let resolved = if let Some(prepared) = prepared {
+                tracing::info!(
+                    video_id = %item.video_id,
+                    age_ms = prepared.resolved_at.elapsed().as_millis() as u64,
+                    "using prepared iOS stream"
+                );
+                Ok(prepared.data)
+            } else {
+                self.resolve(
                     &item.video_id,
                     item.is_upload,
                     parse_duration_ms(item.duration.as_deref()) / 1000,
                 )
-                .await;
+                .await
+            };
             // A resolve takes seconds; a skip during it bumps the generation. Re-check before
             // acting on the result: an abandoned failure would otherwise move `current` under the
             // track that's already playing and leave a stale error banner (nothing clears it, the
@@ -2171,6 +2206,7 @@ impl AppState {
                         client = %d.stream_client,
                         itag = d.itag,
                         header_count = d.headers.len(),
+                        elapsed_ms = startup_started.elapsed().as_millis() as u64,
                         "current track resolved"
                     );
                     break (item, d);
@@ -2256,13 +2292,24 @@ impl AppState {
             client = %data.stream_client,
             itag = data.itag,
             headers = ?header_names,
+            elapsed_ms = startup_started.elapsed().as_millis() as u64,
             "loading resolved stream into native player"
         );
-        if let Err(e) =
-            self.player.load(&stream_url, &data.headers, self.track_gain(data.loudness_db), seek)
-        {
-            tracing::warn!(video_id = %item.video_id, category = "player-load", error = %e, "playback startup failed");
-            self.emit_error(&item.video_id, &e.to_string());
+        #[cfg(target_os = "ios")]
+        let load_result = self.player.load(
+            &stream_url,
+            &data.headers,
+            self.track_gain(data.loudness_db),
+            seek,
+            data.duration.as_deref().and_then(|value| value.parse::<f64>().ok()),
+        );
+        #[cfg(not(target_os = "ios"))]
+        let load_result =
+            self.player.load(&stream_url, &data.headers, self.track_gain(data.loudness_db), seek);
+        let load_error = load_result.err().map(|error| error.to_string());
+        if let Some(error) = load_error {
+            tracing::warn!(video_id = %item.video_id, category = "player-load", %error, "playback startup failed");
+            self.emit_error(&item.video_id, &error);
             return false;
         }
         tracing::info!(video_id = %item.video_id, "native player load command completed");
@@ -2276,7 +2323,11 @@ impl AppState {
             self.emit_error(&item.video_id, &e.to_string());
             return false;
         }
-        tracing::info!(video_id = %item.video_id, "native player play command completed");
+        tracing::info!(
+            video_id = %item.video_id,
+            elapsed_ms = startup_started.elapsed().as_millis() as u64,
+            "native player play command completed"
+        );
         // Items played from cards/radio can arrive without a duration; the player response knows
         // the exact length of the cut we stream. Backfill before emitting — lyrics matching keys
         // on it (a wrong-cut LRCLIB match plays lyrics seconds off the audio).
@@ -2336,10 +2387,11 @@ impl AppState {
     /// waterfall fails again on the event pump (and used to wedge until a manual skip).
     /// ponytail: at most 3 removals per prime so a network outage can't eat the whole queue.
     async fn prime_lookahead(self: &std::sync::Arc<Self>, gen: u64) {
-        // AVPlayer owns one current item in the iOS MVP. Gapless lookahead is an mpv feature and
-        // deliberately remains unavailable until it has a native design of its own.
         #[cfg(target_os = "ios")]
-        return;
+        {
+            self.prepare_ios_lookahead(gen).await;
+            return;
+        }
 
         // A guest plays whatever the host announces next, and a primed entry would let mpv move on
         // by itself into a track the room may not be playing.
@@ -2402,6 +2454,71 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Resolve one iOS successor ahead of time. AVPlayer still owns only its current item: at EOF
+    /// `start_current` validates and consumes this data before issuing the normal native load/play.
+    #[cfg(target_os = "ios")]
+    async fn prepare_ios_lookahead(self: &std::sync::Arc<Self>, gen: u64) {
+        if self.lt.is_guest().await {
+            return;
+        }
+        let (epoch, index, video_id, is_upload, duration_secs) = {
+            let q = self.queue.lock().await;
+            let Some(index) = next_index(q.items.len(), q.current, q.repeat) else { return };
+            let Some(item) = q.items.get(index) else { return };
+            if q.prepared_next.as_ref().is_some_and(|prepared| {
+                prepared.epoch == q.epoch
+                    && prepared.index == index
+                    && prepared.video_id == item.video_id
+            }) {
+                return;
+            }
+            (
+                q.epoch,
+                index,
+                item.video_id.clone(),
+                item.is_upload,
+                parse_duration_ms(item.duration.as_deref()) / 1000,
+            )
+        };
+        let started = Instant::now();
+        let data = match self.resolve(&video_id, is_upload, duration_secs).await {
+            Ok(data) => data,
+            Err(error) => {
+                tracing::warn!(
+                    video_id = %video_id,
+                    category = "ios-lookahead-resolve",
+                    %error,
+                    "iOS next-track preparation failed"
+                );
+                return;
+            }
+        };
+        if self.generation.load(Ordering::SeqCst) != gen {
+            return;
+        }
+        let mut q = self.queue.lock().await;
+        if q.epoch != epoch
+            || q.items.get(index).map(|item| item.video_id.as_str()) != Some(video_id.as_str())
+            || next_index(q.items.len(), q.current, q.repeat) != Some(index)
+        {
+            tracing::debug!(index, "queue changed during iOS next-track preparation — dropped");
+            return;
+        }
+        q.prepared_next = Some(PreparedTrack {
+            epoch,
+            index,
+            video_id: video_id.clone(),
+            resolved_at: Instant::now(),
+            data,
+        });
+        tracing::info!(
+            video_id = %video_id,
+            index,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "iOS next track prepared"
+        );
     }
 
     /// Second half of [`Self::prime_lookahead`]: hand the resolved stream to mpv and record it.
@@ -3621,6 +3738,7 @@ impl AppState {
             if q.lookahead_loaded.take().is_some() {
                 let _ = self.player.clear_playlist();
             }
+            q.prepared_next = None;
         }
         self.emit_queue().await;
         self.persist_queue().await;
@@ -3665,6 +3783,7 @@ impl AppState {
         {
             let mut q = self.queue.lock().await;
             q.repeat = next(q.repeat);
+            q.prepared_next = None;
             let _ = self.player.set_loop_file(q.repeat == RepeatMode::One);
         }
         self.emit_queue().await; // carries the new repeat state to the UI

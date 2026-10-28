@@ -239,16 +239,45 @@ pub fn find_format(data: &StreamingData, quality: AudioQuality) -> Option<&Forma
 /// Pick a format AVPlayer can decode on iOS. Desktop mpv deliberately prefers Opus/WebM for
 /// quality, but handing that same choice to AVPlayer leaves the item at time zero. YouTube's
 /// MP4/AAC (normally itag 140), MP3 podcast enclosures, and raw AAC are supported native inputs.
-pub fn find_ios_format(data: &StreamingData, quality: AudioQuality) -> Option<&Format> {
-    let aac = find_format_where(data, quality, |format| {
+pub fn find_ios_format(
+    data: &StreamingData,
+    quality: AudioQuality,
+    expected_duration_secs: Option<u64>,
+) -> Option<&Format> {
+    let aac = find_ios_format_where(data, quality, expected_duration_secs, |format| {
         let mime = format.mime_type.to_ascii_lowercase();
         mime.contains("audio/mp4") || mime.contains("mp4a") || mime.contains("audio/aac")
     });
     aac.or_else(|| {
-        find_format_where(data, quality, |format| {
+        find_ios_format_where(data, quality, expected_duration_secs, |format| {
             format.mime_type.to_ascii_lowercase().contains("audio/mpeg")
         })
     })
+}
+
+/// Prefer formats whose own timeline agrees with the authoritative video duration. Some iOS
+/// responses contain otherwise-attractive AAC entries with a doubled `approxDurationMs`; AVPlayer
+/// trusts that malformed timeline and plays silence to its reported end. Unknown durations remain
+/// eligible, and if every candidate is an outlier we retain the old ranking as a safe fallback.
+fn find_ios_format_where(
+    data: &StreamingData,
+    quality: AudioQuality,
+    expected_duration_secs: Option<u64>,
+    compatible: impl Fn(&Format) -> bool + Copy,
+) -> Option<&Format> {
+    let sane = |format: &Format| {
+        let Some(expected) = expected_duration_secs.filter(|value| *value > 0) else { return true };
+        let Some(actual_ms) =
+            format.approx_duration_ms.as_deref().and_then(|value| value.parse::<u64>().ok())
+        else {
+            return true;
+        };
+        let expected_ms = expected.saturating_mul(1000);
+        let tolerance_ms = 10_000u64.max(expected_ms / 10);
+        actual_ms.abs_diff(expected_ms) <= tolerance_ms
+    };
+    find_format_where(data, quality, |format| compatible(format) && sane(format))
+        .or_else(|| find_format_where(data, quality, compatible))
 }
 
 fn find_format_where(
@@ -393,7 +422,7 @@ mod tests {
         let sd = serde_json::from_str::<PlayerResponse>(json).unwrap().streaming_data.unwrap();
 
         assert_eq!(find_format(&sd, AudioQuality::High).unwrap().itag, 251);
-        assert_eq!(find_ios_format(&sd, AudioQuality::High).unwrap().itag, 140);
+        assert_eq!(find_ios_format(&sd, AudioQuality::High, None).unwrap().itag, 140);
     }
 
     #[test]
@@ -406,14 +435,41 @@ mod tests {
             ] }
         }"#;
         let sd = serde_json::from_str::<PlayerResponse>(json).unwrap().streaming_data.unwrap();
-        assert_eq!(find_ios_format(&sd, AudioQuality::High).unwrap().itag, 140);
+        assert_eq!(find_ios_format(&sd, AudioQuality::High, None).unwrap().itag, 140);
 
         let mp3_only = StreamingData {
             formats: Some(vec![sd.formats.unwrap()[0].clone()]),
             adaptive_formats: Vec::new(),
             expires_in_seconds: None,
         };
-        assert_eq!(find_ios_format(&mp3_only, AudioQuality::High).unwrap().itag, 15);
+        assert_eq!(find_ios_format(&mp3_only, AudioQuality::High, None).unwrap().itag, 15);
+    }
+
+    #[test]
+    fn ios_format_rejects_doubled_timeline_when_sane_aac_exists() {
+        let json = r#"{
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": 141, "url": "bad", "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 256000, "audioQuality": "AUDIO_QUALITY_HIGH", "approxDurationMs": "486000" },
+                { "itag": 140, "url": "good", "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 129000, "audioQuality": "AUDIO_QUALITY_MEDIUM", "approxDurationMs": "243800" }
+            ] }
+        }"#;
+        let sd = serde_json::from_str::<PlayerResponse>(json).unwrap().streaming_data.unwrap();
+        assert_eq!(find_ios_format(&sd, AudioQuality::High, Some(243)).unwrap().itag, 140);
+    }
+
+    #[test]
+    fn ios_format_accepts_unknown_and_small_duration_differences() {
+        let json = r#"{
+            "playabilityStatus": { "status": "OK" },
+            "streamingData": { "adaptiveFormats": [
+                { "itag": 139, "url": "unknown", "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 48000, "audioQuality": "AUDIO_QUALITY_LOW" },
+                { "itag": 140, "url": "close", "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "bitrate": 129000, "audioQuality": "AUDIO_QUALITY_MEDIUM", "approxDurationMs": "247000" }
+            ] }
+        }"#;
+        let sd = serde_json::from_str::<PlayerResponse>(json).unwrap().streaming_data.unwrap();
+        assert_eq!(find_ios_format(&sd, AudioQuality::High, Some(243)).unwrap().itag, 140);
+        assert_eq!(find_ios_format(&sd, AudioQuality::High, None).unwrap().itag, 140);
     }
 
     /// A dubbed video lists each language at the same qualities; the higher-bitrate dub must not

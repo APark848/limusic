@@ -393,7 +393,15 @@ impl Orchestrator {
             let Some(streaming) = resp.streaming_data.as_ref() else { continue };
             let Some(expires) = streaming.expires_in_seconds else { continue };
             #[cfg(target_os = "ios")]
-            let format = find_ios_format(streaming, quality);
+            let format = find_ios_format(
+                streaming,
+                quality,
+                main_resp
+                    .as_ref()
+                    .and_then(|response| response.video_details.as_ref())
+                    .and_then(|details| details.length_seconds.as_deref())
+                    .and_then(|seconds| seconds.parse::<u64>().ok()),
+            );
             #[cfg(not(target_os = "ios"))]
             let format = find_format(streaming, quality);
             let Some(format) = format else {
@@ -819,6 +827,8 @@ impl Orchestrator {
             client,
             itag = format.itag,
             mime = %format.mime_type,
+            expected_duration_secs = vd.and_then(|details| details.length_seconds.as_deref()),
+            format_duration_ms = format.approx_duration_ms.as_deref(),
             "resolved stream"
         );
         PlaybackData {
