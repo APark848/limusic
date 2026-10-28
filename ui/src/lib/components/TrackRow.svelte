@@ -21,6 +21,7 @@
 	import ExplicitIcon from './ExplicitIcon.svelte';
 	import { t } from '$lib/i18n.svelte';
 	import { keyOf } from '$lib/shortcuts';
+	import { win } from '$lib/win.svelte';
 	import type { TrackSelection } from '$lib/selection.svelte';
 	import { Checkbox } from './ui/checkbox';
 
@@ -102,6 +103,7 @@
 	// Space/click rebinding.
 	const selectable = $derived(!!selection?.active && selectionKey !== undefined);
 	const selected = $derived(selection?.has(selectionKey) ?? false);
+	const mobile = $derived(win.chrome === 'mobile');
 
 	// In select mode the row's menu acts on the whole selection when this row is in it; otherwise it
 	// keeps adding just this row. While pages are still being fetched the floating bar disables its
@@ -233,7 +235,9 @@
 	data-selected={selectable ? selected : undefined}
 	aria-describedby={selectable ? selectionDescriptionId : undefined}
 	aria-label={selectable ? t(guestAdd ? 'selection.track_guest' : 'selection.track', { title: song.title }) : guestAdd ? `Add ${song.title} to the session queue` : `Play ${song.title}`}
-	class="group flex w-full cursor-pointer items-center gap-3 rounded-lg p-2 hover:bg-accent/10 {selected
+	class="track-row group flex w-full cursor-pointer items-center gap-3 rounded-lg p-2 {mobile
+		? ''
+		: 'hover:bg-accent/10'} {selected
 		? 'bg-primary/15'
 		: active
 		? 'bg-accent/10'
@@ -274,7 +278,7 @@
 						: 'text-muted-foreground'}"
 				>
 					<!-- Kept in flow on the playing row too, invisible: it is what sizes the column. -->
-					<span class={active ? 'invisible' : selectable ? '' : 'group-hover:invisible'}>
+					<span class={active ? 'invisible' : selectable || mobile ? '' : 'group-hover:invisible'}>
 						{index + 1}
 					</span>
 					{#if active}
@@ -282,12 +286,16 @@
 						     loops keeps the compositor from ever idling while a track plays. -->
 						<HugeiconsIcon
 							icon={VolumeHighIcon}
-							class="absolute inset-0 m-auto h-3.5 w-3.5 {selectable ? '' : 'group-hover:invisible'}"
+							class="absolute inset-0 m-auto h-3.5 w-3.5 {selectable || mobile
+								? ''
+								: 'group-hover:invisible'}"
 						/>
 					{/if}
 					<HugeiconsIcon
 						icon={guestAdd ? PlayListAddIcon : PlayIcon}
-						class="invisible absolute inset-0 m-auto h-3.5 w-3.5 {selectable ? '' : 'group-hover:visible'}"
+						class="invisible absolute inset-0 m-auto h-3.5 w-3.5 {selectable || mobile
+							? ''
+							: 'group-hover:visible'}"
 					/>
 				</span>
 			{/if}
@@ -386,7 +394,9 @@
 			     what has to reveal it before Tab can reach it. -->
 			<div
 				class="flex items-center gap-0.5 {rated === 'indifferent'
-					? 'invisible group-focus-within:visible group-hover:visible'
+					? mobile
+						? 'invisible'
+						: 'invisible group-focus-within:visible group-hover:visible'
 					: ''}"
 			>
 				{@render rateButton(ThumbsUpIcon, 'like', t('common.like'))}
@@ -424,7 +434,7 @@
 			{playlistId}
 			{queueIndex}
 			{inLibraryList}
-			triggerClass="cursor-pointer rounded-md p-1.5 text-muted-foreground hover:bg-accent/20 hover:text-foreground {compact
+			triggerClass="cursor-pointer rounded-md p-1.5 text-muted-foreground hover:bg-accent/20 hover:text-foreground {compact || mobile
 				? ''
 				: 'invisible group-focus-within:visible group-hover:visible'}"
 		/>

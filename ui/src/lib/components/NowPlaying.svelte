@@ -89,17 +89,26 @@
 	const keeps = (t: EventTarget | null) => !!(t as Element | null)?.closest?.('[data-np-keep]');
 	let pressedKeep = false;
 	let releasedKeep = false;
-	let swipeStart: { id: number; x: number; y: number; at: number } | null = null;
+	let swipeStart: { id: number; x: number; y: number; at: number; artwork: boolean } | null = null;
 	let swipeOffset = $state(0);
 	let swiping = $state(false);
 	let swipeVertical = false;
+	let suppressArtworkToggleUntil = 0;
 	const swipeBlocked = (target: EventTarget | null) =>
-		!!(target as Element | null)?.closest?.('button,input,[data-np-scroll]');
+		!!(target as Element | null)?.closest?.(
+			'button:not([data-np-artwork]),input,[data-np-scroll],[data-np-seek]'
+		);
 	function onPointerDown(e: PointerEvent) {
 		pressedKeep = keeps(e.target);
 		releasedKeep = false;
 		if (!mobile || e.pointerType === 'mouse' || swipeBlocked(e.target)) return;
-		swipeStart = { id: e.pointerId, x: e.clientX, y: e.clientY, at: performance.now() };
+		swipeStart = {
+			id: e.pointerId,
+			x: e.clientX,
+			y: e.clientY,
+			at: performance.now(),
+			artwork: !!(e.target as Element | null)?.closest?.('[data-np-artwork]')
+		};
 		swipeVertical = false;
 		view.setPointerCapture(e.pointerId);
 	}
@@ -114,6 +123,7 @@
 			}
 			swipeVertical = true;
 			swiping = true;
+			if (swipeStart.artwork) suppressArtworkToggleUntil = performance.now() + 500;
 		}
 		if (swipeVertical) {
 			e.preventDefault();
@@ -193,6 +203,7 @@
 	let flash: 'play' | 'pause' | null = $state(null);
 	let flashTimer: ReturnType<typeof setTimeout>;
 	function toggle() {
+		if (mobile && performance.now() < suppressArtworkToggleUntil) return;
 		flash = playback.paused ? 'play' : 'pause';
 		clearTimeout(flashTimer);
 		flashTimer = setTimeout(() => (flash = null), 220);
@@ -210,6 +221,8 @@
 			.padStart(2, '0')}`;
 	};
 	let seekDrag = $state<number | null>(null);
+	let seekPointer: number | null = null;
+	let seekInput = $state<HTMLInputElement>();
 	const shownPosition = $derived(seekDrag ?? playback.position);
 	function onSeekInput(e: Event) {
 		seekDrag = Number((e.target as HTMLInputElement).value);
@@ -219,6 +232,44 @@
 		playback.position = position;
 		seekDrag = null;
 		api.seek(position);
+	}
+	function seekFromPointer(e: PointerEvent, target: HTMLElement) {
+		const box = target.getBoundingClientRect();
+		const ratio = Math.max(0, Math.min(1, (e.clientX - box.left) / Math.max(1, box.width)));
+		seekDrag = ratio * playback.duration;
+	}
+	function onSeekPointerDown(e: PointerEvent) {
+		if (!mobile || e.pointerType === 'mouse' || !playback.duration) return;
+		e.preventDefault();
+		e.stopPropagation();
+		seekPointer = e.pointerId;
+		seekInput?.focus({ preventScroll: true });
+		const target = e.currentTarget as HTMLElement;
+		target.setPointerCapture(e.pointerId);
+		seekFromPointer(e, target);
+	}
+	function onSeekPointerMove(e: PointerEvent) {
+		if (seekPointer !== e.pointerId) return;
+		e.preventDefault();
+		e.stopPropagation();
+		seekFromPointer(e, e.currentTarget as HTMLElement);
+	}
+	function finishSeekPointer(e: PointerEvent) {
+		if (seekPointer !== e.pointerId) return;
+		e.preventDefault();
+		e.stopPropagation();
+		seekFromPointer(e, e.currentTarget as HTMLElement);
+		const position = seekDrag ?? playback.position;
+		seekPointer = null;
+		playback.position = position;
+		seekDrag = null;
+		api.seek(position);
+	}
+	function cancelSeekPointer(e: PointerEvent) {
+		if (seekPointer !== e.pointerId) return;
+		e.stopPropagation();
+		seekPointer = null;
+		seekDrag = null;
 	}
 
 	// Scrolling the artwork is the volume, same step as the slider. The level only draws while the
@@ -385,7 +436,13 @@
 
 <!-- Both layouts: the play/pause button over the picture, and the picture in it. -->
 {#snippet picture()}
-	<button type="button" onclick={toggle} aria-label={t('a11y.play_pause')} class="block w-full cursor-pointer">
+	<button
+		type="button"
+		onclick={toggle}
+		aria-label={t('a11y.play_pause')}
+		data-np-artwork={mobile ? '' : undefined}
+		class="block w-full cursor-pointer"
+	>
 		{#if flash}
 			<!-- No backdrop-blur: re-blurring the plate on every frame of the scale is what made this
 			     stutter on WebKitGTK. Transform and opacity only. -->
@@ -621,10 +678,18 @@
 				/>
 			</div>
 
-			<div class="mt-4">
+			<div
+				class="mobile-seek-target mt-2 flex items-center"
+				data-np-seek
+				onpointerdown={onSeekPointerDown}
+				onpointermove={onSeekPointerMove}
+				onpointerup={finishSeekPointer}
+				onpointercancel={cancelSeekPointer}
+			>
 				<input
+					bind:this={seekInput}
 					type="range"
-					class="range w-full"
+					class="range w-full {mobile ? 'pointer-events-none' : ''}"
 					style="--pct:{playback.duration ? (shownPosition / playback.duration) * 100 : 0}%"
 					min="0"
 					max={playback.duration || 0}
@@ -633,6 +698,8 @@
 					onchange={onSeekCommit}
 					aria-label={t('player.seek')}
 				/>
+			</div>
+			<div>
 				<div class="flex justify-between text-xs tabular-nums text-muted-foreground">
 					<span>{fmt(shownPosition)}</span>
 					<span>{fmt(playback.duration)}</span>

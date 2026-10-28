@@ -822,6 +822,8 @@ impl Orchestrator {
         headers: HashMap<String, String>,
     ) -> PlaybackData {
         let vd = main_resp.as_ref().and_then(|r| r.video_details.as_ref());
+        let duration =
+            resolved_duration(vd.and_then(|details| details.length_seconds.as_deref()), format);
         tracing::info!(
             video_id,
             client,
@@ -841,12 +843,29 @@ impl Orchestrator {
             playback_ping: ping,
             title: vd.and_then(|v| v.title.clone()),
             artists: vd.and_then(|v| v.author.clone()),
-            duration: vd.and_then(|v| v.length_seconds.clone()),
+            duration,
             thumbnail: main_resp.as_ref().and_then(best_thumbnail),
             is_video: vd.and_then(|v| v.is_music_video()),
             stream_client: client.to_owned(),
         }
     }
+}
+
+/// The player response is the preferred track-level duration. Some successful fallback clients do
+/// not repeat `videoDetails`, though, while the selected audio format still carries an exact
+/// millisecond timeline. Typeahead song rows have no duration of their own, so retaining this
+/// format-level value is what lets iOS reject an implausible AVPlayer container timeline without
+/// replacing the row with a title-matched search result.
+fn resolved_duration(video_seconds: Option<&str>, format: &Format) -> Option<String> {
+    video_seconds.map(str::to_owned).or_else(|| {
+        format
+            .approx_duration_ms
+            .as_deref()?
+            .parse::<f64>()
+            .ok()
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+            .map(|ms| (ms / 1000.0).to_string())
+    })
 }
 
 /// A format's byte length, when it reported one. `"0"` (an RSS-feed enclosure, #294) reads as
@@ -969,7 +988,7 @@ fn best_thumbnail(resp: &PlayerResponse) -> Option<String> {
 mod tests {
     use super::{
         blacklist_blocks, blacklist_insert, claim_heal, content_length, is_youtube_stream,
-        nothing_played, stream_headers, ResolveError, WEB_REMIX_BLACKLIST_TTL,
+        nothing_played, resolved_duration, stream_headers, ResolveError, WEB_REMIX_BLACKLIST_TTL,
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -1097,6 +1116,22 @@ mod tests {
         );
         assert_eq!(content_length(&fmt("")), None);
         assert_eq!(content_length(&fmt("not a number")), None);
+    }
+
+    #[test]
+    fn selected_format_duration_protects_durationless_typeahead_rows() {
+        let format: super::Format = serde_json::from_value(serde_json::json!({
+            "itag": 140,
+            "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+            "approxDurationMs": "243081"
+        }))
+        .unwrap();
+        assert_eq!(resolved_duration(None, &format).as_deref(), Some("243.081"));
+        assert_eq!(
+            resolved_duration(Some("244"), &format).as_deref(),
+            Some("244"),
+            "track-level metadata remains authoritative when both values exist"
+        );
     }
 
     #[test]
