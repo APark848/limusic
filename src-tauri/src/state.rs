@@ -358,6 +358,17 @@ struct PreparedTrack {
     data: PlaybackData,
 }
 
+fn prepared_identity_matches(
+    prepared_epoch: u64,
+    prepared_index: usize,
+    prepared_video_id: &str,
+    epoch: u64,
+    index: usize,
+    video_id: &str,
+) -> bool {
+    prepared_epoch == epoch && prepared_index == index && prepared_video_id == video_id
+}
+
 /// What was playing before a click replaced the whole queue, so Previous can go back to it.
 ///
 /// Clicking a song outside the queue (a search result, a card) throws the queue away and starts a
@@ -1241,7 +1252,11 @@ impl AppState {
                     .map(|(url, client)| PlaybackPing { url, client }),
                 title: None,
                 artists: None,
-                duration: None,
+                // A cache hit skips `/player`, but the queue row may still carry authoritative
+                // metadata from search/browse or an earlier response. Keep that known duration so
+                // iOS can reject a wildly wrong AVPlayer container timeline. Zero still means
+                // unknown and must not be invented as metadata.
+                duration: cached_duration_metadata(duration_secs),
                 thumbnail: None,
                 // Cached alongside the URL: a hit skips `/player`, so without it a replay inside
                 // the cache window (hours, and every track you just listened to) would fall back
@@ -1989,7 +2004,7 @@ impl AppState {
             // advance into.
             self.queue.lock().await.lookahead_loaded = None;
             if self.start_current(gen).await {
-                self.prime_lookahead(gen).await;
+                self.prime_lookahead_after_player_event(gen).await;
             }
             return;
         }
@@ -2098,7 +2113,7 @@ impl AppState {
                 tracing::info!(video_id = %vid, "retrying failed track via fallback clients");
                 let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
                 if self.start_current(gen).await {
-                    self.prime_lookahead(gen).await;
+                    self.prime_lookahead_after_player_event(gen).await;
                 }
                 return true;
             }
@@ -2168,12 +2183,16 @@ impl AppState {
             let prepared = {
                 let mut q = self.queue.lock().await;
                 let matches = q.prepared_next.as_ref().is_some_and(|prepared| {
-                    prepared.epoch == q.epoch
-                        && prepared.index == q.current
-                        && prepared.video_id == item.video_id
-                        && prepared.resolved_at.elapsed().as_secs()
-                            < u64::try_from(prepared.data.expires_in_seconds.saturating_sub(60))
-                                .unwrap_or(0)
+                    prepared_identity_matches(
+                        prepared.epoch,
+                        prepared.index,
+                        &prepared.video_id,
+                        q.epoch,
+                        q.current,
+                        &item.video_id,
+                    ) && prepared.resolved_at.elapsed().as_secs()
+                        < u64::try_from(prepared.data.expires_in_seconds.saturating_sub(60))
+                            .unwrap_or(0)
                 });
                 matches.then(|| q.prepared_next.take().expect("prepared entry was present"))
             };
@@ -2456,6 +2475,19 @@ impl AppState {
         }
     }
 
+    /// Prime after a native player event started the current track. On iOS this must return to the
+    /// event pump before resolving the following song; desktop keeps awaiting its existing mpv
+    /// playlist preparation so its gapless behavior is unchanged.
+    async fn prime_lookahead_after_player_event(self: &std::sync::Arc<Self>, gen: u64) {
+        #[cfg(target_os = "ios")]
+        {
+            let me = self.clone();
+            tauri::async_runtime::spawn(async move { me.prime_lookahead(gen).await });
+        }
+        #[cfg(not(target_os = "ios"))]
+        self.prime_lookahead(gen).await;
+    }
+
     /// Resolve one iOS successor ahead of time. AVPlayer still owns only its current item: at EOF
     /// `start_current` validates and consumes this data before issuing the normal native load/play.
     #[cfg(target_os = "ios")]
@@ -2468,9 +2500,14 @@ impl AppState {
             let Some(index) = next_index(q.items.len(), q.current, q.repeat) else { return };
             let Some(item) = q.items.get(index) else { return };
             if q.prepared_next.as_ref().is_some_and(|prepared| {
-                prepared.epoch == q.epoch
-                    && prepared.index == index
-                    && prepared.video_id == item.video_id
+                prepared_identity_matches(
+                    prepared.epoch,
+                    prepared.index,
+                    &prepared.video_id,
+                    q.epoch,
+                    index,
+                    &item.video_id,
+                )
             }) {
                 return;
             }
@@ -4602,6 +4639,12 @@ fn cache_horizon(now: i64, duration_secs: i64) -> i64 {
     now + 60 + duration_secs.max(0)
 }
 
+/// Metadata retained when a cached stream skips `/player`. Positive values came from the queue's
+/// known duration; zero/negative is the existing sentinel for unknown.
+fn cached_duration_metadata(duration_secs: i64) -> Option<String> {
+    (duration_secs > 0).then(|| duration_secs.to_string())
+}
+
 /// Parse a `"m:ss"` / `"h:mm:ss"` duration string to ms (0 if absent/unparseable).
 fn parse_duration_ms(s: Option<&str>) -> i64 {
     let Some(s) = s else { return 0 };
@@ -4823,13 +4866,13 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_page, backfill_metadata, cache_horizon, drop_duplicates, enqueue_at,
-        format_duration, get_url, guest_insert_index, history_threshold, is_mix, loudness_gain,
-        merge_radio, next_index, parse_duration_ms, persist_fingerprint, prefer_version,
-        prev_track_title, put_url, queue_fingerprint, radio_seed_for, retain_upcoming,
-        shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version, trim_played,
-        unshuffled, upcoming_queued, QueueState, RepeatMode, VideoUrls, KEEP_PLAYED,
-        LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
+        append_page, backfill_metadata, cache_horizon, cached_duration_metadata, drop_duplicates,
+        enqueue_at, format_duration, get_url, guest_insert_index, history_threshold, is_mix,
+        loudness_gain, merge_radio, next_index, parse_duration_ms, persist_fingerprint,
+        prefer_version, prepared_identity_matches, prev_track_title, put_url, queue_fingerprint,
+        radio_seed_for, retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into,
+        swap_version, trim_played, unshuffled, upcoming_queued, QueueState, RepeatMode, VideoUrls,
+        KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -5346,6 +5389,48 @@ mod tests {
 
         // Unknown length falls back to the old load-only margin rather than refusing everything.
         assert_eq!(cache_horizon(now, 0), now + 60);
+    }
+
+    #[test]
+    fn cached_stream_metadata_keeps_only_a_known_duration() {
+        assert_eq!(cached_duration_metadata(243), Some("243".to_owned()));
+        assert_eq!(cached_duration_metadata(0), None);
+        assert_eq!(cached_duration_metadata(-1), None);
+    }
+
+    #[test]
+    fn prepared_stream_identity_rejects_every_stale_dimension() {
+        assert!(prepared_identity_matches(7, 2, "next", 7, 2, "next"));
+        assert!(!prepared_identity_matches(6, 2, "next", 7, 2, "next"));
+        assert!(!prepared_identity_matches(7, 1, "next", 7, 2, "next"));
+        assert!(!prepared_identity_matches(7, 2, "old", 7, 2, "next"));
+    }
+
+    #[test]
+    fn player_event_lookahead_is_detached_only_on_ios() {
+        let source = include_str!("state.rs");
+        let helper = source
+            .split("async fn prime_lookahead_after_player_event")
+            .nth(1)
+            .and_then(|rest| rest.split("/// Resolve one iOS successor").next())
+            .expect("post-player-event lookahead helper");
+        assert!(helper.contains("#[cfg(target_os = \"ios\")]"));
+        assert!(helper.contains("tauri::async_runtime::spawn"));
+        assert!(helper.contains("#[cfg(not(target_os = \"ios\"))]"));
+        assert!(helper.contains("self.prime_lookahead(gen).await"));
+
+        let ended = source
+            .split("pub async fn on_track_ended")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn current_stream_client").next())
+            .expect("track-ended handler");
+        let failed = source
+            .split("pub async fn on_track_failed")
+            .nth(1)
+            .and_then(|rest| rest.split("pub async fn on_audio_device_lost").next())
+            .expect("track-failed handler");
+        assert!(ended.contains("prime_lookahead_after_player_event(gen).await"));
+        assert!(failed.contains("prime_lookahead_after_player_event(gen).await"));
     }
 
     // The one that silently breaks: a duplicate sitting *before* the playing track. Removing it
