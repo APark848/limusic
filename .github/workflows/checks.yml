@@ -237,7 +237,7 @@ jobs:
         run: |
           set -euo pipefail
           (cd ui && pnpm build)
-          tauri build --bundles nsis --config '{"build":{"beforeBuildCommand":""}}'
+          tauri build --bundles nsis --config '{"build":{"beforeBuildCommand":""},"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Upload Windows test installer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
