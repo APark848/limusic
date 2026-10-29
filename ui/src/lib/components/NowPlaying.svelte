@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { fade, fly, scale } from 'svelte/transition';
+	import { onDestroy } from 'svelte';
 	import { cubicOut } from 'svelte/easing';
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
@@ -223,15 +224,43 @@
 	let seekDrag = $state<number | null>(null);
 	let seekPointer: number | null = null;
 	let seekInput = $state<HTMLInputElement>();
-	const shownPosition = $derived(seekDrag ?? playback.position);
+	let seekHold = $state<{ videoId: string; target: number } | null>(null);
+	let seekHoldTimer: ReturnType<typeof setTimeout> | undefined;
+	const shownPosition = $derived(seekDrag ?? seekHold?.target ?? playback.position);
+	function clearSeekHold() {
+		clearTimeout(seekHoldTimer);
+		seekHoldTimer = undefined;
+		seekHold = null;
+	}
+	function holdCommittedSeek(position: number) {
+		const videoId = playback.now?.videoId;
+		if (!videoId) return;
+		clearTimeout(seekHoldTimer);
+		seekHold = { videoId, target: position };
+		seekHoldTimer = setTimeout(clearSeekHold, 1800);
+	}
+	$effect(() => {
+		const hold = seekHold;
+		if (!hold) return;
+		if (
+			playback.now?.videoId !== hold.videoId ||
+			Math.abs(playback.position - hold.target) <= 1.5
+		) {
+			clearSeekHold();
+		}
+	});
+	onDestroy(() => clearTimeout(seekHoldTimer));
+	function commitSeek(position: number) {
+		if (mobile) holdCommittedSeek(position);
+		else playback.position = position;
+		seekDrag = null;
+		api.seek(position);
+	}
 	function onSeekInput(e: Event) {
 		seekDrag = Number((e.target as HTMLInputElement).value);
 	}
 	function onSeekCommit(e: Event) {
-		const position = Number((e.target as HTMLInputElement).value);
-		playback.position = position;
-		seekDrag = null;
-		api.seek(position);
+		commitSeek(Number((e.target as HTMLInputElement).value));
 	}
 	function seekFromPointer(e: PointerEvent, target: HTMLElement) {
 		const box = target.getBoundingClientRect();
@@ -261,9 +290,7 @@
 		seekFromPointer(e, e.currentTarget as HTMLElement);
 		const position = seekDrag ?? playback.position;
 		seekPointer = null;
-		playback.position = position;
-		seekDrag = null;
-		api.seek(position);
+		commitSeek(position);
 	}
 	function cancelSeekPointer(e: PointerEvent) {
 		if (seekPointer !== e.pointerId) return;
@@ -368,7 +395,7 @@
 
 {#snippet mobileTabs()}
 	<div
-		class="flex min-h-[22rem] shrink-0 flex-col border-t px-4 pt-3"
+		class="flex min-h-0 flex-1 flex-col border-t px-4 pt-3"
 		style="padding-bottom:max(env(safe-area-inset-bottom),1rem)"
 		data-np-keep
 		data-np-scroll
@@ -640,7 +667,7 @@
 		? `translate:0 ${swipeOffset}px;transition:${swiping ? 'none' : 'translate 180ms ease-out'}`
 		: undefined}
 	class="absolute right-0 flex motion-reduce:!transition-none inert:bg-background {mobile
-		? 'inset-0 left-0 z-40 flex-col overflow-y-auto'
+		? 'inset-0 left-0 z-40 flex-col overflow-hidden'
 		: `inset-y-0 left-16 z-20 overflow-hidden ${ui.sidebarCollapsed ? '' : 'lg:left-60'} ${inset}`} {video.hole
 		? ''
 		: 'bg-background'} {mobile || stage ? '' : 'justify-center px-4 py-4 sm:px-6 sm:py-6 lg:px-10'}"

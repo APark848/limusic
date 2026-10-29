@@ -33,6 +33,17 @@ ok(
 	nowPlaying.includes('[data-np-seek]') && nowPlaying.includes('seekFromPointer'),
 	'the mobile seek target owns pointer scrubbing instead of the parent dismiss gesture'
 );
+ok(
+	nowPlaying.includes("'inset-0 left-0 z-40 flex-col overflow-hidden'") &&
+		nowPlaying.includes('class="flex min-h-0 flex-1 flex-col border-t'),
+	'mobile Now Playing stays viewport-fixed while its tab region owns the remaining height'
+);
+ok(
+	nowPlaying.includes('seekHold?.target') &&
+		nowPlaying.includes('Math.abs(playback.position - hold.target) <= 1.5') &&
+		nowPlaying.includes('setTimeout(clearSeekHold, 1800)'),
+	'a committed mobile seek masks stale position ticks until confirmation or a short timeout'
+);
 ok(css.includes('min-height: 44px;') && css.includes('touch-action: none;'), 'mobile seek has a native-size isolated touch target');
 ok(
 	trackRow.includes("win.chrome === 'mobile'") &&

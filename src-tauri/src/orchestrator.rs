@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 #[cfg(not(target_os = "ios"))]
 use innertube::find_format;
 #[cfg(target_os = "ios")]
-use innertube::find_ios_format;
+use innertube::{expected_audio_duration_ms, find_ios_format};
 use innertube::{
     find_video_format, rustypipe_fallback, AudioQuality, Clients, Format, InnerTube,
     PlayerResponse, StreamingData, YouTubeClient, MAIN_CLIENT, STREAM_FALLBACK_ORDER,
@@ -107,6 +107,7 @@ const NEEDS_N_TRANSFORM: [&str; 4] = ["WEB", "WEB_REMIX", "WEB_CREATOR", "TVHTML
 /// A remembered best-but-not-ideal stream, for the HIGH two-pass (context/06 §4).
 struct Candidate {
     format: Format,
+    expected_duration_ms: Option<u64>,
     url: String,
     expires: i64,
     client: String,
@@ -216,7 +217,10 @@ impl Orchestrator {
         is_upload: bool,
         quality: AudioQuality,
         disabled: &HashSet<String>,
+        known_duration_secs: Option<u64>,
     ) -> Result<PlaybackData, ResolveError> {
+        #[cfg(not(target_os = "ios"))]
+        let _ = known_duration_secs;
         tracing::info!(
             video_id,
             upload = is_upload,
@@ -393,15 +397,23 @@ impl Orchestrator {
             let Some(streaming) = resp.streaming_data.as_ref() else { continue };
             let Some(expires) = streaming.expires_in_seconds else { continue };
             #[cfg(target_os = "ios")]
-            let format = find_ios_format(
+            let expected_duration_ms = expected_audio_duration_ms(
                 streaming,
-                quality,
+                known_duration_secs,
                 main_resp
                     .as_ref()
                     .and_then(|response| response.video_details.as_ref())
                     .and_then(|details| details.length_seconds.as_deref())
-                    .and_then(|seconds| seconds.parse::<u64>().ok()),
+                    .or_else(|| {
+                        resp.video_details
+                            .as_ref()
+                            .and_then(|details| details.length_seconds.as_deref())
+                    }),
             );
+            #[cfg(not(target_os = "ios"))]
+            let expected_duration_ms = None;
+            #[cfg(target_os = "ios")]
+            let format = find_ios_format(streaming, quality, expected_duration_ms);
             #[cfg(not(target_os = "ios"))]
             let format = find_format(streaming, quality);
             let Some(format) = format else {
@@ -436,8 +448,14 @@ impl Orchestrator {
             if prefer_high && !is_high(format) && has_high {
                 if better(format, best.as_ref().map(|c| &c.format)) {
                     let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
-                    best =
-                        Some(Candidate { format: format.clone(), url, expires, client: key, ping });
+                    best = Some(Candidate {
+                        format: format.clone(),
+                        expected_duration_ms,
+                        url,
+                        expires,
+                        client: key,
+                        ping,
+                    });
                 }
                 continue;
             }
@@ -475,6 +493,7 @@ impl Orchestrator {
                     &key,
                     audio_config_loudness,
                     &main_resp,
+                    expected_duration_ms,
                     ping,
                     headers,
                 ));
@@ -495,8 +514,14 @@ impl Orchestrator {
                 if upload_fallback.is_none() {
                     tracing::info!(video_id, client = %key, "upload stream failed validation, trying the next login client");
                     let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
-                    upload_fallback =
-                        Some(Candidate { format: format.clone(), url, expires, client: key, ping });
+                    upload_fallback = Some(Candidate {
+                        format: format.clone(),
+                        expected_duration_ms,
+                        url,
+                        expires,
+                        client: key,
+                        ping,
+                    });
                 }
                 continue;
             }
@@ -517,6 +542,7 @@ impl Orchestrator {
                 &c.client,
                 audio_config_loudness,
                 &main_resp,
+                c.expected_duration_ms,
                 c.ping,
                 headers,
             ));
@@ -540,6 +566,7 @@ impl Orchestrator {
                 &c.client,
                 audio_config_loudness,
                 &main_resp,
+                c.expected_duration_ms,
                 c.ping,
                 headers,
             ));
@@ -818,18 +845,23 @@ impl Orchestrator {
         client: &str,
         loudness: Option<f64>,
         main_resp: &Option<PlayerResponse>,
+        expected_duration_ms: Option<u64>,
         ping: Option<PlaybackPing>,
         headers: HashMap<String, String>,
     ) -> PlaybackData {
         let vd = main_resp.as_ref().and_then(|r| r.video_details.as_ref());
-        let duration =
-            resolved_duration(vd.and_then(|details| details.length_seconds.as_deref()), format);
+        let duration = resolved_duration(
+            expected_duration_ms,
+            vd.and_then(|details| details.length_seconds.as_deref()),
+            format,
+        );
         tracing::info!(
             video_id,
             client,
             itag = format.itag,
             mime = %format.mime_type,
             expected_duration_secs = vd.and_then(|details| details.length_seconds.as_deref()),
+            selected_expected_duration_ms = expected_duration_ms,
             format_duration_ms = format.approx_duration_ms.as_deref(),
             "resolved stream"
         );
@@ -856,16 +888,29 @@ impl Orchestrator {
 /// millisecond timeline. Typeahead song rows have no duration of their own, so retaining this
 /// format-level value is what lets iOS reject an implausible AVPlayer container timeline without
 /// replacing the row with a title-matched search result.
-fn resolved_duration(video_seconds: Option<&str>, format: &Format) -> Option<String> {
-    video_seconds.map(str::to_owned).or_else(|| {
-        format
-            .approx_duration_ms
-            .as_deref()?
-            .parse::<f64>()
-            .ok()
-            .filter(|ms| ms.is_finite() && *ms > 0.0)
-            .map(|ms| (ms / 1000.0).to_string())
-    })
+fn resolved_duration(
+    expected_duration_ms: Option<u64>,
+    video_details_seconds: Option<&str>,
+    format: &Format,
+) -> Option<String> {
+    expected_duration_ms
+        .map(|ms| (ms as f64 / 1000.0).to_string())
+        .or_else(|| {
+            video_details_seconds?
+                .parse::<f64>()
+                .ok()
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+                .map(|seconds| seconds.to_string())
+        })
+        .or_else(|| {
+            format
+                .approx_duration_ms
+                .as_deref()?
+                .parse::<f64>()
+                .ok()
+                .filter(|ms| ms.is_finite() && *ms > 0.0)
+                .map(|ms| (ms / 1000.0).to_string())
+        })
 }
 
 /// A format's byte length, when it reported one. `"0"` (an RSS-feed enclosure, #294) reads as
@@ -1126,9 +1171,19 @@ mod tests {
             "approxDurationMs": "243081"
         }))
         .unwrap();
-        assert_eq!(resolved_duration(None, &format).as_deref(), Some("243.081"));
+        assert_eq!(resolved_duration(None, None, &format).as_deref(), Some("243.081"));
         assert_eq!(
-            resolved_duration(Some("244"), &format).as_deref(),
+            resolved_duration(None, Some("244"), &format).as_deref(),
+            Some("244"),
+            "desktop videoDetails retain their precedence over format metadata"
+        );
+        assert_eq!(
+            resolved_duration(Some(245_000), Some("244"), &format).as_deref(),
+            Some("245"),
+            "the independently chosen iOS duration remains authoritative"
+        );
+        assert_eq!(
+            resolved_duration(Some(244_000), None, &format).as_deref(),
             Some("244"),
             "track-level metadata remains authoritative when both values exist"
         );

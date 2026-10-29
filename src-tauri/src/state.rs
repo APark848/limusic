@@ -1256,7 +1256,7 @@ impl AppState {
                 // metadata from search/browse or an earlier response. Keep that known duration so
                 // iOS can reject a wildly wrong AVPlayer container timeline. Zero still means
                 // unknown and must not be invented as metadata.
-                duration: cached_duration_metadata(duration_secs),
+                duration: cached_duration_metadata(duration_secs).or(c.duration),
                 thumbnail: None,
                 // Cached alongside the URL: a hit skips `/player`, so without it a replay inside
                 // the cache window (hours, and every track you just listened to) would fall back
@@ -1267,7 +1267,13 @@ impl AppState {
         }
         let data = self
             .orchestrator
-            .resolve(video_id, is_upload, self.quality(), &self.disabled_clients())
+            .resolve(
+                video_id,
+                is_upload,
+                self.quality(),
+                &self.disabled_clients(),
+                (duration_secs > 0).then_some(duration_secs as u64),
+            )
             .await?;
         // Never cache rustypipe URLs: googlevideo serves them only for bounded-Range requests,
         // which mpv doesn't send → LOADING_FAILED(-13). Caching one poisons the videoId for ~6h.
@@ -1282,6 +1288,7 @@ impl AppState {
                     itag: data.itag,
                     expires_at: now + data.expires_in_seconds.max(0),
                     loudness_db: data.loudness_db,
+                    duration: data.duration.clone(),
                     is_video: data.is_video,
                     ping_url: data.playback_ping.as_ref().map(|p| p.url.clone()),
                     ping_client: data.playback_ping.as_ref().map(|p| p.client.clone()),
