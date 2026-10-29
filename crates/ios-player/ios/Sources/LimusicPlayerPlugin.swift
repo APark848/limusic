@@ -20,6 +20,7 @@ private struct LoadArgs: Decodable {
   let url: String
   let headers: [String: String]
   let start: Double?
+  let expectedDuration: Double?
 }
 
 private struct SeekArgs: Decodable {
@@ -44,6 +45,11 @@ final class LimusicPlayerPlugin: Plugin {
   private var loopsCurrentItem = false
   private var failureEmitted = false
   private var wantsPlayback = false
+  private var expectedDuration: Double?
+  private var usesExpectedDuration = false
+  private var endedEmitted = false
+  private var authoritativeBoundaryHandled = false
+  private var loadStartedAt = CFAbsoluteTimeGetCurrent()
 
   deinit {
     removeObservers()
@@ -99,7 +105,33 @@ final class LimusicPlayerPlugin: Plugin {
   }
 
   private func diagnostic(_ stage: String) {
-    emit(EventKind.diagnostic, message: stage)
+    emit(
+      EventKind.diagnostic,
+      value: max(0, (CFAbsoluteTimeGetCurrent() - loadStartedAt) * 1000),
+      message: stage)
+  }
+
+  private func finishCurrentItem() {
+    guard !endedEmitted else { return }
+    endedEmitted = true
+    wantsPlayback = false
+    player.pause()
+    emit(EventKind.playing, value: 0)
+    emit(EventKind.ended)
+  }
+
+  private func reachAuthoritativeEnd(_ item: AVPlayerItem) {
+    guard !authoritativeBoundaryHandled else { return }
+    authoritativeBoundaryHandled = true
+    if loopsCurrentItem {
+      player.seek(to: .zero) { [weak self, weak item] _ in
+        guard let self, let item, item === self.player.currentItem else { return }
+        self.authoritativeBoundaryHandled = false
+        self.startPlaybackIfReady(item, stage: "authoritative-duration-loop-restart")
+      }
+    } else {
+      finishCurrentItem()
+    }
   }
 
   private func startPlaybackIfReady(_ item: AVPlayerItem, stage: String) {
@@ -184,6 +216,16 @@ final class LimusicPlayerPlugin: Plugin {
       let seconds = time.seconds
       if seconds.isFinite {
         self?.emit(EventKind.position, value: max(0, seconds))
+        if let self,
+          self.usesExpectedDuration,
+          let expected = self.expectedDuration,
+          seconds >= expected
+        {
+          self.diagnostic("authoritative-duration-ended")
+          if let item = self.player.currentItem {
+            self.reachAuthoritativeEnd(item)
+          }
+        }
       }
     }
 
@@ -194,9 +236,17 @@ final class LimusicPlayerPlugin: Plugin {
       switch observed.status {
       case .readyToPlay:
         self.diagnostic("item-ready-to-play")
-        let seconds = observed.duration.seconds
-        if seconds.isFinite && seconds >= 0 {
-          self.emit(EventKind.duration, value: seconds)
+        let observedSeconds = observed.duration.seconds
+        if observedSeconds.isFinite && observedSeconds >= 0 {
+          if let expected = self.expectedDuration {
+            let tolerance = max(10, expected * 0.1)
+            self.usesExpectedDuration = abs(observedSeconds - expected) > tolerance
+          }
+          let reported = self.usesExpectedDuration ? self.expectedDuration! : observedSeconds
+          self.emit(EventKind.duration, value: reported)
+          if self.usesExpectedDuration {
+            self.diagnostic("duration-authoritative-fallback")
+          }
         }
         self.startPlaybackIfReady(observed, stage: "ready-autoplay")
       case .failed:
@@ -240,9 +290,7 @@ final class LimusicPlayerPlugin: Plugin {
         self.player.seek(to: .zero)
         self.startPlaybackIfReady(item, stage: "loop-restart")
       } else {
-        self.wantsPlayback = false
-        self.emit(EventKind.playing, value: 0)
-        self.emit(EventKind.ended)
+        self.finishCurrentItem()
       }
     }
 
@@ -291,6 +339,11 @@ final class LimusicPlayerPlugin: Plugin {
       self.removeObservers()
       self.wantsPlayback = false
       self.failureEmitted = false
+      self.expectedDuration = args.expectedDuration
+      self.usesExpectedDuration = false
+      self.endedEmitted = false
+      self.authoritativeBoundaryHandled = false
+      self.loadStartedAt = CFAbsoluteTimeGetCurrent()
       self.diagnostic("load-received")
       let item = AVPlayerItem(asset: asset)
       self.player.replaceCurrentItem(with: item)

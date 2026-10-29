@@ -17,9 +17,9 @@ use innertube::find_format;
 #[cfg(target_os = "ios")]
 use innertube::find_ios_format;
 use innertube::{
-    find_video_format, rustypipe_fallback, AudioQuality, Clients, Format, InnerTube,
-    PlayerResponse, StreamingData, YouTubeClient, MAIN_CLIENT, STREAM_FALLBACK_ORDER,
-    UPLOAD_FALLBACK_ORDER,
+    expected_audio_duration_ms, find_video_format, rustypipe_fallback, AudioQuality, Clients,
+    Format, InnerTube, PlayerResponse, StreamingData, YouTubeClient, MAIN_CLIENT,
+    STREAM_FALLBACK_ORDER, UPLOAD_FALLBACK_ORDER,
 };
 use tokio::sync::Mutex;
 
@@ -43,6 +43,10 @@ pub struct PlaybackData {
     pub title: Option<String>,
     pub artists: Option<String>,
     pub duration: Option<String>,
+    /// True when `duration` came from row metadata, `videoDetails`, or a strict format majority.
+    /// A selected format's own timeline is useful as a fallback but cannot validate itself.
+    #[serde(skip)]
+    pub duration_trusted: bool,
     pub thumbnail: Option<String>,
     /// YouTube's own `musicVideoType` for this videoId: `Some(true)` = a video upload, `Some(false)`
     /// = the generated audio track, `None` = the metadata client never answered. The player view's
@@ -107,6 +111,7 @@ const NEEDS_N_TRANSFORM: [&str; 4] = ["WEB", "WEB_REMIX", "WEB_CREATOR", "TVHTML
 /// A remembered best-but-not-ideal stream, for the HIGH two-pass (context/06 §4).
 struct Candidate {
     format: Format,
+    expected_duration_ms: Option<u64>,
     url: String,
     expires: i64,
     client: String,
@@ -216,6 +221,7 @@ impl Orchestrator {
         is_upload: bool,
         quality: AudioQuality,
         disabled: &HashSet<String>,
+        known_duration_secs: Option<u64>,
     ) -> Result<PlaybackData, ResolveError> {
         tracing::info!(
             video_id,
@@ -392,8 +398,21 @@ impl Orchestrator {
 
             let Some(streaming) = resp.streaming_data.as_ref() else { continue };
             let Some(expires) = streaming.expires_in_seconds else { continue };
+            let expected_duration_ms = expected_audio_duration_ms(
+                streaming,
+                known_duration_secs,
+                main_resp
+                    .as_ref()
+                    .and_then(|response| response.video_details.as_ref())
+                    .and_then(|details| details.length_seconds.as_deref())
+                    .or_else(|| {
+                        resp.video_details
+                            .as_ref()
+                            .and_then(|details| details.length_seconds.as_deref())
+                    }),
+            );
             #[cfg(target_os = "ios")]
-            let format = find_ios_format(streaming, quality);
+            let format = find_ios_format(streaming, quality, expected_duration_ms);
             #[cfg(not(target_os = "ios"))]
             let format = find_format(streaming, quality);
             let Some(format) = format else {
@@ -428,8 +447,14 @@ impl Orchestrator {
             if prefer_high && !is_high(format) && has_high {
                 if better(format, best.as_ref().map(|c| &c.format)) {
                     let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
-                    best =
-                        Some(Candidate { format: format.clone(), url, expires, client: key, ping });
+                    best = Some(Candidate {
+                        format: format.clone(),
+                        expected_duration_ms,
+                        url,
+                        expires,
+                        client: key,
+                        ping,
+                    });
                 }
                 continue;
             }
@@ -467,6 +492,7 @@ impl Orchestrator {
                     &key,
                     audio_config_loudness,
                     &main_resp,
+                    expected_duration_ms,
                     ping,
                     headers,
                 ));
@@ -487,8 +513,14 @@ impl Orchestrator {
                 if upload_fallback.is_none() {
                     tracing::info!(video_id, client = %key, "upload stream failed validation, trying the next login client");
                     let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
-                    upload_fallback =
-                        Some(Candidate { format: format.clone(), url, expires, client: key, ping });
+                    upload_fallback = Some(Candidate {
+                        format: format.clone(),
+                        expected_duration_ms,
+                        url,
+                        expires,
+                        client: key,
+                        ping,
+                    });
                 }
                 continue;
             }
@@ -509,6 +541,7 @@ impl Orchestrator {
                 &c.client,
                 audio_config_loudness,
                 &main_resp,
+                c.expected_duration_ms,
                 c.ping,
                 headers,
             ));
@@ -532,6 +565,7 @@ impl Orchestrator {
                 &c.client,
                 audio_config_loudness,
                 &main_resp,
+                c.expected_duration_ms,
                 c.ping,
                 headers,
             ));
@@ -562,6 +596,7 @@ impl Orchestrator {
                 title: c.title,
                 artists: None,
                 duration: c.duration_secs.map(|s| s.to_string()),
+                duration_trusted: false,
                 thumbnail: None,
                 // rustypipe answers without a `musicVideoType`, so the queue row's flag stands.
                 is_video: None,
@@ -810,15 +845,24 @@ impl Orchestrator {
         client: &str,
         loudness: Option<f64>,
         main_resp: &Option<PlayerResponse>,
+        expected_duration_ms: Option<u64>,
         ping: Option<PlaybackPing>,
         headers: HashMap<String, String>,
     ) -> PlaybackData {
         let vd = main_resp.as_ref().and_then(|r| r.video_details.as_ref());
+        let duration = resolved_duration(
+            expected_duration_ms,
+            vd.and_then(|details| details.length_seconds.as_deref()),
+            format,
+        );
         tracing::info!(
             video_id,
             client,
             itag = format.itag,
             mime = %format.mime_type,
+            expected_duration_secs = vd.and_then(|details| details.length_seconds.as_deref()),
+            selected_expected_duration_ms = expected_duration_ms,
+            format_duration_ms = format.approx_duration_ms.as_deref(),
             "resolved stream"
         );
         PlaybackData {
@@ -831,12 +875,43 @@ impl Orchestrator {
             playback_ping: ping,
             title: vd.and_then(|v| v.title.clone()),
             artists: vd.and_then(|v| v.author.clone()),
-            duration: vd.and_then(|v| v.length_seconds.clone()),
+            duration,
+            duration_trusted: expected_duration_ms.is_some(),
             thumbnail: main_resp.as_ref().and_then(best_thumbnail),
             is_video: vd.and_then(|v| v.is_music_video()),
             stream_client: client.to_owned(),
         }
     }
+}
+
+/// The player response is the preferred track-level duration. Some successful fallback clients do
+/// not repeat `videoDetails`, though, while the selected audio format still carries an exact
+/// millisecond timeline. Typeahead song rows have no duration of their own, so retaining this
+/// format-level value is what lets either native player reject an implausible container timeline
+/// without replacing the row with a title-matched search result.
+fn resolved_duration(
+    expected_duration_ms: Option<u64>,
+    video_details_seconds: Option<&str>,
+    format: &Format,
+) -> Option<String> {
+    expected_duration_ms
+        .map(|ms| (ms as f64 / 1000.0).to_string())
+        .or_else(|| {
+            video_details_seconds?
+                .parse::<f64>()
+                .ok()
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+                .map(|seconds| seconds.to_string())
+        })
+        .or_else(|| {
+            format
+                .approx_duration_ms
+                .as_deref()?
+                .parse::<f64>()
+                .ok()
+                .filter(|ms| ms.is_finite() && *ms > 0.0)
+                .map(|ms| (ms / 1000.0).to_string())
+        })
 }
 
 /// A format's byte length, when it reported one. `"0"` (an RSS-feed enclosure, #294) reads as
@@ -959,7 +1034,7 @@ fn best_thumbnail(resp: &PlayerResponse) -> Option<String> {
 mod tests {
     use super::{
         blacklist_blocks, blacklist_insert, claim_heal, content_length, is_youtube_stream,
-        nothing_played, stream_headers, ResolveError, WEB_REMIX_BLACKLIST_TTL,
+        nothing_played, resolved_duration, stream_headers, ResolveError, WEB_REMIX_BLACKLIST_TTL,
     };
     use std::collections::HashMap;
     use std::time::{Duration, Instant};
@@ -1087,6 +1162,32 @@ mod tests {
         );
         assert_eq!(content_length(&fmt("")), None);
         assert_eq!(content_length(&fmt("not a number")), None);
+    }
+
+    #[test]
+    fn selected_format_duration_protects_durationless_typeahead_rows() {
+        let format: super::Format = serde_json::from_value(serde_json::json!({
+            "itag": 140,
+            "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+            "approxDurationMs": "243081"
+        }))
+        .unwrap();
+        assert_eq!(resolved_duration(None, None, &format).as_deref(), Some("243.081"));
+        assert_eq!(
+            resolved_duration(None, Some("244"), &format).as_deref(),
+            Some("244"),
+            "desktop videoDetails retain their precedence over format metadata"
+        );
+        assert_eq!(
+            resolved_duration(Some(245_000), Some("244"), &format).as_deref(),
+            Some("245"),
+            "the independently chosen iOS duration remains authoritative"
+        );
+        assert_eq!(
+            resolved_duration(Some(244_000), None, &format).as_deref(),
+            Some("244"),
+            "track-level metadata remains authoritative when both values exist"
+        );
     }
 
     #[test]

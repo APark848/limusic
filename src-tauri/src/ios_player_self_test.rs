@@ -104,7 +104,10 @@ async fn run(
     let mut observed = vec!["constructed"];
 
     write_progress(result_path, "loading")?;
-    state.player.load(&fixture_url, &HashMap::new(), None, None).context("load failed")?;
+    state
+        .player
+        .load(&fixture_url, &HashMap::new(), None, None, Some(1.0))
+        .context("load failed")?;
     // Deliberately do not wait for AVPlayerItem.readyToPlay. This is the production song-tap
     // sequence and protects the pending-play intent in the Swift bridge.
     write_progress(result_path, "playing-before-ready")?;
@@ -275,7 +278,13 @@ async fn run_remote(
     let client = data.stream_client.clone();
     let itag = data.itag;
     let _ = write_progress(&result_path, "loading-remote-stream");
-    if let Err(error) = state.player.load(&data.stream_url, &data.headers, None, None) {
+    if let Err(error) = state.player.load(
+        &data.stream_url,
+        &data.headers,
+        None,
+        None,
+        data.duration.as_deref().and_then(|value| value.parse::<f64>().ok()),
+    ) {
         write_remote_failure(
             &result_path,
             "application",

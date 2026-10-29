@@ -84,12 +84,18 @@ pub async fn search_cards(
 /// with its metadata without another round-trip.
 #[tauri::command]
 pub async fn play(state: St<'_>, item: SongItem) -> Result<(), String> {
+    let started = std::time::Instant::now();
     tracing::info!(video_id = %item.video_id, "play command received");
     let state = state.inner().clone();
     let result = state.play_song(item).await;
     match &result {
-        Ok(()) => tracing::info!("play command completed"),
-        Err(error) => tracing::warn!(%error, "play command failed"),
+        Ok(()) => tracing::info!(
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "play command completed"
+        ),
+        Err(error) => {
+            tracing::warn!(%error, elapsed_ms = started.elapsed().as_millis() as u64, "play command failed")
+        }
     }
     result
 }

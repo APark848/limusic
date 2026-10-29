@@ -155,6 +155,7 @@ impl Player {
         headers: &HashMap<String, String>,
         gain: Option<f64>,
         start: Option<f64>,
+        expected_duration: Option<f64>,
     ) -> Result<(), Error> {
         tracing::info!(
             header_count = headers.len(),
@@ -165,7 +166,7 @@ impl Player {
         if gain.is_some_and(|gain| gain.abs() > f64::EPSILON) {
             return Err(Error::Unsupported("loudness gain"));
         }
-        self.native.load(url, headers, start)?;
+        self.native.load(url, headers, start, expected_duration)?;
         self.native.set_volume(self.volume())?;
         if let Ok(mut path) = self.current_path.lock() {
             *path = Some(url.to_owned());

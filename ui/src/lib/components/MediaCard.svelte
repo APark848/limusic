@@ -14,6 +14,7 @@
 	import ItemMenu from './ItemMenu.svelte';
 	import ExplicitIcon from './ExplicitIcon.svelte';
 	import { t } from '$lib/i18n.svelte';
+	import { win } from '$lib/win.svelte';
 
 	let { item, compact = false }: { item: BrowseItem; compact?: boolean } = $props();
 
@@ -21,6 +22,7 @@
 	// On Repeat has no artwork by nature, so its cover is the icon rather than the neutral
 	// placeholder every failed thumbnail lands on.
 	const onRepeat = $derived(item.id === ON_REPEAT_ID);
+	const mobile = $derived(win.chrome === 'mobile');
 
 	// Google's CDN doesn't serve every rewritten size — asking for one it doesn't have 404s, and the
 	// browser then paints its broken-image glyph. So: try the sized URL, retry the original once, and
@@ -60,10 +62,10 @@
 </script>
 
 <!-- data-ctx: right-clicking anywhere on the card opens the ⋯ menu below at the pointer. -->
-<div class="group relative flex w-full flex-col gap-2" data-ctx>
+<div class="{mobile ? '' : 'group'} relative flex w-full flex-col gap-2" data-ctx>
 	<!-- draggable: every card is a drag source for home's Shortcuts grid (the only drop target). -->
 	<div
-		class="flex flex-col text-left transition-colors hover:bg-accent/10 {compact
+		class="flex flex-col text-left transition-colors {mobile ? '' : 'hover:bg-accent/10'} {compact
 			? 'gap-1.5 rounded-lg p-1.5'
 			: 'gap-2 rounded-xl p-2'}"
 		role="button"
@@ -143,7 +145,9 @@
 				{#if item.kind !== 'artist'}
 					<!-- A fade only: the slide it used to have is a transform transition (see above). -->
 					<button
-						class="absolute flex cursor-pointer items-center justify-center rounded-full bg-primary text-primary-foreground opacity-0 shadow-lg transition-opacity duration-200 ease-out group-hover:opacity-100 focus-visible:opacity-100 {compact
+						class="absolute flex cursor-pointer items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-opacity duration-200 ease-out focus-visible:opacity-100 {mobile
+							? 'opacity-100'
+							: 'opacity-0 group-hover:opacity-100'} {compact
 							? 'bottom-1.5 right-1.5 h-7 w-7'
 							: 'bottom-2 right-2 h-9 w-9'}"
 						class:animate-pulse={playing}
@@ -180,6 +184,6 @@
 	     hovered. At 90% over artwork there is nothing left to blur that you can see. -->
 	<ItemMenu
 		{item}
-		triggerClass="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-full bg-background/90 text-foreground opacity-0 shadow-md transition hover:bg-background focus-visible:opacity-100 group-hover:opacity-100 cursor-pointer"
+		triggerClass="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-full bg-background/90 text-foreground shadow-md transition hover:bg-background focus-visible:opacity-100 cursor-pointer {mobile ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'}"
 	/>
 </div>

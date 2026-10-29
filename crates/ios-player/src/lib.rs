@@ -69,4 +69,13 @@ mod tests {
             assert!(body.contains("self.wantsPlayback = false"), "{method} must cancel autoplay");
         }
     }
+
+    #[test]
+    fn swift_bridge_uses_authoritative_duration_conservatively_and_ends_once() {
+        let swift = include_str!("../ios/Sources/LimusicPlayerPlugin.swift");
+        assert!(swift.contains("let tolerance = max(10, expected * 0.1)"));
+        assert!(swift.contains("guard !endedEmitted else { return }"));
+        assert!(swift.contains("self.reachAuthoritativeEnd(item)"));
+        assert!(swift.contains("authoritative-duration-loop-restart"));
+    }
 }

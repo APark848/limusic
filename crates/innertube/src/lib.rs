@@ -40,8 +40,8 @@ pub use models::metadata::{
     AccountIdentity, AccountInfo, NextResult, Rating, SearchResult, SongItem,
 };
 pub use models::player::{
-    find_format, find_ios_format, find_video_format, AudioQuality, Format, PlaybackTracking,
-    PlayerResponse, StreamingData,
+    authoritative_duration_secs, expected_audio_duration_ms, find_format, find_ios_format,
+    find_video_format, AudioQuality, Format, PlaybackTracking, PlayerResponse, StreamingData,
 };
 pub use rustypipe_fallback::{FallbackError, StreamCandidate};
 pub use transport::{

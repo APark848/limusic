@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { fade, fly, scale } from 'svelte/transition';
+	import { onDestroy } from 'svelte';
 	import { cubicOut } from 'svelte/easing';
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { HugeiconsIcon } from '@hugeicons/svelte';
@@ -89,6 +90,82 @@
 	const keeps = (t: EventTarget | null) => !!(t as Element | null)?.closest?.('[data-np-keep]');
 	let pressedKeep = false;
 	let releasedKeep = false;
+	let swipeStart: { x: number; y: number; at: number; artwork: boolean; atTop: boolean } | null = null;
+	let swipeOffset = $state(0);
+	let swiping = $state(false);
+	let swipeVertical = false;
+	let suppressArtworkToggleUntil = 0;
+	const swipeBlocked = (target: EventTarget | null) =>
+		!!(target as Element | null)?.closest?.(
+			'button:not([data-np-artwork]),input,[data-np-scroll],[data-np-seek]'
+		);
+	function onPointerDown(e: PointerEvent) {
+		pressedKeep = keeps(e.target);
+		releasedKeep = false;
+	}
+	function onPointerUp(e: PointerEvent) {
+		releasedKeep = keeps(e.target);
+	}
+	function finishSwipe() {
+		if (!swipeStart) return;
+		const elapsed = Math.max(1, performance.now() - swipeStart.at);
+		const velocity = swipeOffset / elapsed;
+		const dismiss = swipeVertical && (swipeOffset >= 96 || (swipeOffset >= 44 && velocity >= 0.65));
+		swipeStart = null;
+		swipeVertical = false;
+		swiping = false;
+		swipeOffset = 0;
+		if (dismiss) np.open = false;
+	}
+	function mobileScrollGesture(node: HTMLElement) {
+		const start = (e: TouchEvent) => {
+			if (!mobile || e.touches.length !== 1 || swipeBlocked(e.target)) return;
+			const touch = e.touches[0];
+			swipeStart = {
+				x: touch.clientX,
+				y: touch.clientY,
+				at: performance.now(),
+				artwork: !!(e.target as Element | null)?.closest?.('[data-np-artwork]'),
+				atTop: node.scrollTop <= 1
+			};
+			swipeVertical = false;
+		};
+		const move = (e: TouchEvent) => {
+			if (!swipeStart || e.touches.length !== 1) return;
+			const touch = e.touches[0];
+			const dx = touch.clientX - swipeStart.x;
+			const dy = touch.clientY - swipeStart.y;
+			if (!swipeVertical && Math.hypot(dx, dy) > 8) {
+				if (swipeStart.artwork) suppressArtworkToggleUntil = performance.now() + 500;
+				// Upward movement, horizontal movement, or a drag that began below the top belongs
+				// to WebKit's native inertial scroller. Only a downward drag that began at the top
+				// becomes the custom minimise gesture.
+				if (Math.abs(dx) >= Math.abs(dy) || dy <= 0 || !swipeStart.atTop) {
+					swipeStart = null;
+					return;
+				}
+				swipeVertical = true;
+				swiping = true;
+			}
+			if (swipeVertical) {
+				e.preventDefault();
+				swipeOffset = Math.max(0, dy);
+			}
+		};
+		const finish = () => finishSwipe();
+		node.addEventListener('touchstart', start, { passive: true });
+		node.addEventListener('touchmove', move, { passive: false });
+		node.addEventListener('touchend', finish, { passive: true });
+		node.addEventListener('touchcancel', finish, { passive: true });
+		return {
+			destroy() {
+				node.removeEventListener('touchstart', start);
+				node.removeEventListener('touchmove', move);
+				node.removeEventListener('touchend', finish);
+				node.removeEventListener('touchcancel', finish);
+			}
+		};
+	}
 	function onBackdropClick(e: MouseEvent) {
 		if (pressedKeep || releasedKeep || keeps(e.target)) return;
 		np.open = false;
@@ -150,6 +227,7 @@
 	let flash: 'play' | 'pause' | null = $state(null);
 	let flashTimer: ReturnType<typeof setTimeout>;
 	function toggle() {
+		if (mobile && performance.now() < suppressArtworkToggleUntil) return;
 		flash = playback.paused ? 'play' : 'pause';
 		clearTimeout(flashTimer);
 		flashTimer = setTimeout(() => (flash = null), 220);
@@ -167,15 +245,81 @@
 			.padStart(2, '0')}`;
 	};
 	let seekDrag = $state<number | null>(null);
-	const shownPosition = $derived(seekDrag ?? playback.position);
+	let seekPointer: number | null = null;
+	let seekInput = $state<HTMLInputElement>();
+	let seekHold = $state<{ videoId: string; target: number } | null>(null);
+	let seekHoldTimer: ReturnType<typeof setTimeout> | undefined;
+	const shownPosition = $derived(seekDrag ?? seekHold?.target ?? playback.position);
+	function clearSeekHold() {
+		clearTimeout(seekHoldTimer);
+		seekHoldTimer = undefined;
+		seekHold = null;
+	}
+	function holdCommittedSeek(position: number) {
+		const videoId = playback.now?.videoId;
+		if (!videoId) return;
+		clearTimeout(seekHoldTimer);
+		seekHold = { videoId, target: position };
+		seekHoldTimer = setTimeout(clearSeekHold, 1800);
+	}
+	$effect(() => {
+		const hold = seekHold;
+		if (!hold) return;
+		if (
+			playback.now?.videoId !== hold.videoId ||
+			Math.abs(playback.position - hold.target) <= 1.5
+		) {
+			clearSeekHold();
+		}
+	});
+	onDestroy(() => clearTimeout(seekHoldTimer));
+	function commitSeek(position: number) {
+		if (mobile) holdCommittedSeek(position);
+		else playback.position = position;
+		seekDrag = null;
+		api.seek(position);
+	}
 	function onSeekInput(e: Event) {
 		seekDrag = Number((e.target as HTMLInputElement).value);
 	}
 	function onSeekCommit(e: Event) {
-		const position = Number((e.target as HTMLInputElement).value);
-		playback.position = position;
+		commitSeek(Number((e.target as HTMLInputElement).value));
+	}
+	function seekFromPointer(e: PointerEvent, target: HTMLElement) {
+		const box = target.getBoundingClientRect();
+		const ratio = Math.max(0, Math.min(1, (e.clientX - box.left) / Math.max(1, box.width)));
+		seekDrag = ratio * playback.duration;
+	}
+	function onSeekPointerDown(e: PointerEvent) {
+		if (!mobile || e.pointerType === 'mouse' || !playback.duration) return;
+		e.preventDefault();
+		e.stopPropagation();
+		seekPointer = e.pointerId;
+		seekInput?.focus({ preventScroll: true });
+		const target = e.currentTarget as HTMLElement;
+		target.setPointerCapture(e.pointerId);
+		seekFromPointer(e, target);
+	}
+	function onSeekPointerMove(e: PointerEvent) {
+		if (seekPointer !== e.pointerId) return;
+		e.preventDefault();
+		e.stopPropagation();
+		seekFromPointer(e, e.currentTarget as HTMLElement);
+	}
+	function finishSeekPointer(e: PointerEvent) {
+		if (seekPointer !== e.pointerId) return;
+		e.preventDefault();
+		e.stopPropagation();
+		seekFromPointer(e, e.currentTarget as HTMLElement);
+		const position = seekDrag ?? playback.position;
+		seekPointer = null;
+		commitSeek(position);
+	}
+	function cancelSeekPointer(e: PointerEvent) {
+		if (seekPointer !== e.pointerId) return;
+		e.stopPropagation();
+		seekPointer = null;
 		seekDrag = null;
-		api.seek(position);
 	}
 
 	// Scrolling the artwork is the volume, same step as the slider. The level only draws while the
@@ -277,6 +421,7 @@
 		class="flex min-h-[22rem] shrink-0 flex-col border-t px-4 pt-3"
 		style="padding-bottom:max(env(safe-area-inset-bottom),1rem)"
 		data-np-keep
+		data-np-scroll
 	>
 		<Tabs.Root
 			value={np.tab}
@@ -341,7 +486,13 @@
 
 <!-- Both layouts: the play/pause button over the picture, and the picture in it. -->
 {#snippet picture()}
-	<button type="button" onclick={toggle} aria-label={t('a11y.play_pause')} class="block w-full cursor-pointer">
+	<button
+		type="button"
+		onclick={toggle}
+		aria-label={t('a11y.play_pause')}
+		data-np-artwork={mobile ? '' : undefined}
+		class="block w-full cursor-pointer"
+	>
 		{#if flash}
 			<!-- No backdrop-blur: re-blurring the plate on every frame of the scale is what made this
 			     stutter on WebKitGTK. Transform and opacity only. -->
@@ -529,19 +680,23 @@
 	onoutrostart={() => ((settled = false), setHole(null))}
 	onintroend={() => (settled = true)}
 	bind:this={view}
-	onpointerdown={(e) => ((pressedKeep = keeps(e.target)), (releasedKeep = false))}
-	onpointerup={(e) => (releasedKeep = keeps(e.target))}
+	use:mobileScrollGesture
+	onpointerdown={onPointerDown}
+	onpointerup={onPointerUp}
 	onclick={onBackdropClick}
 	data-np-view
-	class="absolute right-0 flex inert:bg-background {mobile
-		? 'inset-0 left-0 z-40 flex-col overflow-y-auto'
+	style={mobile
+		? `translate:0 ${swipeOffset}px;transition:${swiping ? 'none' : 'translate 180ms ease-out'}`
+		: undefined}
+	class="absolute right-0 flex motion-reduce:!transition-none inert:bg-background {mobile
+		? 'inset-0 left-0 z-40 flex-col overflow-y-auto overscroll-y-contain'
 		: `inset-y-0 left-16 z-20 overflow-hidden ${ui.sidebarCollapsed ? '' : 'lg:left-60'} ${inset}`} {video.hole
 		? ''
 		: 'bg-background'} {mobile || stage ? '' : 'justify-center px-4 py-4 sm:px-6 sm:py-6 lg:px-10'}"
 >
 	{#if mobile}
 		<section
-			class="flex shrink-0 flex-col px-5 pb-5"
+			class="flex shrink-0 touch-pan-y flex-col px-5 pb-5"
 			style="padding-top:max(env(safe-area-inset-top),0.5rem)"
 			data-np-keep
 		>
@@ -572,10 +727,18 @@
 				/>
 			</div>
 
-			<div class="mt-4">
+			<div
+				class="mobile-seek-target mt-2 flex items-center"
+				data-np-seek
+				onpointerdown={onSeekPointerDown}
+				onpointermove={onSeekPointerMove}
+				onpointerup={finishSeekPointer}
+				onpointercancel={cancelSeekPointer}
+			>
 				<input
+					bind:this={seekInput}
 					type="range"
-					class="range w-full"
+					class="range w-full {mobile ? 'pointer-events-none' : ''}"
 					style="--pct:{playback.duration ? (shownPosition / playback.duration) * 100 : 0}%"
 					min="0"
 					max={playback.duration || 0}
@@ -584,6 +747,8 @@
 					onchange={onSeekCommit}
 					aria-label={t('player.seek')}
 				/>
+			</div>
+			<div>
 				<div class="flex justify-between text-xs tabular-nums text-muted-foreground">
 					<span>{fmt(shownPosition)}</span>
 					<span>{fmt(playback.duration)}</span>
