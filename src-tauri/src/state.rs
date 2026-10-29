@@ -335,8 +335,13 @@ struct QueueState {
     /// Content Playback Nonce for the current play. context/01. (The "already pinged" latch that
     /// used to live beside it is `AppState::history_pinged`.)
     cpn: String,
-    /// Latest mpv-reported track duration (secs), for the history-ping threshold.
+    /// Effective track duration (secs), for UI, history threshold, and media integrations.
     duration: f64,
+    /// Independently established track duration. Native/container events may refine a close value,
+    /// but an implausibly different timeline must not replace it.
+    expected_duration: Option<f64>,
+    /// Expected duration for the mpv lookahead, promoted when that entry becomes current.
+    lookahead_expected_duration: Option<Option<f64>>,
     /// Last videoId we re-resolved after a playback failure — guards the one-shot retry in
     /// `on_track_failed` against a retry loop when the retried stream dies too.
     retried: Option<String>,
@@ -1223,47 +1228,56 @@ impl AppState {
         // The cost of asking for more life than a row has is one resolve.
         let now = now_secs();
         if let Some(c) = self.db.get_stream(video_id, cache_horizon(now, duration_secs)) {
-            tracing::debug!(video_id, "stream url cache hit");
-            // Cached URL carries no fresh metadata; the UI already has it from the queue item.
-            //
-            // The URL was validated under one client's User-Agent, so the replay sends the same
-            // one. An empty map (what this used to return) sent the audio proxy upstream as
-            // reqwest's default, and left mpv on the previous track's UA. `is_upload` is false by
-            // construction: upload URLs are never cached (see the write below).
-            let headers = match c.client.as_deref() {
-                Some(k) => self.orchestrator.headers_for(k, false),
-                None => Default::default(),
-            };
-            return Ok(PlaybackData {
-                video_id: video_id.to_owned(),
-                stream_url: c.url,
-                itag: c.itag,
-                headers,
-                expires_in_seconds: c.expires_at - now,
-                loudness_db: c.loudness_db,
-                // Cached alongside the URL: a hit skips `/player`, so without it a replay never
-                // registered in watch history — and neither did a first listen whose stream the
-                // gapless lookahead had already cached (issue #83). `None` on rows written before
-                // the column, and on whatever YouTube declines a stale `ei` for; the ping is
-                // best-effort either way.
-                playback_ping: c
-                    .ping_url
-                    .zip(c.ping_client)
-                    .map(|(url, client)| PlaybackPing { url, client }),
-                title: None,
-                artists: None,
-                // A cache hit skips `/player`, but the queue row may still carry authoritative
-                // metadata from search/browse or an earlier response. Keep that known duration so
-                // iOS can reject a wildly wrong AVPlayer container timeline. Zero still means
-                // unknown and must not be invented as metadata.
-                duration: cached_duration_metadata(duration_secs).or(c.duration),
-                thumbnail: None,
-                // Cached alongside the URL: a hit skips `/player`, so without it a replay inside
-                // the cache window (hours, and every track you just listened to) would fall back
-                // to the queue row's flag, which is exactly the thing that can't be trusted.
-                is_video: c.is_video,
-                stream_client: c.client.unwrap_or_else(|| "cache".to_owned()),
-            });
+            let trusted_duration =
+                trusted_cached_duration(duration_secs, c.duration.as_deref(), c.duration_trusted);
+            if trusted_duration.is_none() {
+                tracing::debug!(
+                    video_id,
+                    "durationless or weak legacy stream cache hit; refreshing metadata"
+                );
+            } else {
+                tracing::debug!(video_id, "stream url cache hit");
+                // Cached URL carries no fresh metadata; the UI already has it from the queue item.
+                //
+                // The URL was validated under one client's User-Agent, so the replay sends the same
+                // one. An empty map (what this used to return) sent the audio proxy upstream as
+                // reqwest's default, and left mpv on the previous track's UA. `is_upload` is false by
+                // construction: upload URLs are never cached (see the write below).
+                let headers = match c.client.as_deref() {
+                    Some(k) => self.orchestrator.headers_for(k, false),
+                    None => Default::default(),
+                };
+                return Ok(PlaybackData {
+                    video_id: video_id.to_owned(),
+                    stream_url: c.url,
+                    itag: c.itag,
+                    headers,
+                    expires_in_seconds: c.expires_at - now,
+                    loudness_db: c.loudness_db,
+                    // Cached alongside the URL: a hit skips `/player`, so without it a replay never
+                    // registered in watch history — and neither did a first listen whose stream the
+                    // gapless lookahead had already cached (issue #83). `None` on rows written before
+                    // the column, and on whatever YouTube declines a stale `ei` for; the ping is
+                    // best-effort either way.
+                    playback_ping: c
+                        .ping_url
+                        .zip(c.ping_client)
+                        .map(|(url, client)| PlaybackPing { url, client }),
+                    title: None,
+                    artists: None,
+                    // A cache hit skips `/player`, but the queue row may still carry authoritative
+                    // metadata from search/browse or an earlier response. Keep that known duration so
+                    // neither native player can replace it with a wildly wrong container timeline.
+                    duration: trusted_duration,
+                    duration_trusted: true,
+                    thumbnail: None,
+                    // Cached alongside the URL: a hit skips `/player`, so without it a replay inside
+                    // the cache window (hours, and every track you just listened to) would fall back
+                    // to the queue row's flag, which is exactly the thing that can't be trusted.
+                    is_video: c.is_video,
+                    stream_client: c.client.unwrap_or_else(|| "cache".to_owned()),
+                });
+            }
         }
         let data = self
             .orchestrator
@@ -1289,6 +1303,7 @@ impl AppState {
                     expires_at: now + data.expires_in_seconds.max(0),
                     loudness_db: data.loudness_db,
                     duration: data.duration.clone(),
+                    duration_trusted: data.duration_trusted,
                     is_video: data.is_video,
                     ping_url: data.playback_ping.as_ref().map(|p| p.url.clone()),
                     ping_client: data.playback_ping.as_ref().map(|p| p.client.clone()),
@@ -2033,6 +2048,7 @@ impl AppState {
             q.current_client = q.lookahead_client.take();
             // New track is now playing → fresh history state (mirrors start_current).
             q.playback_ping = q.lookahead_playback_ping.take();
+            q.expected_duration = q.lookahead_expected_duration.take().flatten();
             q.cpn = innertube::generate_cpn();
             self.history_pinged.store(false, Ordering::Relaxed);
             q.duration = 0.0;
@@ -2311,6 +2327,15 @@ impl AppState {
             .filter(|(vid, _)| *vid == item.video_id)
             .map(|(_, pos)| pos);
         let stream_url = mpv_stream_url(&data);
+        let expected_duration = data
+            .duration_trusted
+            .then(|| data.duration.as_deref().and_then(parse_positive_seconds))
+            .flatten();
+        {
+            let mut q = self.queue.lock().await;
+            q.expected_duration = expected_duration;
+            q.duration = 0.0;
+        }
         let mut header_names: Vec<&str> = data.headers.keys().map(String::as_str).collect();
         header_names.sort_unstable();
         tracing::info!(
@@ -2372,7 +2397,6 @@ impl AppState {
             q.playback_ping = data.playback_ping.clone();
             q.cpn = innertube::generate_cpn();
             self.history_pinged.store(false, Ordering::Relaxed);
-            q.duration = 0.0;
             let cur = q.current;
             if let Some(qi) = q.items.get_mut(cur) {
                 // Same repair on the queue's own copy: it's what the queue panel renders, what
@@ -2608,6 +2632,11 @@ impl AppState {
         q.lookahead_client = Some(data.stream_client.clone());
         q.lookahead_loudness_db = Some(data.loudness_db);
         q.lookahead_playback_ping = data.playback_ping.clone();
+        q.lookahead_expected_duration = Some(
+            data.duration_trusted
+                .then(|| data.duration.as_deref().and_then(parse_positive_seconds))
+                .flatten(),
+        );
         // Same backfill as start_current: a gapless advance emits this item straight from the
         // queue, so the repair has to land before it becomes the current track.
         if let Some(qi) = q.items.get_mut(next_idx) {
@@ -3097,18 +3126,33 @@ impl AppState {
         });
     }
 
-    /// Latest mpv-reported track duration (secs), feeding the history-ping threshold + OS scrubber.
-    pub async fn on_duration(&self, secs: f64) {
+    /// Accept a native/container duration unless it is implausibly different from independently
+    /// established metadata. Returns the effective value every UI/media consumer should use.
+    pub async fn on_duration(&self, secs: f64) -> Option<f64> {
         if secs.is_finite() && secs > 0.0 {
-            self.queue.lock().await.duration = secs;
+            let effective = {
+                let mut q = self.queue.lock().await;
+                let effective = innertube::authoritative_duration_secs(q.expected_duration, secs);
+                q.duration = effective;
+                effective
+            };
+            if (effective - secs).abs() > f64::EPSILON {
+                tracing::warn!(
+                    reported_duration_secs = secs,
+                    trusted_duration_secs = effective,
+                    "ignored implausible native duration"
+                );
+            }
             if let Some(m) = &self.media {
-                m.set_duration(secs);
+                m.set_duration(effective);
             }
             if let Some(d) = &self.discord {
-                d.set_duration(secs);
+                d.set_duration(effective);
             }
-            self.lastfm.set_duration(secs);
+            self.lastfm.set_duration(effective);
+            return Some(effective);
         }
+        None
     }
 
     /// Watch-history ping enabled? Default on; only an explicit `"false"` disables it.
@@ -3596,6 +3640,14 @@ impl AppState {
             if playing { position_ms + t0.elapsed().as_millis() as i64 } else { position_ms };
         let pos = target_ms as f64 / 1000.0;
         let stream_url = mpv_stream_url(&data);
+        {
+            let mut q = self.queue.lock().await;
+            q.expected_duration = data
+                .duration_trusted
+                .then(|| data.duration.as_deref().and_then(parse_positive_seconds))
+                .flatten();
+            q.duration = 0.0;
+        }
         #[cfg(target_os = "ios")]
         let load_result = self.player.load(
             &stream_url,
@@ -4663,6 +4715,24 @@ fn cached_duration_metadata(duration_secs: i64) -> Option<String> {
     (duration_secs > 0).then(|| duration_secs.to_string())
 }
 
+fn parse_positive_seconds(value: &str) -> Option<f64> {
+    value.parse::<f64>().ok().filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+}
+
+fn valid_duration_metadata(value: Option<&str>) -> Option<String> {
+    let value = value?;
+    parse_positive_seconds(value).map(|_| value.to_owned())
+}
+
+fn trusted_cached_duration(
+    row_duration_secs: i64,
+    cached_duration: Option<&str>,
+    cached_trusted: bool,
+) -> Option<String> {
+    cached_duration_metadata(row_duration_secs)
+        .or_else(|| cached_trusted.then(|| valid_duration_metadata(cached_duration)).flatten())
+}
+
 /// Parse a `"m:ss"` / `"h:mm:ss"` duration string to ms (0 if absent/unparseable).
 fn parse_duration_ms(s: Option<&str>) -> i64 {
     let Some(s) = s else { return 0 };
@@ -4889,8 +4959,8 @@ mod tests {
         loudness_gain, merge_radio, next_index, parse_duration_ms, persist_fingerprint,
         prefer_version, prepared_identity_matches, prev_track_title, put_url, queue_fingerprint,
         radio_seed_for, retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into,
-        swap_version, trim_played, unshuffled, upcoming_queued, QueueState, RepeatMode, VideoUrls,
-        KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
+        swap_version, trim_played, trusted_cached_duration, unshuffled, upcoming_queued,
+        QueueState, RepeatMode, VideoUrls, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -5414,6 +5484,14 @@ mod tests {
         assert_eq!(cached_duration_metadata(243), Some("243".to_owned()));
         assert_eq!(cached_duration_metadata(0), None);
         assert_eq!(cached_duration_metadata(-1), None);
+    }
+
+    #[test]
+    fn cache_duration_never_overrides_stronger_row_metadata() {
+        assert_eq!(trusted_cached_duration(243, Some("486"), true).as_deref(), Some("243"));
+        assert_eq!(trusted_cached_duration(0, Some("243.081"), true).as_deref(), Some("243.081"));
+        assert_eq!(trusted_cached_duration(0, Some("486"), false), None);
+        assert_eq!(trusted_cached_duration(0, Some("NaN"), true), None);
     }
 
     #[test]

@@ -34,9 +34,20 @@ ok(
 	'the mobile seek target owns pointer scrubbing instead of the parent dismiss gesture'
 );
 ok(
-	nowPlaying.includes("'inset-0 left-0 z-40 flex-col overflow-hidden'") &&
-		nowPlaying.includes('class="flex min-h-0 flex-1 flex-col border-t'),
-	'mobile Now Playing stays viewport-fixed while its tab region owns the remaining height'
+	nowPlaying.includes("'inset-0 left-0 z-40 flex-col overflow-y-auto overscroll-y-contain'") &&
+		nowPlaying.includes('class="flex min-h-[22rem] shrink-0 flex-col border-t'),
+	'mobile Now Playing owns native page scrolling while retaining a usable tab region'
+);
+ok(
+	nowPlaying.includes('atTop: node.scrollTop <= 1') &&
+		nowPlaying.includes('dy <= 0 || !swipeStart.atTop') &&
+		nowPlaying.includes("node.addEventListener('touchmove', move, { passive: false })"),
+	'upward drags stay native and downward dismissal can begin only at scroll top'
+);
+ok(
+	nowPlaying.includes('if (swipeStart.artwork) suppressArtworkToggleUntil') &&
+		nowPlaying.includes('performance.now() < suppressArtworkToggleUntil'),
+	'artwork scrolling suppresses its tap toggle while an unmoved tap still toggles playback'
 );
 ok(
 	nowPlaying.includes('seekHold?.target') &&

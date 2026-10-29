@@ -90,7 +90,7 @@
 	const keeps = (t: EventTarget | null) => !!(t as Element | null)?.closest?.('[data-np-keep]');
 	let pressedKeep = false;
 	let releasedKeep = false;
-	let swipeStart: { id: number; x: number; y: number; at: number; artwork: boolean } | null = null;
+	let swipeStart: { x: number; y: number; at: number; artwork: boolean; atTop: boolean } | null = null;
 	let swipeOffset = $state(0);
 	let swiping = $state(false);
 	let swipeVertical = false;
@@ -102,38 +102,12 @@
 	function onPointerDown(e: PointerEvent) {
 		pressedKeep = keeps(e.target);
 		releasedKeep = false;
-		if (!mobile || e.pointerType === 'mouse' || swipeBlocked(e.target)) return;
-		swipeStart = {
-			id: e.pointerId,
-			x: e.clientX,
-			y: e.clientY,
-			at: performance.now(),
-			artwork: !!(e.target as Element | null)?.closest?.('[data-np-artwork]')
-		};
-		swipeVertical = false;
-		view.setPointerCapture(e.pointerId);
 	}
-	function onPointerMove(e: PointerEvent) {
-		if (!swipeStart || e.pointerId !== swipeStart.id) return;
-		const dx = e.clientX - swipeStart.x;
-		const dy = e.clientY - swipeStart.y;
-		if (!swipeVertical && Math.hypot(dx, dy) > 8) {
-			if (Math.abs(dx) >= Math.abs(dy) || dy < 0) {
-				swipeStart = null;
-				return;
-			}
-			swipeVertical = true;
-			swiping = true;
-			if (swipeStart.artwork) suppressArtworkToggleUntil = performance.now() + 500;
-		}
-		if (swipeVertical) {
-			e.preventDefault();
-			swipeOffset = Math.max(0, dy);
-		}
-	}
-	function finishSwipe(e: PointerEvent) {
+	function onPointerUp(e: PointerEvent) {
 		releasedKeep = keeps(e.target);
-		if (!swipeStart || e.pointerId !== swipeStart.id) return;
+	}
+	function finishSwipe() {
+		if (!swipeStart) return;
 		const elapsed = Math.max(1, performance.now() - swipeStart.at);
 		const velocity = swipeOffset / elapsed;
 		const dismiss = swipeVertical && (swipeOffset >= 96 || (swipeOffset >= 44 && velocity >= 0.65));
@@ -142,6 +116,55 @@
 		swiping = false;
 		swipeOffset = 0;
 		if (dismiss) np.open = false;
+	}
+	function mobileScrollGesture(node: HTMLElement) {
+		const start = (e: TouchEvent) => {
+			if (!mobile || e.touches.length !== 1 || swipeBlocked(e.target)) return;
+			const touch = e.touches[0];
+			swipeStart = {
+				x: touch.clientX,
+				y: touch.clientY,
+				at: performance.now(),
+				artwork: !!(e.target as Element | null)?.closest?.('[data-np-artwork]'),
+				atTop: node.scrollTop <= 1
+			};
+			swipeVertical = false;
+		};
+		const move = (e: TouchEvent) => {
+			if (!swipeStart || e.touches.length !== 1) return;
+			const touch = e.touches[0];
+			const dx = touch.clientX - swipeStart.x;
+			const dy = touch.clientY - swipeStart.y;
+			if (!swipeVertical && Math.hypot(dx, dy) > 8) {
+				if (swipeStart.artwork) suppressArtworkToggleUntil = performance.now() + 500;
+				// Upward movement, horizontal movement, or a drag that began below the top belongs
+				// to WebKit's native inertial scroller. Only a downward drag that began at the top
+				// becomes the custom minimise gesture.
+				if (Math.abs(dx) >= Math.abs(dy) || dy <= 0 || !swipeStart.atTop) {
+					swipeStart = null;
+					return;
+				}
+				swipeVertical = true;
+				swiping = true;
+			}
+			if (swipeVertical) {
+				e.preventDefault();
+				swipeOffset = Math.max(0, dy);
+			}
+		};
+		const finish = () => finishSwipe();
+		node.addEventListener('touchstart', start, { passive: true });
+		node.addEventListener('touchmove', move, { passive: false });
+		node.addEventListener('touchend', finish, { passive: true });
+		node.addEventListener('touchcancel', finish, { passive: true });
+		return {
+			destroy() {
+				node.removeEventListener('touchstart', start);
+				node.removeEventListener('touchmove', move);
+				node.removeEventListener('touchend', finish);
+				node.removeEventListener('touchcancel', finish);
+			}
+		};
 	}
 	function onBackdropClick(e: MouseEvent) {
 		if (pressedKeep || releasedKeep || keeps(e.target)) return;
@@ -395,7 +418,7 @@
 
 {#snippet mobileTabs()}
 	<div
-		class="flex min-h-0 flex-1 flex-col border-t px-4 pt-3"
+		class="flex min-h-[22rem] shrink-0 flex-col border-t px-4 pt-3"
 		style="padding-bottom:max(env(safe-area-inset-bottom),1rem)"
 		data-np-keep
 		data-np-scroll
@@ -657,24 +680,23 @@
 	onoutrostart={() => ((settled = false), setHole(null))}
 	onintroend={() => (settled = true)}
 	bind:this={view}
+	use:mobileScrollGesture
 	onpointerdown={onPointerDown}
-	onpointermove={onPointerMove}
-	onpointerup={finishSwipe}
-	onpointercancel={finishSwipe}
+	onpointerup={onPointerUp}
 	onclick={onBackdropClick}
 	data-np-view
 	style={mobile
 		? `translate:0 ${swipeOffset}px;transition:${swiping ? 'none' : 'translate 180ms ease-out'}`
 		: undefined}
 	class="absolute right-0 flex motion-reduce:!transition-none inert:bg-background {mobile
-		? 'inset-0 left-0 z-40 flex-col overflow-hidden'
+		? 'inset-0 left-0 z-40 flex-col overflow-y-auto overscroll-y-contain'
 		: `inset-y-0 left-16 z-20 overflow-hidden ${ui.sidebarCollapsed ? '' : 'lg:left-60'} ${inset}`} {video.hole
 		? ''
 		: 'bg-background'} {mobile || stage ? '' : 'justify-center px-4 py-4 sm:px-6 sm:py-6 lg:px-10'}"
 >
 	{#if mobile}
 		<section
-			class="flex shrink-0 touch-none flex-col px-5 pb-5"
+			class="flex shrink-0 touch-pan-y flex-col px-5 pb-5"
 			style="padding-top:max(env(safe-area-inset-top),0.5rem)"
 			data-np-keep
 		>

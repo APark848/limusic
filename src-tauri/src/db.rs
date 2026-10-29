@@ -76,6 +76,8 @@ pub struct CachedStream {
     /// Independent expected duration selected during resolution. A cache hit skips every player
     /// response and its format consensus, so this must travel with the URL for durationless rows.
     pub duration: Option<String>,
+    /// Whether `duration` came from independent metadata rather than the selected format itself.
+    pub duration_trusted: bool,
     /// YouTube's `musicVideoType` verdict, cached for the same reason: a hit skips `/player`, and
     /// without it a replay inside the cache window can't tell the player view whether the track
     /// has a music video. `None` on rows written before the column existed.
@@ -178,7 +180,8 @@ impl Db {
                 is_video    INTEGER,
                 ping_url    TEXT,
                 ping_client TEXT,
-                duration    TEXT
+                duration    TEXT,
+                duration_trusted INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS lyrics_cache (
                 video_id   TEXT PRIMARY KEY,
@@ -281,9 +284,13 @@ impl Db {
         // means that one replay goes unregistered, which is exactly what every row did before.
         let _ = conn.execute("ALTER TABLE stream_url_cache ADD COLUMN ping_url TEXT", []);
         let _ = conn.execute("ALTER TABLE stream_url_cache ADD COLUMN ping_client TEXT", []);
-        // The expected duration derived during resolution. Old rows remain usable; a durationless
-        // cache hit simply has no guard until that URL is refreshed and rewritten.
+        // The expected duration derived during resolution. The trust bit distinguishes independent
+        // metadata from a selected format's weak fallback; old weak rows are refreshed on demand.
         let _ = conn.execute("ALTER TABLE stream_url_cache ADD COLUMN duration TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE stream_url_cache ADD COLUMN duration_trusted INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         // The resolving client, so a replay can rebuild its headers and name itself. Rows that
         // predate it have neither, which is the bug, so wipe them once like `is_video` above.
         if conn.execute("ALTER TABLE stream_url_cache ADD COLUMN client TEXT", []).is_ok() {
@@ -673,7 +680,7 @@ impl Db {
     pub fn get_stream(&self, video_id: &str, now: i64) -> Option<CachedStream> {
         let conn = self.0.lock().unwrap();
         conn.query_row(
-            "SELECT url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, duration FROM stream_url_cache WHERE video_id = ?1 AND expires_at > ?2",
+            "SELECT url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, duration, duration_trusted FROM stream_url_cache WHERE video_id = ?1 AND expires_at > ?2",
             rusqlite::params![video_id, now],
             |r| {
                 Ok(CachedStream {
@@ -686,6 +693,7 @@ impl Db {
                     ping_client: r.get(6)?,
                     client: r.get(7)?,
                     duration: r.get(8)?,
+                    duration_trusted: r.get(9)?,
                 })
             },
         )
@@ -707,8 +715,8 @@ impl Db {
     pub fn put_stream(&self, video_id: &str, row: &CachedStream, now: i64) {
         let conn = self.0.lock().unwrap();
         let _ = conn.execute(
-            "INSERT INTO stream_url_cache(video_id, url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, duration) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-             ON CONFLICT(video_id) DO UPDATE SET url = excluded.url, itag = excluded.itag, expires_at = excluded.expires_at, loudness_db = excluded.loudness_db, is_video = excluded.is_video, ping_url = excluded.ping_url, ping_client = excluded.ping_client, client = excluded.client, duration = excluded.duration",
+            "INSERT INTO stream_url_cache(video_id, url, itag, expires_at, loudness_db, is_video, ping_url, ping_client, client, duration, duration_trusted) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(video_id) DO UPDATE SET url = excluded.url, itag = excluded.itag, expires_at = excluded.expires_at, loudness_db = excluded.loudness_db, is_video = excluded.is_video, ping_url = excluded.ping_url, ping_client = excluded.ping_client, client = excluded.client, duration = excluded.duration, duration_trusted = excluded.duration_trusted",
             rusqlite::params![
                 video_id,
                 row.url,
@@ -719,7 +727,8 @@ impl Db {
                 row.ping_url,
                 row.ping_client,
                 row.client,
-                row.duration
+                row.duration,
+                row.duration_trusted
             ],
         );
         let _ = conn.execute("DELETE FROM stream_url_cache WHERE expires_at <= ?1", [now]);
@@ -1473,6 +1482,7 @@ mod tests {
             expires_at,
             loudness_db: None,
             duration: None,
+            duration_trusted: false,
             is_video: None,
             ping_url: None,
             ping_client: None,
@@ -1560,10 +1570,15 @@ mod tests {
         let d = db();
         d.put_stream(
             "v",
-            &CachedStream { duration: Some("243.081".into()), ..row("https://x/1", 9_000) },
+            &CachedStream {
+                duration: Some("243.081".into()),
+                duration_trusted: true,
+                ..row("https://x/1", 9_000)
+            },
             900,
         );
         assert_eq!(d.get_stream("v", 900).unwrap().duration.as_deref(), Some("243.081"));
+        assert!(d.get_stream("v", 900).unwrap().duration_trusted);
     }
 
     #[test]
@@ -2095,6 +2110,7 @@ mod tests {
             ping_client: Some("WEB_REMIX".into()),
             client: Some("VISIONOS".into()),
             duration: Some("243.081".into()),
+            duration_trusted: true,
         };
         d.put_stream("fresh", &fresh, now);
         let got = d.get_stream("fresh", now).unwrap_or_else(|| {
@@ -2107,6 +2123,7 @@ mod tests {
         );
         assert_eq!(got.ping_client.as_deref(), Some("WEB_REMIX"), "{tag}");
         assert_eq!(got.duration.as_deref(), Some("243.081"), "{tag}");
+        assert!(got.duration_trusted, "{tag}");
         // Every one of these releases predates `client`, so the pre-column row has to be gone:
         // its headers cannot be rebuilt. Checked after the round trip above, which is what
         // proves `None` here means "deleted" and not "the query failed".

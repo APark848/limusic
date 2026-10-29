@@ -283,7 +283,7 @@ fn find_ios_format_where(
     }
 }
 
-/// Independent expected duration for iOS format selection and AVPlayer's timeline guard.
+/// Independent expected duration shared by playback metadata and iOS format selection.
 /// Existing queue metadata outranks `/player`; a strict majority of the response's original-audio
 /// timelines is the fallback when neither is present. One format is not a consensus: the selected
 /// format may still supply the final fallback after selection, but it must not validate itself.
@@ -297,6 +297,20 @@ pub fn expected_audio_duration_ms(
         .and_then(|value| value.checked_mul(1000))
         .or_else(|| parse_seconds_ms(video_details_seconds?))
         .or_else(|| audio_duration_consensus_ms(data))
+}
+
+/// Prefer an independently established duration when a native player reports a wildly different
+/// container timeline. Close values still use the player's more precise answer.
+pub fn authoritative_duration_secs(expected: Option<f64>, reported: f64) -> f64 {
+    let Some(expected) = expected.filter(|value| value.is_finite() && *value > 0.0) else {
+        return reported;
+    };
+    let tolerance = 10.0f64.max(expected / 10.0);
+    if (reported - expected).abs() <= tolerance {
+        reported
+    } else {
+        expected
+    }
 }
 
 fn parse_seconds_ms(value: &str) -> Option<u64> {
@@ -533,7 +547,7 @@ mod tests {
     }
 
     #[test]
-    fn ios_duration_authority_prefers_queue_then_video_details() {
+    fn shared_duration_authority_prefers_queue_then_video_details() {
         let sd: StreamingData = serde_json::from_value(serde_json::json!({
             "adaptiveFormats": [
                 { "itag": 140, "mimeType": "audio/mp4", "approxDurationMs": "486000" },
@@ -546,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn ios_duration_consensus_rejects_a_doubled_aac_outlier() {
+    fn shared_duration_consensus_rejects_a_doubled_aac_outlier() {
         let sd: StreamingData = serde_json::from_value(serde_json::json!({
             "adaptiveFormats": [
                 { "itag": 139, "mimeType": "audio/mp4", "bitrate": 48000, "approxDurationMs": "243000" },
@@ -566,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn ios_duration_consensus_is_conservative_with_sparse_or_ambiguous_evidence() {
+    fn shared_duration_consensus_is_conservative_with_sparse_or_ambiguous_evidence() {
         let one: StreamingData = serde_json::from_value(serde_json::json!({
             "adaptiveFormats": [
                 { "itag": 140, "mimeType": "audio/mp4", "approxDurationMs": "243000" },
@@ -592,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn ios_duration_consensus_does_not_cap_legitimate_long_tracks() {
+    fn shared_duration_consensus_does_not_cap_legitimate_long_tracks() {
         let sd: StreamingData = serde_json::from_value(serde_json::json!({
             "adaptiveFormats": [
                 { "itag": 140, "mimeType": "audio/mp4", "approxDurationMs": "1080000" },
@@ -602,6 +616,18 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(expected_audio_duration_ms(&sd, None, None), Some(1_080_000));
+    }
+
+    #[test]
+    fn shared_duration_authority_rejects_wild_native_timelines_only() {
+        assert_eq!(authoritative_duration_secs(Some(243.0), 486.0), 243.0);
+        assert_eq!(authoritative_duration_secs(Some(243.0), 244.5), 244.5);
+        assert_eq!(authoritative_duration_secs(None, 1_080.0), 1_080.0);
+        assert_eq!(
+            authoritative_duration_secs(Some(1_080.0), 1_085.0),
+            1_085.0,
+            "legitimate long tracks keep a close native duration"
+        );
     }
 
     /// A dubbed video lists each language at the same qualities; the higher-bitrate dub must not

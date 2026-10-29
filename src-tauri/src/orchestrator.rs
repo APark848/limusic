@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 #[cfg(not(target_os = "ios"))]
 use innertube::find_format;
 #[cfg(target_os = "ios")]
-use innertube::{expected_audio_duration_ms, find_ios_format};
+use innertube::find_ios_format;
 use innertube::{
-    find_video_format, rustypipe_fallback, AudioQuality, Clients, Format, InnerTube,
-    PlayerResponse, StreamingData, YouTubeClient, MAIN_CLIENT, STREAM_FALLBACK_ORDER,
-    UPLOAD_FALLBACK_ORDER,
+    expected_audio_duration_ms, find_video_format, rustypipe_fallback, AudioQuality, Clients,
+    Format, InnerTube, PlayerResponse, StreamingData, YouTubeClient, MAIN_CLIENT,
+    STREAM_FALLBACK_ORDER, UPLOAD_FALLBACK_ORDER,
 };
 use tokio::sync::Mutex;
 
@@ -43,6 +43,10 @@ pub struct PlaybackData {
     pub title: Option<String>,
     pub artists: Option<String>,
     pub duration: Option<String>,
+    /// True when `duration` came from row metadata, `videoDetails`, or a strict format majority.
+    /// A selected format's own timeline is useful as a fallback but cannot validate itself.
+    #[serde(skip)]
+    pub duration_trusted: bool,
     pub thumbnail: Option<String>,
     /// YouTube's own `musicVideoType` for this videoId: `Some(true)` = a video upload, `Some(false)`
     /// = the generated audio track, `None` = the metadata client never answered. The player view's
@@ -219,8 +223,6 @@ impl Orchestrator {
         disabled: &HashSet<String>,
         known_duration_secs: Option<u64>,
     ) -> Result<PlaybackData, ResolveError> {
-        #[cfg(not(target_os = "ios"))]
-        let _ = known_duration_secs;
         tracing::info!(
             video_id,
             upload = is_upload,
@@ -396,7 +398,6 @@ impl Orchestrator {
 
             let Some(streaming) = resp.streaming_data.as_ref() else { continue };
             let Some(expires) = streaming.expires_in_seconds else { continue };
-            #[cfg(target_os = "ios")]
             let expected_duration_ms = expected_audio_duration_ms(
                 streaming,
                 known_duration_secs,
@@ -410,8 +411,6 @@ impl Orchestrator {
                             .and_then(|details| details.length_seconds.as_deref())
                     }),
             );
-            #[cfg(not(target_os = "ios"))]
-            let expected_duration_ms = None;
             #[cfg(target_os = "ios")]
             let format = find_ios_format(streaming, quality, expected_duration_ms);
             #[cfg(not(target_os = "ios"))]
@@ -597,6 +596,7 @@ impl Orchestrator {
                 title: c.title,
                 artists: None,
                 duration: c.duration_secs.map(|s| s.to_string()),
+                duration_trusted: false,
                 thumbnail: None,
                 // rustypipe answers without a `musicVideoType`, so the queue row's flag stands.
                 is_video: None,
@@ -876,6 +876,7 @@ impl Orchestrator {
             title: vd.and_then(|v| v.title.clone()),
             artists: vd.and_then(|v| v.author.clone()),
             duration,
+            duration_trusted: expected_duration_ms.is_some(),
             thumbnail: main_resp.as_ref().and_then(best_thumbnail),
             is_video: vd.and_then(|v| v.is_music_video()),
             stream_client: client.to_owned(),
@@ -886,8 +887,8 @@ impl Orchestrator {
 /// The player response is the preferred track-level duration. Some successful fallback clients do
 /// not repeat `videoDetails`, though, while the selected audio format still carries an exact
 /// millisecond timeline. Typeahead song rows have no duration of their own, so retaining this
-/// format-level value is what lets iOS reject an implausible AVPlayer container timeline without
-/// replacing the row with a title-matched search result.
+/// format-level value is what lets either native player reject an implausible container timeline
+/// without replacing the row with a title-matched search result.
 fn resolved_duration(
     expected_duration_ms: Option<u64>,
     video_details_seconds: Option<&str>,
