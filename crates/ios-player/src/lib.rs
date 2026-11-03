@@ -78,4 +78,15 @@ mod tests {
         assert!(swift.contains("self.reachAuthoritativeEnd(item)"));
         assert!(swift.contains("authoritative-duration-loop-restart"));
     }
+
+    #[test]
+    fn swift_bridge_prepares_only_one_successor_and_preserves_pause_intent() {
+        let swift = include_str!("../ios/Sources/LimusicPlayerPlugin.swift");
+        assert!(swift.contains("private var preparedAsset: AVURLAsset?"));
+        assert!(swift.contains("asset === preparedAsset"));
+        assert!(swift.contains("prepared-asset-consumed"));
+        assert!(swift.contains("self.clearPreparedAsset()"));
+        assert!(swift.contains("time-control-paused-with-playback-intent"));
+        assert!(swift.contains("first-playback-progress"));
+    }
 }

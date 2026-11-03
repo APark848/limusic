@@ -149,6 +149,15 @@ impl Player {
         Err(Error::Unsupported("gapless lookahead enqueue"))
     }
 
+    pub(crate) fn prepare(
+        &self,
+        url: &str,
+        headers: &HashMap<String, String>,
+        expected_duration: Option<f64>,
+    ) -> Result<(), Error> {
+        self.native.prepare(url, headers, expected_duration)
+    }
+
     pub(crate) fn load(
         &self,
         url: &str,

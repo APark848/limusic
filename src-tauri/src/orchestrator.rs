@@ -223,6 +223,7 @@ impl Orchestrator {
         disabled: &HashSet<String>,
         known_duration_secs: Option<u64>,
     ) -> Result<PlaybackData, ResolveError> {
+        let resolution_started = Instant::now();
         tracing::info!(
             video_id,
             upload = is_upload,
@@ -241,10 +242,11 @@ impl Orchestrator {
         // 32 seconds (Metrolist PR #3857). Harmless for ordinary tracks, so scoped to uploads.
         let playlist_id = is_upload.then_some("MLPT");
 
-        // 1. Signature timestamp from the deciphering player.js (context/05).
-        let sts = self.cipher.signature_timestamp().await;
-
-        // 2. Session PoToken for the main web client's /player body (context/04). Cached in Rust
+        // 1/2. Signature timestamp and the session PoToken are independent prerequisites. On a
+        // warm session both are cache reads; on a cold iOS session serialising their web work adds
+        // avoidable startup latency before the first /player request can even begin. Desktop keeps
+        // its established order below; this latency pass is deliberately scoped to the device path.
+        // Session PoToken for the main web client's /player body (context/04). Cached in Rust
         // with its TTL, so this is usually free; may be None (timeout / broken webview) —
         // degrade gracefully.
         let main_client = self.clients.get(MAIN_CLIENT);
@@ -258,19 +260,59 @@ impl Orchestrator {
             .chain(order.iter().copied())
             .filter(|k| !disabled.contains(*k))
             .any(|k| self.clients.get(k).is_some_and(|c| c.use_web_po_tokens));
-        let session_pot_owned = match &visitor {
-            Some(vd) if wants_pot => self.potoken.get_session_po_token(vd).await,
-            _ => None,
+        let prerequisites_started = Instant::now();
+        #[cfg(target_os = "ios")]
+        let (sts, session_pot_owned) = tokio::join!(self.cipher.signature_timestamp(), async {
+            match &visitor {
+                Some(vd) if wants_pot => self.potoken.get_session_po_token(vd).await,
+                _ => None,
+            }
+        });
+        #[cfg(not(target_os = "ios"))]
+        let (sts, session_pot_owned) = {
+            let sts = self.cipher.signature_timestamp().await;
+            let pot = match &visitor {
+                Some(vd) if wants_pot => self.potoken.get_session_po_token(vd).await,
+                _ => None,
+            };
+            (sts, pot)
         };
+        tracing::info!(
+            video_id,
+            elapsed_ms = prerequisites_started.elapsed().as_millis() as u64,
+            has_signature_timestamp = sts.is_some(),
+            has_session_pot = session_pot_owned.is_some(),
+            "stream prerequisites completed"
+        );
         let session_pot = session_pot_owned.as_deref();
 
         // 3. Main request as WEB_REMIX (metadata source even when a fallback wins the stream).
+        let main_started = Instant::now();
         let mut main_resp = match main_client {
             Some(c) if !disabled.contains(MAIN_CLIENT) => {
-                self.it.player(c, video_id, playlist_id, sts, session_pot).await.ok()
+                match self.it.player(c, video_id, playlist_id, sts, session_pot).await {
+                    Ok(response) => Some(response),
+                    Err(error) => {
+                        tracing::warn!(
+                            video_id,
+                            client = MAIN_CLIENT,
+                            elapsed_ms = main_started.elapsed().as_millis() as u64,
+                            %error,
+                            "stream client attempt failed"
+                        );
+                        None
+                    }
+                }
             }
             _ => None,
         };
+        tracing::info!(
+            video_id,
+            client = MAIN_CLIENT,
+            elapsed_ms = main_started.elapsed().as_millis() as u64,
+            answered = main_resp.is_some(),
+            "stream client attempt completed"
+        );
 
         // Which client `main_resp` actually came from — WEB_CREATOR can replace it just below, and
         // a tracking URL has to be pinged as the client that was issued it.
@@ -286,9 +328,26 @@ impl Orchestrator {
                 let cc_pot = if cc.use_web_po_tokens { session_pot } else { None };
                 let cc_sts = if cc.use_signature_timestamp { sts } else { None };
                 tracing::info!(video_id, "WEB_REMIX age/login-gated → retrying WEB_CREATOR");
-                if let Ok(r) = self.it.player(cc, video_id, playlist_id, cc_sts, cc_pot).await {
-                    main_resp = Some(r);
-                    main_key = "WEB_CREATOR";
+                let creator_started = Instant::now();
+                match self.it.player(cc, video_id, playlist_id, cc_sts, cc_pot).await {
+                    Ok(r) => {
+                        tracing::info!(
+                            video_id,
+                            client = "WEB_CREATOR",
+                            elapsed_ms = creator_started.elapsed().as_millis() as u64,
+                            answered = true,
+                            "stream client attempt completed"
+                        );
+                        main_resp = Some(r);
+                        main_key = "WEB_CREATOR";
+                    }
+                    Err(error) => tracing::warn!(
+                        video_id,
+                        client = "WEB_CREATOR",
+                        elapsed_ms = creator_started.elapsed().as_millis() as u64,
+                        %error,
+                        "stream client attempt failed"
+                    ),
                 }
             }
         }
@@ -373,8 +432,16 @@ impl Orchestrator {
                     continue;
                 }
                 let client_sts = if client.use_signature_timestamp { sts } else { None };
+                let client_started = Instant::now();
                 let answered =
                     self.it.player(client, video_id, playlist_id, client_sts, client_pot).await;
+                tracing::info!(
+                    video_id,
+                    client = key,
+                    elapsed_ms = client_started.elapsed().as_millis() as u64,
+                    answered = answered.is_ok(),
+                    "stream client attempt completed"
+                );
                 reached |= answered.is_ok();
                 match answered {
                     Ok(r) if r.playability_status.is_ok() => (key.to_owned(), r),
@@ -482,8 +549,25 @@ impl Orchestrator {
             // is not a prediction of anything. Issue #71.
             let headers =
                 stream_headers(client.map(|c| c.user_agent.clone()), self.it.cookie(), is_upload);
-            if self.validate_stream(&url, &headers, content_length(format)).await {
+            let validation_started = Instant::now();
+            let validated = self.validate_stream(&url, &headers, content_length(format)).await;
+            tracing::info!(
+                video_id,
+                client = %key,
+                itag = format.itag,
+                elapsed_ms = validation_started.elapsed().as_millis() as u64,
+                validated,
+                "stream validation completed"
+            );
+            if validated {
                 let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
+                tracing::info!(
+                    video_id,
+                    client = %key,
+                    itag = format.itag,
+                    elapsed_ms = resolution_started.elapsed().as_millis() as u64,
+                    "stream resolution selected"
+                );
                 return Ok(self.build(
                     video_id,
                     format,

@@ -316,6 +316,14 @@ struct QueueState {
     /// current one plays removes the network waterfall from the track boundary. This remains a
     /// single, validated cache entry; `items`/`current` are still the only queue authority.
     prepared_next: Option<PreparedTrack>,
+    /// Identity currently being resolved for iOS lookahead. It prevents the radio hydrator,
+    /// playlist filler, and track-start trigger from resolving the same successor concurrently.
+    preparing_next: Option<PreparedIdentity>,
+    /// Consecutive resolve failures for `preparing_next`'s identity. Preparation gets one delayed
+    /// retry; a later queue mutation resets the counter for the new successor.
+    preparation_failures: u8,
+    /// Identity the failure counter belongs to; unlike `preparing_next`, retained between attempts.
+    preparation_identity: Option<PreparedIdentity>,
     /// Which client served the currently-loaded track (for the WEB_REMIX-403 feedback). context/06.
     current_client: Option<String>,
     /// The client that served the primed lookahead track — promoted to `current_client` on a
@@ -363,6 +371,23 @@ struct PreparedTrack {
     data: PlaybackData,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparedIdentity {
+    epoch: u64,
+    index: usize,
+    video_id: String,
+}
+
+#[cfg(any(target_os = "ios", test))]
+const IOS_PREPARATION_ATTEMPTS: u8 = 2;
+#[cfg(target_os = "ios")]
+const IOS_PREPARATION_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[cfg(any(target_os = "ios", test))]
+fn next_preparation_attempt(failures: u8) -> Option<u8> {
+    (failures < IOS_PREPARATION_ATTEMPTS).then_some(failures + 1)
+}
+
 fn prepared_identity_matches(
     prepared_epoch: u64,
     prepared_index: usize,
@@ -372,6 +397,53 @@ fn prepared_identity_matches(
     video_id: &str,
 ) -> bool {
     prepared_epoch == epoch && prepared_index == index && prepared_video_id == video_id
+}
+
+fn prepared_next_is_current(q: &QueueState) -> bool {
+    let Some(prepared) = q.prepared_next.as_ref() else { return false };
+    let Some(index) = next_index(q.items.len(), q.current, q.repeat) else { return false };
+    q.items.get(index).is_some_and(|item| {
+        prepared_identity_matches(
+            prepared.epoch,
+            prepared.index,
+            &prepared.video_id,
+            q.epoch,
+            index,
+            &item.video_id,
+        )
+    })
+}
+
+fn preparation_identity_is_current(q: &QueueState, identity: &PreparedIdentity) -> bool {
+    let Some(index) = next_index(q.items.len(), q.current, q.repeat) else { return false };
+    q.items.get(index).is_some_and(|item| {
+        prepared_identity_matches(
+            identity.epoch,
+            identity.index,
+            &identity.video_id,
+            q.epoch,
+            index,
+            &item.video_id,
+        )
+    })
+}
+
+/// Drop only stale iOS preparation state. A valid immediate successor survives mutations deeper
+/// in the queue, while a changed next row gets a fresh bounded preparation attempt.
+fn clear_stale_preparation(q: &mut QueueState) -> bool {
+    let has_state =
+        q.prepared_next.is_some() || q.preparing_next.is_some() || q.preparation_identity.is_some();
+    let current = prepared_next_is_current(q)
+        || q.preparing_next.as_ref().is_some_and(|id| preparation_identity_is_current(q, id))
+        || q.preparation_identity.as_ref().is_some_and(|id| preparation_identity_is_current(q, id));
+    if !has_state || current {
+        return false;
+    }
+    q.prepared_next = None;
+    q.preparing_next = None;
+    q.preparation_failures = 0;
+    q.preparation_identity = None;
+    true
 }
 
 /// What was playing before a click replaced the whole queue, so Previous can go back to it.
@@ -1227,7 +1299,15 @@ impl AppState {
         // which is why seeking in long videos died while short ones were fine. Issue #188.
         // The cost of asking for more life than a row has is one resolve.
         let now = now_secs();
-        if let Some(c) = self.db.get_stream(video_id, cache_horizon(now, duration_secs)) {
+        let cache_started = Instant::now();
+        let cached = self.db.get_stream(video_id, cache_horizon(now, duration_secs));
+        tracing::info!(
+            video_id,
+            hit = cached.is_some(),
+            elapsed_ms = cache_started.elapsed().as_millis() as u64,
+            "stream cache lookup completed"
+        );
+        if let Some(c) = cached {
             let trusted_duration =
                 trusted_cached_duration(duration_secs, c.duration.as_deref(), c.duration_trusted);
             if trusted_duration.is_none() {
@@ -1326,6 +1406,7 @@ impl AppState {
         }
         let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let video_id = seed.video_id.clone();
+        tracing::info!(video_id = %video_id, generation = gen, "user selection installed as current queue");
         let sticky = self.sticky_shuffle();
 
         // A local file isn't a videoId YouTube has ever heard of: it has no radio, and asking for
@@ -1351,6 +1432,9 @@ impl AppState {
             q.current = 0;
             q.lookahead_loaded = None;
             q.prepared_next = None;
+            q.preparing_next = None;
+            q.preparation_failures = 0;
+            q.preparation_identity = None;
             q.radio_seed = None; // single-song queue → autoplay re-seeds from the last track
             q.source_id = None;
             q.radio = false;
@@ -1943,12 +2027,12 @@ impl AppState {
                 return;
             }
             // mpv holds the old version as the gapless next.
-            let stale = primed.is_some() && primed != primed_id(q);
-            if stale {
+            let stale_desktop = primed.is_some() && primed != primed_id(q);
+            if stale_desktop {
                 q.lookahead_loaded = None;
                 let _ = self.player.clear_playlist();
             }
-            stale
+            stale_desktop || clear_stale_preparation(q)
         };
         self.emit_queue().await;
         self.persist_queue().await;
@@ -1967,17 +2051,36 @@ impl AppState {
         if self.lt.is_guest().await {
             return; // the host drives track changes for guests; don't auto-advance locally
         }
-        let (has_next, primed) = {
+        let transition_started = Instant::now();
+        let (has_next, primed, prepared) = {
             let mut q = self.queue.lock().await;
             match next_index(q.items.len(), q.current, q.repeat) {
                 Some(next) => {
                     let primed = q.lookahead_loaded == Some(next);
+                    let prepared = q.items.get(next).is_some_and(|item| {
+                        q.prepared_next.as_ref().is_some_and(|prepared| {
+                            prepared_identity_matches(
+                                prepared.epoch,
+                                prepared.index,
+                                &prepared.video_id,
+                                q.epoch,
+                                next,
+                                &item.video_id,
+                            )
+                        })
+                    });
                     q.seek_to(next);
-                    (true, primed)
+                    (true, primed, prepared)
                 }
-                None => (false, false),
+                None => (false, false, false),
             }
         };
+        tracing::info!(
+            has_next,
+            desktop_primed = primed,
+            ios_prepared = prepared,
+            "track ended; queue transition started"
+        );
         if !has_next {
             // Try autoplay before declaring the queue dead (the early trigger usually already
             // extended it; this is the fallback when that didn't land in time). Off the pump:
@@ -2026,7 +2129,20 @@ impl AppState {
             // advance into.
             self.queue.lock().await.lookahead_loaded = None;
             if self.start_current(gen).await {
+                tracing::info!(
+                    generation = gen,
+                    elapsed_ms = transition_started.elapsed().as_millis() as u64,
+                    prepared,
+                    "next-track load/play commands completed after EOF"
+                );
                 self.prime_lookahead_after_player_event(gen).await;
+            } else {
+                tracing::warn!(
+                    generation = gen,
+                    elapsed_ms = transition_started.elapsed().as_millis() as u64,
+                    prepared,
+                    "next-track startup failed after EOF; queue retained"
+                );
             }
             return;
         }
@@ -2526,10 +2642,13 @@ impl AppState {
         if self.lt.is_guest().await {
             return;
         }
-        let (epoch, index, video_id, is_upload, duration_secs) = {
-            let q = self.queue.lock().await;
+        let (identity, is_upload, duration_secs, attempt) = {
+            let mut q = self.queue.lock().await;
             let Some(index) = next_index(q.items.len(), q.current, q.repeat) else { return };
             let Some(item) = q.items.get(index) else { return };
+            let video_id = item.video_id.clone();
+            let is_upload = item.is_upload;
+            let duration_secs = parse_duration_ms(item.duration.as_deref()) / 1000;
             if q.prepared_next.as_ref().is_some_and(|prepared| {
                 prepared_identity_matches(
                     prepared.epoch,
@@ -2537,53 +2656,126 @@ impl AppState {
                     &prepared.video_id,
                     q.epoch,
                     index,
-                    &item.video_id,
+                    &video_id,
                 )
             }) {
                 return;
             }
-            (
-                q.epoch,
-                index,
-                item.video_id.clone(),
-                item.is_upload,
-                parse_duration_ms(item.duration.as_deref()) / 1000,
-            )
+            let identity = PreparedIdentity { epoch: q.epoch, index, video_id };
+            if q.preparing_next.as_ref() == Some(&identity) {
+                tracing::debug!(video_id = %identity.video_id, index, "iOS next-track preparation already in flight");
+                return;
+            }
+            if q.preparation_identity.as_ref() != Some(&identity) {
+                q.preparation_failures = 0;
+                q.preparation_identity = Some(identity.clone());
+                q.prepared_next = None;
+            }
+            let Some(attempt) = next_preparation_attempt(q.preparation_failures) else {
+                tracing::warn!(video_id = %identity.video_id, index, "iOS next-track preparation attempts exhausted");
+                return;
+            };
+            q.preparing_next = Some(identity.clone());
+            (identity, is_upload, duration_secs, attempt)
         };
         let started = Instant::now();
-        let data = match self.resolve(&video_id, is_upload, duration_secs).await {
+        tracing::info!(
+            video_id = %identity.video_id,
+            index = identity.index,
+            attempt,
+            generation = gen,
+            "iOS next-track preparation started"
+        );
+        let data = match self.resolve(&identity.video_id, is_upload, duration_secs).await {
             Ok(data) => data,
             Err(error) => {
+                let retry = {
+                    let mut q = self.queue.lock().await;
+                    if q.preparing_next.as_ref() == Some(&identity) {
+                        q.preparing_next = None;
+                    }
+                    let still_next = q.epoch == identity.epoch
+                        && next_index(q.items.len(), q.current, q.repeat) == Some(identity.index)
+                        && q.items.get(identity.index).map(|item| item.video_id.as_str())
+                            == Some(identity.video_id.as_str());
+                    if still_next {
+                        q.preparation_failures = attempt;
+                    }
+                    still_next
+                        && attempt < IOS_PREPARATION_ATTEMPTS
+                        && self.generation.load(Ordering::SeqCst) == gen
+                };
                 tracing::warn!(
-                    video_id = %video_id,
+                    video_id = %identity.video_id,
+                    index = identity.index,
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
                     category = "ios-lookahead-resolve",
                     %error,
                     "iOS next-track preparation failed"
                 );
+                if retry {
+                    let me = self.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(IOS_PREPARATION_RETRY_DELAY).await;
+                        if me.generation.load(Ordering::SeqCst) == gen {
+                            Box::pin(me.prepare_ios_lookahead(gen)).await;
+                        }
+                    });
+                }
                 return;
             }
         };
         if self.generation.load(Ordering::SeqCst) != gen {
+            let mut q = self.queue.lock().await;
+            if q.preparing_next.as_ref() == Some(&identity) {
+                q.preparing_next = None;
+            }
+            tracing::debug!(video_id = %identity.video_id, attempt, "iOS next-track preparation superseded");
             return;
         }
         let mut q = self.queue.lock().await;
-        if q.epoch != epoch
-            || q.items.get(index).map(|item| item.video_id.as_str()) != Some(video_id.as_str())
-            || next_index(q.items.len(), q.current, q.repeat) != Some(index)
+        if q.preparing_next.as_ref() == Some(&identity) {
+            q.preparing_next = None;
+        }
+        if q.epoch != identity.epoch
+            || q.items.get(identity.index).map(|item| item.video_id.as_str())
+                != Some(identity.video_id.as_str())
+            || next_index(q.items.len(), q.current, q.repeat) != Some(identity.index)
         {
-            tracing::debug!(index, "queue changed during iOS next-track preparation — dropped");
+            tracing::debug!(
+                video_id = %identity.video_id,
+                index = identity.index,
+                attempt,
+                "queue changed during iOS next-track preparation — dropped"
+            );
             return;
         }
+        let stream_url = mpv_stream_url(&data);
+        let expected_duration =
+            data.duration.as_deref().and_then(|value| value.parse::<f64>().ok());
+        if let Err(error) = self.player.prepare(&stream_url, &data.headers, expected_duration) {
+            tracing::warn!(
+                video_id = %identity.video_id,
+                index = identity.index,
+                attempt,
+                %error,
+                "native iOS next-track asset preparation failed; keeping resolved fallback"
+            );
+        }
+        q.preparation_failures = 0;
+        q.preparation_identity = Some(identity.clone());
         q.prepared_next = Some(PreparedTrack {
-            epoch,
-            index,
-            video_id: video_id.clone(),
+            epoch: identity.epoch,
+            index: identity.index,
+            video_id: identity.video_id.clone(),
             resolved_at: Instant::now(),
             data,
         });
         tracing::info!(
-            video_id = %video_id,
-            index,
+            video_id = %identity.video_id,
+            index = identity.index,
+            attempt,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "iOS next track prepared"
         );
@@ -4102,7 +4294,7 @@ impl AppState {
             if index < q.current {
                 q.current -= 1;
             }
-            match q.lookahead_loaded {
+            let stale_desktop = match q.lookahead_loaded {
                 // mpv holds the removed song as the gapless next — drop it. (Compared against the
                 // recorded index, not `current + 1`, so a primed repeat-all wrap target is caught.)
                 Some(i) if i == index => {
@@ -4116,7 +4308,8 @@ impl AppState {
                     false
                 }
                 _ => false,
-            }
+            };
+            stale_desktop || clear_stale_preparation(&mut q)
         };
         self.emit_queue().await;
         self.persist_queue().await;
@@ -4213,7 +4406,7 @@ impl AppState {
                 q.lookahead_loaded = None;
                 let _ = self.player.clear_playlist();
             }
-            stale
+            stale || clear_stale_preparation(&mut q)
         };
         self.emit_queue().await;
         self.persist_queue().await;
@@ -4954,12 +5147,13 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_page, backfill_metadata, cache_horizon, cached_duration_metadata, drop_duplicates,
-        enqueue_at, format_duration, get_url, guest_insert_index, history_threshold, is_mix,
-        loudness_gain, merge_radio, next_index, parse_duration_ms, persist_fingerprint,
-        prefer_version, prepared_identity_matches, prev_track_title, put_url, queue_fingerprint,
-        radio_seed_for, retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into,
-        swap_version, trim_played, trusted_cached_duration, unshuffled, upcoming_queued,
+        append_page, backfill_metadata, cache_horizon, cached_duration_metadata,
+        clear_stale_preparation, drop_duplicates, enqueue_at, format_duration, get_url,
+        guest_insert_index, history_threshold, is_mix, loudness_gain, merge_radio, next_index,
+        next_preparation_attempt, parse_duration_ms, persist_fingerprint, prefer_version,
+        prepared_identity_matches, prev_track_title, put_url, queue_fingerprint, radio_seed_for,
+        retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
+        trim_played, trusted_cached_duration, unshuffled, upcoming_queued, PreparedIdentity,
         QueueState, RepeatMode, VideoUrls, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
@@ -5500,6 +5694,42 @@ mod tests {
         assert!(!prepared_identity_matches(6, 2, "next", 7, 2, "next"));
         assert!(!prepared_identity_matches(7, 1, "next", 7, 2, "next"));
         assert!(!prepared_identity_matches(7, 2, "old", 7, 2, "next"));
+    }
+
+    #[test]
+    fn ios_preparation_retry_is_bounded_and_resets_for_a_new_identity() {
+        assert_eq!(next_preparation_attempt(0), Some(1));
+        assert_eq!(next_preparation_attempt(1), Some(2));
+        assert_eq!(next_preparation_attempt(2), None);
+        assert_eq!(next_preparation_attempt(20), None);
+
+        let old = PreparedIdentity { epoch: 7, index: 2, video_id: "old".into() };
+        let new = PreparedIdentity { epoch: 7, index: 2, video_id: "new".into() };
+        assert_ne!(old, new, "a queue mutation must reset the successor's retry budget");
+    }
+
+    #[test]
+    fn ios_preparation_survives_deep_edits_but_invalidates_when_next_changes() {
+        let mut q = QueueState {
+            items: vec![song("now", None), song("next", None), song("later", None)],
+            current: 0,
+            epoch: 7,
+            preparing_next: Some(PreparedIdentity { epoch: 7, index: 1, video_id: "next".into() }),
+            preparation_identity: Some(PreparedIdentity {
+                epoch: 7,
+                index: 1,
+                video_id: "next".into(),
+            }),
+            preparation_failures: 1,
+            ..Default::default()
+        };
+        assert!(!clear_stale_preparation(&mut q), "a deep queue edit keeps the same successor");
+
+        q.items.swap(1, 2);
+        assert!(clear_stale_preparation(&mut q), "changing the successor must re-prime it");
+        assert!(q.preparing_next.is_none());
+        assert!(q.preparation_identity.is_none());
+        assert_eq!(q.preparation_failures, 0);
     }
 
     #[test]
