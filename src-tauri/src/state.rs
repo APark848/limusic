@@ -5856,7 +5856,7 @@ mod tests {
 
     #[test]
     fn ios_preparation_rejects_queue_changes_before_retry_or_install() {
-        for change in ["remove", "reorder", "epoch", "eof", "generation", "repeat-one"] {
+        for change in ["remove", "reorder", "epoch", "eof", "generation"] {
             let mut q = QueueState {
                 items: vec![song("now", None), song("next", None), song("later", None)],
                 ..Default::default()
@@ -5874,7 +5874,6 @@ mod tests {
                 "epoch" => q.epoch += 1,
                 "eof" => q.seek_to(1),
                 "generation" => generation += 1,
-                "repeat-one" => q.repeat = RepeatMode::One,
                 _ => unreachable!(),
             }
             assert!(!preparation_can_continue(&q, &owner, generation), "{change}");
@@ -5926,6 +5925,15 @@ mod tests {
         assert!(!preparation_can_continue(&q, &owner, 1));
         q.repeat = RepeatMode::One;
         assert!(!preparation_can_continue(&q, &owner, 1));
+
+        // With a following row, existing queue semantics keep that successor warm even while
+        // the native player loops the current item. Toggling repeat must not change its identity.
+        q.items.push(song("next", None));
+        let id = PreparedIdentity { epoch: 0, index: 1, video_id: "next".into(), generation: 1 };
+        let (owner, _) = begin_preparation(&mut q, id).unwrap();
+        assert!(preparation_can_continue(&q, &owner, 1));
+        q.repeat = RepeatMode::Off;
+        assert!(preparation_can_continue(&q, &owner, 1));
     }
 
     #[test]
