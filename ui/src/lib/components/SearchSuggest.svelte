@@ -98,7 +98,14 @@
 		active = -1;
 	}
 
+	function dismissMobileKeyboard() {
+		if (win.chrome === 'mobile' && document.activeElement instanceof HTMLInputElement) {
+			document.activeElement.blur();
+		}
+	}
+
 	function choose(item: BrowseItem) {
+		dismissMobileKeyboard();
 		close();
 		openItem(item); // a song plays, everything else opens its page
 		onpick?.();
@@ -108,6 +115,7 @@
 	// each caller's own idea of a full search applies, the same as the "All results" row.
 	function search(text: string) {
 		value = text;
+		dismissMobileKeyboard();
 		close();
 		root.closest('form')?.requestSubmit();
 	}

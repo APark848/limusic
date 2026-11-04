@@ -231,8 +231,9 @@ pub(crate) fn spawn_event_pump(
                     state.on_position(position).await;
                 }
                 PlayerEvent::Duration(duration) => {
-                    let _ = app.emit("duration", serde_json::json!({ "duration": duration }));
-                    state.on_duration(duration).await;
+                    if let Some(duration) = state.on_duration(duration).await {
+                        let _ = app.emit("duration", serde_json::json!({ "duration": duration }));
+                    }
                 }
                 PlayerEvent::Playing(playing) => {
                     let _ = app.emit("playback-state", if playing { "playing" } else { "paused" });

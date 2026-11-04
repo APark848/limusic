@@ -638,6 +638,7 @@ pub fn playback_data(video_id: &str, path: &str) -> Result<crate::orchestrator::
         title: None,
         artists: None,
         duration: None,
+        duration_trusted: false,
         // A file on disk has no `musicVideoType`, and video mode skips local ids anyway.
         is_video: None,
         thumbnail: None,

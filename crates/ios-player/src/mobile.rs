@@ -71,7 +71,7 @@ pub unsafe extern "C" fn limusic_ios_player_emit(kind: u32, value: f64, message:
     };
 
     if kind == 7 {
-        tracing::info!(stage = %message, "iOS AVPlayer stage");
+        tracing::info!(stage = %message, elapsed_ms = value, "iOS AVPlayer stage");
         return;
     }
 
@@ -134,6 +134,15 @@ struct LoadArgs<'a> {
     url: &'a str,
     headers: &'a std::collections::HashMap<String, String>,
     start: Option<f64>,
+    expected_duration: Option<f64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareArgs<'a> {
+    url: &'a str,
+    headers: &'a std::collections::HashMap<String, String>,
+    expected_duration: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -173,12 +182,16 @@ impl<R: Runtime> IosPlayer<R> {
         url: &str,
         headers: &std::collections::HashMap<String, String>,
         start: Option<f64>,
+        expected_duration: Option<f64>,
     ) -> Result<()> {
         if url.is_empty() {
             return Err(Error::Invalid("stream URL is empty"));
         }
         if start.is_some_and(|value| !value.is_finite() || value < 0.0) {
             return Err(Error::Invalid("start position must be finite and non-negative"));
+        }
+        if expected_duration.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+            return Err(Error::Invalid("expected duration must be finite and positive"));
         }
         if let Some(name) = headers.keys().find(|name| !crate::supported_stream_header(name)) {
             tracing::warn!(header = %name, "iOS player rejected unsupported stream header");
@@ -187,11 +200,37 @@ impl<R: Runtime> IosPlayer<R> {
         let mut header_names: Vec<&str> = headers.keys().map(String::as_str).collect();
         header_names.sort_unstable();
         tracing::info!(headers = ?header_names, has_start = start.is_some(), "calling Swift player load");
-        self.0.run_mobile_plugin::<()>("load", LoadArgs { url, headers, start })?;
+        self.0
+            .run_mobile_plugin::<()>("load", LoadArgs { url, headers, start, expected_duration })?;
         tracing::info!("Swift player load returned successfully");
         IDLE.store(false, Ordering::SeqCst);
         PLAYING.store(false, Ordering::SeqCst);
         REPORTED_PROGRESS.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Ask AVFoundation to resolve the immediate successor's asset metadata while the current
+    /// track is still playing. This deliberately does not create a second player or queue.
+    pub fn prepare(
+        &self,
+        url: &str,
+        headers: &std::collections::HashMap<String, String>,
+        expected_duration: Option<f64>,
+    ) -> Result<()> {
+        if url.is_empty() {
+            return Err(Error::Invalid("stream URL is empty"));
+        }
+        if expected_duration.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+            return Err(Error::Invalid("expected duration must be finite and positive"));
+        }
+        if let Some(name) = headers.keys().find(|name| !crate::supported_stream_header(name)) {
+            tracing::warn!(header = %name, "iOS player rejected unsupported prepared-stream header");
+            return Err(Error::UnsupportedHeader(name.clone()));
+        }
+        tracing::info!(header_count = headers.len(), "calling Swift player prepare");
+        self.0
+            .run_mobile_plugin::<()>("prepare", PrepareArgs { url, headers, expected_duration })?;
+        tracing::info!("Swift player prepare returned successfully");
         Ok(())
     }
 

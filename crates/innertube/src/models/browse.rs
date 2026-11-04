@@ -1946,6 +1946,14 @@ mod tests {
             ("La Vie En Rose", Some("Emily Watts"))
         );
         assert_eq!(s.items.len(), 3);
+        assert_eq!(first.duration, None, "typeahead rows do not carry a track length");
+        assert!(!first.is_video, "the endpoint marks this row as an official audio track");
+        let row = &find_all(&root, "musicResponsiveListItemRenderer")[0];
+        assert_eq!(
+            list_item_video_id(row).as_deref(),
+            Some("y7fN6YNFnJ4"),
+            "the canonical row identity wins over unrelated watch endpoints in its menu"
+        );
 
         let signed_in = json!({ "contents": [{ "searchSuggestionsSectionRenderer": { "contents": [
             { "historySuggestionRenderer": {

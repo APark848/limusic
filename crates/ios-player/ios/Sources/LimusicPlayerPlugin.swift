@@ -20,6 +20,13 @@ private struct LoadArgs: Decodable {
   let url: String
   let headers: [String: String]
   let start: Double?
+  let expectedDuration: Double?
+}
+
+private struct PrepareArgs: Decodable {
+  let url: String
+  let headers: [String: String]
+  let expectedDuration: Double?
 }
 
 private struct SeekArgs: Decodable {
@@ -44,6 +51,16 @@ final class LimusicPlayerPlugin: Plugin {
   private var loopsCurrentItem = false
   private var failureEmitted = false
   private var wantsPlayback = false
+  private var expectedDuration: Double?
+  private var usesExpectedDuration = false
+  private var endedEmitted = false
+  private var authoritativeBoundaryHandled = false
+  private var loadStartedAt = CFAbsoluteTimeGetCurrent()
+  private var firstProgressEmitted = false
+  private var preparedAsset: AVURLAsset?
+  private var preparedURL: String?
+  private var preparedHeaders: [String: String]?
+  private var preparedExpectedDuration: Double?
 
   deinit {
     removeObservers()
@@ -99,7 +116,40 @@ final class LimusicPlayerPlugin: Plugin {
   }
 
   private func diagnostic(_ stage: String) {
-    emit(EventKind.diagnostic, message: stage)
+    emit(
+      EventKind.diagnostic,
+      value: max(0, (CFAbsoluteTimeGetCurrent() - loadStartedAt) * 1000),
+      message: stage)
+  }
+
+  private func clearPreparedAsset() {
+    preparedAsset = nil
+    preparedURL = nil
+    preparedHeaders = nil
+    preparedExpectedDuration = nil
+  }
+
+  private func finishCurrentItem() {
+    guard !endedEmitted else { return }
+    endedEmitted = true
+    wantsPlayback = false
+    player.pause()
+    emit(EventKind.playing, value: 0)
+    emit(EventKind.ended)
+  }
+
+  private func reachAuthoritativeEnd(_ item: AVPlayerItem) {
+    guard !authoritativeBoundaryHandled else { return }
+    authoritativeBoundaryHandled = true
+    if loopsCurrentItem {
+      player.seek(to: .zero) { [weak self, weak item] _ in
+        guard let self, let item, item === self.player.currentItem else { return }
+        self.authoritativeBoundaryHandled = false
+        self.startPlaybackIfReady(item, stage: "authoritative-duration-loop-restart")
+      }
+    } else {
+      finishCurrentItem()
+    }
   }
 
   private func startPlaybackIfReady(_ item: AVPlayerItem, stage: String) {
@@ -184,6 +234,20 @@ final class LimusicPlayerPlugin: Plugin {
       let seconds = time.seconds
       if seconds.isFinite {
         self?.emit(EventKind.position, value: max(0, seconds))
+        if let self, seconds > 0, !self.firstProgressEmitted {
+          self.firstProgressEmitted = true
+          self.diagnostic("first-playback-progress")
+        }
+        if let self,
+          self.usesExpectedDuration,
+          let expected = self.expectedDuration,
+          seconds >= expected
+        {
+          self.diagnostic("authoritative-duration-ended")
+          if let item = self.player.currentItem {
+            self.reachAuthoritativeEnd(item)
+          }
+        }
       }
     }
 
@@ -194,9 +258,17 @@ final class LimusicPlayerPlugin: Plugin {
       switch observed.status {
       case .readyToPlay:
         self.diagnostic("item-ready-to-play")
-        let seconds = observed.duration.seconds
-        if seconds.isFinite && seconds >= 0 {
-          self.emit(EventKind.duration, value: seconds)
+        let observedSeconds = observed.duration.seconds
+        if observedSeconds.isFinite && observedSeconds >= 0 {
+          if let expected = self.expectedDuration {
+            let tolerance = max(10, expected * 0.1)
+            self.usesExpectedDuration = abs(observedSeconds - expected) > tolerance
+          }
+          let reported = self.usesExpectedDuration ? self.expectedDuration! : observedSeconds
+          self.emit(EventKind.duration, value: reported)
+          if self.usesExpectedDuration {
+            self.diagnostic("duration-authoritative-fallback")
+          }
         }
         self.startPlaybackIfReady(observed, stage: "ready-autoplay")
       case .failed:
@@ -220,11 +292,22 @@ final class LimusicPlayerPlugin: Plugin {
         self.emit(EventKind.playing, value: 1)
         self.emit(EventKind.paused, value: 0)
       case .paused:
-        self.diagnostic("time-control-paused")
-        self.emit(EventKind.playing, value: 0)
-        self.emit(EventKind.paused, value: 1)
+        if self.wantsPlayback {
+          self.diagnostic("time-control-paused-with-playback-intent")
+        } else {
+          self.diagnostic("time-control-paused")
+          self.emit(EventKind.playing, value: 0)
+          self.emit(EventKind.paused, value: 1)
+        }
       case .waitingToPlayAtSpecifiedRate:
-        self.diagnostic("time-control-waiting")
+        let reason: String
+        switch observed.reasonForWaitingToPlay {
+        case .toMinimizeStalls?: reason = "minimize-stalls"
+        case .evaluatingBufferingRate?: reason = "evaluating-buffer"
+        case .noItemToPlay?: reason = "no-item"
+        default: reason = "unspecified"
+        }
+        self.diagnostic("time-control-waiting-\(reason)")
       @unknown default:
         self.diagnostic("time-control-unknown")
       }
@@ -240,9 +323,7 @@ final class LimusicPlayerPlugin: Plugin {
         self.player.seek(to: .zero)
         self.startPlaybackIfReady(item, stage: "loop-restart")
       } else {
-        self.wantsPlayback = false
-        self.emit(EventKind.playing, value: 0)
-        self.emit(EventKind.ended)
+        self.finishCurrentItem()
       }
     }
 
@@ -283,7 +364,7 @@ final class LimusicPlayerPlugin: Plugin {
       invoke.reject("Playback requires an HTTP or HTTPS stream URL")
       return
     }
-    let asset = try makeAsset(url: url, headers: args.headers)
+    let freshAsset = try makeAsset(url: url, headers: args.headers)
     let start = args.start
 
     resolveOnMain(invoke) { [weak self] in
@@ -291,7 +372,19 @@ final class LimusicPlayerPlugin: Plugin {
       self.removeObservers()
       self.wantsPlayback = false
       self.failureEmitted = false
+      self.expectedDuration = args.expectedDuration
+      self.usesExpectedDuration = false
+      self.endedEmitted = false
+      self.authoritativeBoundaryHandled = false
+      self.loadStartedAt = CFAbsoluteTimeGetCurrent()
+      self.firstProgressEmitted = false
       self.diagnostic("load-received")
+      let canUsePrepared = self.preparedURL == args.url
+        && self.preparedHeaders == args.headers
+        && self.preparedExpectedDuration == args.expectedDuration
+      let asset = canUsePrepared ? self.preparedAsset! : freshAsset
+      self.diagnostic(canUsePrepared ? "prepared-asset-consumed" : "fresh-asset-installed")
+      self.clearPreparedAsset()
       let item = AVPlayerItem(asset: asset)
       self.player.replaceCurrentItem(with: item)
       self.diagnostic("item-installed")
@@ -300,6 +393,45 @@ final class LimusicPlayerPlugin: Plugin {
         self.player.seek(to: CMTime(seconds: start, preferredTimescale: 600))
       }
       self.emit(EventKind.position, value: start ?? 0)
+    }
+  }
+
+  @objc public func prepare(_ invoke: Invoke) throws {
+    let args = try invoke.parseArgs(PrepareArgs.self)
+    guard let url = URL(string: args.url), let scheme = url.scheme?.lowercased(),
+      ["http", "https"].contains(scheme)
+    else {
+      invoke.reject("Playback preparation requires an HTTP or HTTPS stream URL")
+      return
+    }
+    let asset = try makeAsset(url: url, headers: args.headers)
+    let startedAt = CFAbsoluteTimeGetCurrent()
+    resolveOnMain(invoke) { [weak self] in
+      guard let self else { return }
+      self.preparedAsset = asset
+      self.preparedURL = args.url
+      self.preparedHeaders = args.headers
+      self.preparedExpectedDuration = args.expectedDuration
+      self.emit(EventKind.diagnostic, message: "prepare-received")
+      asset.loadValuesAsynchronously(forKeys: ["playable", "duration"]) { [weak self, weak asset] in
+        DispatchQueue.main.async {
+          guard let self, let asset, let preparedAsset = self.preparedAsset,
+            asset === preparedAsset
+          else { return }
+          var error: NSError?
+          let status = asset.statusOfValue(forKey: "playable", error: &error)
+          let elapsed = max(0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+          switch status {
+          case .loaded:
+            self.emit(EventKind.diagnostic, value: elapsed, message: "prepared-asset-ready")
+          case .failed, .cancelled:
+            self.emit(EventKind.diagnostic, value: elapsed, message: "prepared-asset-failed")
+            self.clearPreparedAsset()
+          default:
+            self.emit(EventKind.diagnostic, value: elapsed, message: "prepared-asset-incomplete")
+          }
+        }
+      }
     }
   }
 

@@ -21,6 +21,7 @@ import { currentLocale, pushLocaleToRust, t } from './i18n.svelte';
 import { friendlyNetError } from './neterr';
 import { logUi } from './errlog';
 import { parseScrobbleConfig } from './scrobble';
+import { win } from './win.svelte';
 
 export const playback = $state({
 	now: null as NowPlaying | null,
@@ -139,9 +140,25 @@ export const openPlayer = () => {
 
 /** Play one track (a search row, a song card, a shelf), and show it. */
 export function playSong(song: SongItem) {
+	const started = performance.now();
 	logUi('info', `frontend play requested video_id=${song.video_id}`);
 	openPlayer();
-	return api.play(song);
+	return api.play(song).then(
+		(value) => {
+			logUi(
+				'info',
+				`frontend play completed video_id=${song.video_id} elapsed_ms=${Math.round(performance.now() - started)}`
+			);
+			return value;
+		},
+		(error) => {
+			logUi(
+				'warn',
+				`frontend play failed video_id=${song.video_id} elapsed_ms=${Math.round(performance.now() - started)}`
+			);
+			throw error;
+		}
+	);
 }
 
 export const auth = $state({
@@ -1490,6 +1507,12 @@ export function initApp(mini = false): () => void {
 	const subs = [
 		api.onNowPlaying((n) => {
 			playback.now = n;
+			// A new item must not inherit the previous AVPlayer timeline while its own ready callback
+			// is still pending (especially visible when an iOS stream reports a bad container length).
+			if (win.chrome === 'mobile') {
+				playback.position = 0;
+				playback.duration = 0;
+			}
 			playback.rating = n.rating ?? 'indifferent'; // the track's real rating when known
 			// Feeds Shortcuts recency and the community shelf's artist seed. Every play lands here,
 			// gapless advances included, so it's the one hook that sees them all.
