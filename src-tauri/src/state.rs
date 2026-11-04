@@ -316,9 +316,9 @@ struct QueueState {
     /// current one plays removes the network waterfall from the track boundary. This remains a
     /// single, validated cache entry; `items`/`current` are still the only queue authority.
     prepared_next: Option<PreparedTrack>,
-    /// Identity currently being resolved for iOS lookahead. It prevents the radio hydrator,
-    /// playlist filler, and track-start trigger from resolving the same successor concurrently.
-    preparing_next: Option<PreparedIdentity>,
+    /// Owner of iOS lookahead, including its delayed retry. Pointer identity prevents an old
+    /// task from completing/clearing a newer request for the same successor after invalidation.
+    preparing_next: Option<std::sync::Arc<PreparedIdentity>>,
     /// Consecutive resolve failures for `preparing_next`'s identity. Preparation gets one delayed
     /// retry; a later queue mutation resets the counter for the new successor.
     preparation_failures: u8,
@@ -376,6 +376,7 @@ struct PreparedIdentity {
     epoch: u64,
     index: usize,
     video_id: String,
+    generation: u64,
 }
 
 #[cfg(any(target_os = "ios", test))]
@@ -386,6 +387,66 @@ const IOS_PREPARATION_RETRY_DELAY: std::time::Duration = std::time::Duration::fr
 #[cfg(any(target_os = "ios", test))]
 fn next_preparation_attempt(failures: u8) -> Option<u8> {
     (failures < IOS_PREPARATION_ATTEMPTS).then_some(failures + 1)
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn owns_preparation(q: &QueueState, identity: &std::sync::Arc<PreparedIdentity>) -> bool {
+    q.preparing_next.as_ref().is_some_and(|owner| std::sync::Arc::ptr_eq(owner, identity))
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn preparation_can_continue(
+    q: &QueueState,
+    identity: &std::sync::Arc<PreparedIdentity>,
+    generation: u64,
+) -> bool {
+    identity.generation == generation
+        && owns_preparation(q, identity)
+        && preparation_identity_is_current(q, identity)
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn finish_preparation(q: &mut QueueState, identity: &std::sync::Arc<PreparedIdentity>) {
+    if owns_preparation(q, identity) {
+        q.preparing_next = None;
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn begin_preparation(
+    q: &mut QueueState,
+    identity: PreparedIdentity,
+) -> Option<(std::sync::Arc<PreparedIdentity>, u8)> {
+    if q.preparing_next.as_deref() == Some(&identity) {
+        return None;
+    }
+    if q.preparation_identity.as_ref() != Some(&identity) {
+        q.preparation_failures = 0;
+        q.preparation_identity = Some(identity.clone());
+        q.prepared_next = None;
+    }
+    let attempt = next_preparation_attempt(q.preparation_failures)?;
+    let identity = std::sync::Arc::new(identity);
+    q.preparing_next = Some(identity.clone());
+    Some((identity, attempt))
+}
+
+#[cfg(any(target_os = "ios", test))]
+fn fail_preparation(
+    q: &mut QueueState,
+    identity: &std::sync::Arc<PreparedIdentity>,
+    generation: u64,
+    attempt: u8,
+) -> bool {
+    let current = preparation_can_continue(q, identity, generation);
+    if current {
+        q.preparation_failures = attempt;
+    }
+    let retry = current && next_preparation_attempt(attempt).is_some();
+    if !retry {
+        finish_preparation(q, identity);
+    }
+    retry
 }
 
 fn prepared_identity_matches(
@@ -2644,6 +2705,9 @@ impl AppState {
         }
         let (identity, is_upload, duration_secs, attempt) = {
             let mut q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return;
+            }
             let Some(index) = next_index(q.items.len(), q.current, q.repeat) else { return };
             let Some(item) = q.items.get(index) else { return };
             let video_id = item.video_id.clone();
@@ -2661,29 +2725,66 @@ impl AppState {
             }) {
                 return;
             }
-            let identity = PreparedIdentity { epoch: q.epoch, index, video_id };
-            if q.preparing_next.as_ref() == Some(&identity) {
-                tracing::debug!(video_id = %identity.video_id, index, "iOS next-track preparation already in flight");
-                return;
-            }
-            if q.preparation_identity.as_ref() != Some(&identity) {
-                q.preparation_failures = 0;
-                q.preparation_identity = Some(identity.clone());
-                q.prepared_next = None;
-            }
-            let Some(attempt) = next_preparation_attempt(q.preparation_failures) else {
-                tracing::warn!(video_id = %identity.video_id, index, "iOS next-track preparation attempts exhausted");
+            let identity = PreparedIdentity { epoch: q.epoch, index, video_id, generation: gen };
+            let Some((identity, attempt)) = begin_preparation(&mut q, identity) else {
                 return;
             };
-            q.preparing_next = Some(identity.clone());
             (identity, is_upload, duration_secs, attempt)
         };
+        if self.try_prepare_ios_lookahead(&identity, is_upload, duration_secs, attempt).await {
+            tauri::async_runtime::spawn(self.clone().retry_ios_lookahead(
+                identity,
+                is_upload,
+                duration_secs,
+                attempt + 1,
+            ));
+        }
+    }
+
+    /// The retry awaits only a single attempt, never the scheduling entry point. The explicit
+    /// bound is checked by the iOS compiler as well as by `spawn`; boxing recursion cannot do this.
+    #[cfg(target_os = "ios")]
+    fn retry_ios_lookahead(
+        self: std::sync::Arc<Self>,
+        identity: std::sync::Arc<PreparedIdentity>,
+        is_upload: bool,
+        duration_secs: i64,
+        attempt: u8,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        async move {
+            tokio::time::sleep(IOS_PREPARATION_RETRY_DELAY).await;
+            self.try_prepare_ios_lookahead(&identity, is_upload, duration_secs, attempt).await;
+        }
+    }
+
+    /// Return whether this owner has one retry left. Keep ownership during the delay so other
+    /// prime requests cannot bypass the backoff or spend the same attempt twice.
+    #[cfg(target_os = "ios")]
+    async fn try_prepare_ios_lookahead(
+        &self,
+        identity: &std::sync::Arc<PreparedIdentity>,
+        is_upload: bool,
+        duration_secs: i64,
+        attempt: u8,
+    ) -> bool {
+        if self.lt.is_guest().await {
+            let mut q = self.queue.lock().await;
+            finish_preparation(&mut q, identity);
+            return false;
+        }
+        {
+            let mut q = self.queue.lock().await;
+            if !preparation_can_continue(&q, identity, self.generation.load(Ordering::SeqCst)) {
+                finish_preparation(&mut q, identity);
+                return false;
+            }
+        }
         let started = Instant::now();
         tracing::info!(
             video_id = %identity.video_id,
             index = identity.index,
             attempt,
-            generation = gen,
+            generation = identity.generation,
             "iOS next-track preparation started"
         );
         let data = match self.resolve(&identity.video_id, is_upload, duration_secs).await {
@@ -2691,19 +2792,12 @@ impl AppState {
             Err(error) => {
                 let retry = {
                     let mut q = self.queue.lock().await;
-                    if q.preparing_next.as_ref() == Some(&identity) {
-                        q.preparing_next = None;
-                    }
-                    let still_next = q.epoch == identity.epoch
-                        && next_index(q.items.len(), q.current, q.repeat) == Some(identity.index)
-                        && q.items.get(identity.index).map(|item| item.video_id.as_str())
-                            == Some(identity.video_id.as_str());
-                    if still_next {
-                        q.preparation_failures = attempt;
-                    }
-                    still_next
-                        && attempt < IOS_PREPARATION_ATTEMPTS
-                        && self.generation.load(Ordering::SeqCst) == gen
+                    fail_preparation(
+                        &mut q,
+                        identity,
+                        self.generation.load(Ordering::SeqCst),
+                        attempt,
+                    )
                 };
                 tracing::warn!(
                     video_id = %identity.video_id,
@@ -2714,43 +2808,19 @@ impl AppState {
                     %error,
                     "iOS next-track preparation failed"
                 );
-                if retry {
-                    let me = self.clone();
-                    tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(IOS_PREPARATION_RETRY_DELAY).await;
-                        if me.generation.load(Ordering::SeqCst) == gen {
-                            Box::pin(me.prepare_ios_lookahead(gen)).await;
-                        }
-                    });
-                }
-                return;
+                return retry;
             }
         };
-        if self.generation.load(Ordering::SeqCst) != gen {
-            let mut q = self.queue.lock().await;
-            if q.preparing_next.as_ref() == Some(&identity) {
-                q.preparing_next = None;
-            }
-            tracing::debug!(video_id = %identity.video_id, attempt, "iOS next-track preparation superseded");
-            return;
-        }
-        let mut q = self.queue.lock().await;
-        if q.preparing_next.as_ref() == Some(&identity) {
-            q.preparing_next = None;
-        }
-        if q.epoch != identity.epoch
-            || q.items.get(identity.index).map(|item| item.video_id.as_str())
-                != Some(identity.video_id.as_str())
-            || next_index(q.items.len(), q.current, q.repeat) != Some(identity.index)
         {
-            tracing::debug!(
-                video_id = %identity.video_id,
-                index = identity.index,
-                attempt,
-                "queue changed during iOS next-track preparation — dropped"
-            );
-            return;
+            let mut q = self.queue.lock().await;
+            if !preparation_can_continue(&q, identity, self.generation.load(Ordering::SeqCst)) {
+                finish_preparation(&mut q, identity);
+                tracing::debug!(video_id = %identity.video_id, attempt, "iOS next-track preparation superseded");
+                return false;
+            }
         }
+        // No queue guard crosses the native bridge. `prepare` only warms an asset; it cannot
+        // load/play a track. Swift also matches URL, headers and duration before consuming it.
         let stream_url = mpv_stream_url(&data);
         let expected_duration =
             data.duration.as_deref().and_then(|value| value.parse::<f64>().ok());
@@ -2763,8 +2833,15 @@ impl AppState {
                 "native iOS next-track asset preparation failed; keeping resolved fallback"
             );
         }
+        let mut q = self.queue.lock().await;
+        let current =
+            preparation_can_continue(&q, identity, self.generation.load(Ordering::SeqCst));
+        finish_preparation(&mut q, identity);
+        if !current {
+            return false;
+        }
         q.preparation_failures = 0;
-        q.preparation_identity = Some(identity.clone());
+        q.preparation_identity = Some(identity.as_ref().clone());
         q.prepared_next = Some(PreparedTrack {
             epoch: identity.epoch,
             index: identity.index,
@@ -2779,6 +2856,7 @@ impl AppState {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "iOS next track prepared"
         );
+        false
     }
 
     /// Second half of [`Self::prime_lookahead`]: hand the resolved stream to mpv and record it.
@@ -5147,14 +5225,15 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        append_page, backfill_metadata, cache_horizon, cached_duration_metadata,
-        clear_stale_preparation, drop_duplicates, enqueue_at, format_duration, get_url,
-        guest_insert_index, history_threshold, is_mix, loudness_gain, merge_radio, next_index,
-        next_preparation_attempt, parse_duration_ms, persist_fingerprint, prefer_version,
-        prepared_identity_matches, prev_track_title, put_url, queue_fingerprint, radio_seed_for,
-        retain_upcoming, shuffle_new_queue, shuffle_upcoming, splice_radio_into, swap_version,
-        trim_played, trusted_cached_duration, unshuffled, upcoming_queued, PreparedIdentity,
-        QueueState, RepeatMode, VideoUrls, KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
+        append_page, backfill_metadata, begin_preparation, cache_horizon, cached_duration_metadata,
+        clear_stale_preparation, drop_duplicates, enqueue_at, fail_preparation, finish_preparation,
+        format_duration, get_url, guest_insert_index, history_threshold, is_mix, loudness_gain,
+        merge_radio, next_index, next_preparation_attempt, parse_duration_ms, persist_fingerprint,
+        prefer_version, preparation_can_continue, prepared_identity_matches, prev_track_title,
+        put_url, queue_fingerprint, radio_seed_for, retain_upcoming, shuffle_new_queue,
+        shuffle_upcoming, splice_radio_into, swap_version, trim_played, trusted_cached_duration,
+        unshuffled, upcoming_queued, PreparedIdentity, QueueState, RepeatMode, VideoUrls,
+        KEEP_PLAYED, LOCAL_PLAYLIST_PREFIX, MAX_BOOST_DB,
     };
 
     /// The whole point of the video-URL map is answering a reopen without a round trip, so a live
@@ -5703,8 +5782,8 @@ mod tests {
         assert_eq!(next_preparation_attempt(2), None);
         assert_eq!(next_preparation_attempt(20), None);
 
-        let old = PreparedIdentity { epoch: 7, index: 2, video_id: "old".into() };
-        let new = PreparedIdentity { epoch: 7, index: 2, video_id: "new".into() };
+        let old = PreparedIdentity { epoch: 7, index: 2, video_id: "old".into(), generation: 1 };
+        let new = PreparedIdentity { epoch: 7, index: 2, video_id: "new".into(), generation: 1 };
         assert_ne!(old, new, "a queue mutation must reset the successor's retry budget");
     }
 
@@ -5714,11 +5793,17 @@ mod tests {
             items: vec![song("now", None), song("next", None), song("later", None)],
             current: 0,
             epoch: 7,
-            preparing_next: Some(PreparedIdentity { epoch: 7, index: 1, video_id: "next".into() }),
+            preparing_next: Some(std::sync::Arc::new(PreparedIdentity {
+                epoch: 7,
+                index: 1,
+                video_id: "next".into(),
+                generation: 1,
+            })),
             preparation_identity: Some(PreparedIdentity {
                 epoch: 7,
                 index: 1,
                 video_id: "next".into(),
+                generation: 1,
             }),
             preparation_failures: 1,
             ..Default::default()
@@ -5730,6 +5815,117 @@ mod tests {
         assert!(q.preparing_next.is_none());
         assert!(q.preparation_identity.is_none());
         assert_eq!(q.preparation_failures, 0);
+    }
+
+    #[test]
+    fn ios_preparation_reserves_both_attempts_including_the_retry_delay() {
+        let mut q =
+            QueueState { items: vec![song("now", None), song("next", None)], ..Default::default() };
+        let id = PreparedIdentity { epoch: 0, index: 1, video_id: "next".into(), generation: 1 };
+        let (owner, attempt) = begin_preparation(&mut q, id.clone()).unwrap();
+        assert_eq!(attempt, 1);
+        assert!(begin_preparation(&mut q, id.clone()).is_none());
+        assert!(fail_preparation(&mut q, &owner, 1, attempt));
+        assert!(preparation_can_continue(&q, &owner, 1));
+        assert!(begin_preparation(&mut q, id.clone()).is_none(), "retry owns the backoff");
+        assert!(!fail_preparation(&mut q, &owner, 1, 2));
+        assert!(q.preparing_next.is_none());
+        assert!(begin_preparation(&mut q, id).is_none(), "two failures exhaust this identity");
+        assert_eq!(q.items.len(), 2, "network failures must retain the queue");
+    }
+
+    #[test]
+    fn ios_preparation_success_releases_the_owner_on_either_attempt() {
+        for retry in [false, true] {
+            let mut q = QueueState {
+                items: vec![song("now", None), song("next", None)],
+                ..Default::default()
+            };
+            let id =
+                PreparedIdentity { epoch: 0, index: 1, video_id: "next".into(), generation: 1 };
+            let (owner, _) = begin_preparation(&mut q, id).unwrap();
+            if retry {
+                assert!(fail_preparation(&mut q, &owner, 1, 1));
+            }
+            assert!(preparation_can_continue(&q, &owner, 1));
+            finish_preparation(&mut q, &owner);
+            assert!(q.preparing_next.is_none());
+            assert!(!preparation_can_continue(&q, &owner, 1));
+        }
+    }
+
+    #[test]
+    fn ios_preparation_rejects_queue_changes_before_retry_or_install() {
+        for change in ["remove", "reorder", "epoch", "eof", "generation", "repeat-one"] {
+            let mut q = QueueState {
+                items: vec![song("now", None), song("next", None), song("later", None)],
+                ..Default::default()
+            };
+            let id =
+                PreparedIdentity { epoch: 0, index: 1, video_id: "next".into(), generation: 1 };
+            let (owner, _) = begin_preparation(&mut q, id).unwrap();
+            assert!(fail_preparation(&mut q, &owner, 1, 1));
+            let mut generation = 1;
+            match change {
+                "remove" => {
+                    q.items.remove(1);
+                }
+                "reorder" => q.items.swap(1, 2),
+                "epoch" => q.epoch += 1,
+                "eof" => q.seek_to(1),
+                "generation" => generation += 1,
+                "repeat-one" => q.repeat = RepeatMode::One,
+                _ => unreachable!(),
+            }
+            assert!(!preparation_can_continue(&q, &owner, generation), "{change}");
+            assert!(!fail_preparation(&mut q, &owner, generation, 2), "{change}");
+            assert!(q.preparing_next.is_none(), "{change}");
+        }
+    }
+
+    #[test]
+    fn ios_preparation_old_completion_cannot_clear_a_replacement_owner() {
+        let mut q = QueueState {
+            items: vec![song("now", None), song("next", None), song("later", None)],
+            ..Default::default()
+        };
+        let id = PreparedIdentity { epoch: 0, index: 1, video_id: "next".into(), generation: 1 };
+        let (old, _) = begin_preparation(&mut q, id.clone()).unwrap();
+        assert!(fail_preparation(&mut q, &old, 1, 1));
+        q.items.swap(1, 2);
+        assert!(clear_stale_preparation(&mut q));
+        q.items.swap(1, 2); // Same queue coordinates again, but a different request.
+        let (new, attempt) = begin_preparation(&mut q, id.clone()).unwrap();
+        assert_eq!(attempt, 1);
+        assert!(!preparation_can_continue(&q, &old, 1));
+        assert!(!fail_preparation(&mut q, &old, 1, 2));
+        finish_preparation(&mut q, &old);
+        assert!(preparation_can_continue(&q, &new, 1));
+        assert_eq!(q.preparation_failures, 0);
+
+        let (new_generation, attempt) =
+            begin_preparation(&mut q, PreparedIdentity { generation: 2, ..id }).unwrap();
+        assert_eq!(attempt, 1);
+        assert!(!fail_preparation(&mut q, &new, 2, 1));
+        assert!(preparation_can_continue(&q, &new_generation, 2));
+        assert_eq!(q.preparation_failures, 0);
+    }
+
+    #[test]
+    fn ios_preparation_single_track_repeat_uses_the_same_validation() {
+        let mut q = QueueState {
+            items: vec![song("only", None)],
+            repeat: RepeatMode::All,
+            ..Default::default()
+        };
+        let id = PreparedIdentity { epoch: 0, index: 0, video_id: "only".into(), generation: 1 };
+        let (owner, _) = begin_preparation(&mut q, id).unwrap();
+        assert!(preparation_can_continue(&q, &owner, 1));
+        assert!(!preparation_can_continue(&q, &owner, 2), "repeat wrap changes generation");
+        q.repeat = RepeatMode::Off;
+        assert!(!preparation_can_continue(&q, &owner, 1));
+        q.repeat = RepeatMode::One;
+        assert!(!preparation_can_continue(&q, &owner, 1));
     }
 
     #[test]
