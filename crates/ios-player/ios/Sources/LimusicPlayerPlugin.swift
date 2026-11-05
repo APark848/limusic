@@ -302,11 +302,11 @@ final class LimusicPlayerPlugin: Plugin {
     }
 
     statusObservation = item.observe(\.status, options: [.initial, .new]) {
-      [weak self, weak item] observed, change in
+      [weak self, weak item] observed, _ in
       DispatchQueue.main.async { [weak self, weak item] in
-        guard let self, let status = change.newValue else { return }
+        guard let self else { return }
         guard observed === self.player.currentItem else { return }
-        switch status {
+        switch observed.status {
         case .readyToPlay:
           self.diagnostic("item-ready-to-play")
           let observedSeconds = observed.duration.seconds
@@ -336,16 +336,17 @@ final class LimusicPlayerPlugin: Plugin {
     }
     self.diagnostic("status-observer-installed")
 
-    // Reading timeControlStatus synchronously during item installation can wait on asset work.
-    // Consume the KVO value instead, and do not request an initial getter on an unready stream.
+    // Read native enum properties after the KVO callback returns, outside AVFoundation's
+    // notification stack. KVO's generic change.newValue may be nil for these ObjC enum values.
     timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) {
-      [weak self, weak item] observed, change in
+      [weak self, weak item] observed, _ in
       DispatchQueue.main.async { [weak self, weak item] in
-        guard let self, let item, item === self.player.currentItem, let status = change.newValue else { return }
+        guard let self, let item, item === self.player.currentItem else { return }
+        let status = observed.timeControlStatus
+        if status == .playing && !self.wantsPlayback { return }
         self.transportStatus = status
         switch status {
         case .playing:
-          guard self.wantsPlayback else { return }
           self.hasPlayed = true
           self.diagnostic("time-control-playing")
           self.emit(EventKind.playing, value: 1)
@@ -615,9 +616,11 @@ final class LimusicPlayerPlugin: Plugin {
   @objc public func snapshot(_ invoke: Invoke) {
     DispatchQueue.main.async { [weak self] in
       guard let self else { return }
+      let ready = self.player.currentItem?.status == .readyToPlay
+      let position = ready ? self.player.currentTime().seconds : 0
       invoke.resolve([
         "epoch": self.eventEpoch,
-        "position": self.player.currentTime().seconds.isFinite ? self.player.currentTime().seconds : 0,
+        "position": position.isFinite ? position : 0,
         "bufferedAhead": self.player.currentItem.flatMap {
           $0.status == .readyToPlay ? self.bufferedAhead($0) : nil
         } ?? 0,

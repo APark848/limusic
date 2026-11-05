@@ -151,6 +151,9 @@ jobs:
           capture_failure() {
             set +e
             echo "Capturing simulator diagnostics after launch failure"
+            if [ -n "${persistent_log:-}" ] && [ -f "$persistent_log" ]; then
+              cp "$persistent_log" "$diagnostics_dir/limusic.log"
+            fi
             if [ -n "${app_pid:-}" ]; then
               sample "$app_pid" 3 -file "$diagnostics_dir/process-sample.txt" 2>/dev/null
             fi
@@ -347,6 +350,7 @@ jobs:
             fail "Limusic exited after the remote-stream self-test (pid $app_pid)"
           fi
           trap - ERR
+          cp "$persistent_log" "$diagnostics_dir/limusic.log"
 
       - name: Preserve iOS generation and build logs
         if: ${{ always() }}
