@@ -60,7 +60,7 @@ final class LimusicPlayerPlugin: Plugin {
   private var usesExpectedDuration = false
   private var endedEmitted = false
   private var authoritativeBoundaryHandled = false
-  private var loadStartedAt = CFAbsoluteTimeGetCurrent()
+  private var loadStartedAt = ProcessInfo.processInfo.systemUptime
   private var firstProgressEmitted = false
   private var hasPlayed = false
   private var preparedAsset: AVURLAsset?
@@ -72,6 +72,7 @@ final class LimusicPlayerPlugin: Plugin {
   private var wasOffline = false
   private var resumeStartedAt: Double?
   private var progressBaseline: Double = 0
+  private var transportStatus: AVPlayer.TimeControlStatus = .paused
 
   deinit {
     networkMonitor.cancel()
@@ -130,7 +131,7 @@ final class LimusicPlayerPlugin: Plugin {
   private func diagnostic(_ stage: String) {
     emit(
       EventKind.diagnostic,
-      value: max(0, (CFAbsoluteTimeGetCurrent() - loadStartedAt) * 1000),
+      value: max(0, (ProcessInfo.processInfo.systemUptime - loadStartedAt) * 1000),
       message: stage)
   }
 
@@ -145,7 +146,7 @@ final class LimusicPlayerPlugin: Plugin {
         if reconnected { self.emit(EventKind.networkRestored) }
         // A path change is not an item failure. Keep the item, timestamp and pause intent.
         if reconnected, self.wantsPlayback, let item = self.player.currentItem,
-          item.status == .readyToPlay, self.player.timeControlStatus != .playing {
+          item.status == .readyToPlay, self.transportStatus != .playing {
           self.startPlaybackIfReady(item, stage: "network-restored-resume")
         }
       }
@@ -277,14 +278,14 @@ final class LimusicPlayerPlugin: Plugin {
       let seconds = time.seconds
       if seconds.isFinite {
         self.emit(EventKind.position, value: max(0, seconds))
-        if self.player.timeControlStatus == .playing, seconds > self.progressBaseline + 0.01,
+        if self.transportStatus == .playing, seconds > self.progressBaseline + 0.01,
           !self.firstProgressEmitted {
           self.firstProgressEmitted = true
           self.diagnostic("first-playback-progress")
         }
-        if let started = self.resumeStartedAt, self.player.timeControlStatus == .playing,
+        if let started = self.resumeStartedAt, self.transportStatus == .playing,
           seconds > self.progressBaseline + 0.01 {
-          self.emit(EventKind.diagnostic, value: (CFAbsoluteTimeGetCurrent() - started) * 1000,
+          self.emit(EventKind.diagnostic, value: (ProcessInfo.processInfo.systemUptime - started) * 1000,
             message: "resume-first-progress")
           self.resumeStartedAt = nil
         }
@@ -301,69 +302,79 @@ final class LimusicPlayerPlugin: Plugin {
     }
 
     statusObservation = item.observe(\.status, options: [.initial, .new]) {
-      [weak self, weak item] observed, _ in
-      guard let self else { return }
-      guard observed === self.player.currentItem else { return }
-      switch observed.status {
-      case .readyToPlay:
-        self.diagnostic("item-ready-to-play")
-        let observedSeconds = observed.duration.seconds
-        if observedSeconds.isFinite && observedSeconds >= 0 {
-          if let expected = self.expectedDuration {
-            let tolerance = max(10, expected * 0.1)
-            self.usesExpectedDuration = abs(observedSeconds - expected) > tolerance
+      [weak self, weak item] observed, change in
+      DispatchQueue.main.async { [weak self, weak item] in
+        guard let self, let status = change.newValue else { return }
+        guard observed === self.player.currentItem else { return }
+        switch status {
+        case .readyToPlay:
+          self.diagnostic("item-ready-to-play")
+          let observedSeconds = observed.duration.seconds
+          if observedSeconds.isFinite && observedSeconds >= 0 {
+            if let expected = self.expectedDuration {
+              let tolerance = max(10, expected * 0.1)
+              self.usesExpectedDuration = abs(observedSeconds - expected) > tolerance
+            }
+            let reported = self.usesExpectedDuration ? self.expectedDuration! : observedSeconds
+            self.emit(EventKind.duration, value: reported)
+            if self.usesExpectedDuration {
+              self.diagnostic("duration-authoritative-fallback")
+            }
           }
-          let reported = self.usesExpectedDuration ? self.expectedDuration! : observedSeconds
-          self.emit(EventKind.duration, value: reported)
-          if self.usesExpectedDuration {
-            self.diagnostic("duration-authoritative-fallback")
-          }
+          self.startPlaybackIfReady(observed, stage: "ready-autoplay")
+        case .failed:
+          self.wantsPlayback = false
+          self.diagnostic("item-failed")
+          self.emitFailure(self.safeFailure(item?.error, fallback: "AVPlayer could not load this track"))
+        case .unknown:
+          self.diagnostic("item-status-unknown")
+        @unknown default:
+          self.wantsPlayback = false
+          self.emit(EventKind.error, message: "AVPlayer reported an unknown item status")
         }
-        self.startPlaybackIfReady(observed, stage: "ready-autoplay")
-      case .failed:
-        self.wantsPlayback = false
-        self.diagnostic("item-failed")
-        self.emitFailure(self.safeFailure(item?.error, fallback: "AVPlayer could not load this track"))
-      case .unknown:
-        self.diagnostic("item-status-unknown")
-      @unknown default:
-        self.wantsPlayback = false
-        self.emit(EventKind.error, message: "AVPlayer reported an unknown item status")
       }
     }
+    self.diagnostic("status-observer-installed")
 
-    timeControlObservation = player.observe(\.timeControlStatus, options: [.initial, .new]) {
-      [weak self] observed, _ in
-      guard let self else { return }
-      switch observed.timeControlStatus {
-      case .playing:
-        self.hasPlayed = true
-        self.diagnostic("time-control-playing")
-        self.emit(EventKind.playing, value: 1)
-        self.emit(EventKind.paused, value: 0)
-      case .paused:
-        if self.wantsPlayback {
-          self.diagnostic("time-control-paused-with-playback-intent")
-          self.emit(EventKind.buffering)
-        } else {
-          self.diagnostic("time-control-paused")
-          self.emit(EventKind.playing, value: 0)
-          self.emit(EventKind.paused, value: 1)
+    // Reading timeControlStatus synchronously during item installation can wait on asset work.
+    // Consume the KVO value instead, and do not request an initial getter on an unready stream.
+    timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) {
+      [weak self, weak item] observed, change in
+      DispatchQueue.main.async { [weak self, weak item] in
+        guard let self, let item, item === self.player.currentItem, let status = change.newValue else { return }
+        self.transportStatus = status
+        switch status {
+        case .playing:
+          guard self.wantsPlayback else { return }
+          self.hasPlayed = true
+          self.diagnostic("time-control-playing")
+          self.emit(EventKind.playing, value: 1)
+          self.emit(EventKind.paused, value: 0)
+        case .paused:
+          if self.wantsPlayback {
+            self.diagnostic("time-control-paused-with-playback-intent")
+            self.emit(EventKind.buffering)
+          } else {
+            self.diagnostic("time-control-paused")
+            self.emit(EventKind.playing, value: 0)
+            self.emit(EventKind.paused, value: 1)
+          }
+        case .waitingToPlayAtSpecifiedRate:
+          let reason: String
+          switch observed.reasonForWaitingToPlay {
+          case .toMinimizeStalls?: reason = "minimize-stalls"
+          case .evaluatingBufferingRate?: reason = "evaluating-buffer"
+          case .noItemToPlay?: reason = "no-item"
+          default: reason = "unspecified"
+          }
+          self.diagnostic("time-control-waiting-\(reason)")
+          if self.wantsPlayback { self.emit(EventKind.buffering) }
+        @unknown default:
+          self.diagnostic("time-control-unknown")
         }
-      case .waitingToPlayAtSpecifiedRate:
-        let reason: String
-        switch observed.reasonForWaitingToPlay {
-        case .toMinimizeStalls?: reason = "minimize-stalls"
-        case .evaluatingBufferingRate?: reason = "evaluating-buffer"
-        case .noItemToPlay?: reason = "no-item"
-        default: reason = "unspecified"
-        }
-        self.diagnostic("time-control-waiting-\(reason)")
-        if self.wantsPlayback { self.emit(EventKind.buffering) }
-      @unknown default:
-        self.diagnostic("time-control-unknown")
       }
     }
+    self.diagnostic("transport-observer-installed")
 
     endedObserver = NotificationCenter.default.addObserver(
       forName: .AVPlayerItemDidPlayToEndTime,
@@ -438,13 +449,14 @@ final class LimusicPlayerPlugin: Plugin {
       self.monitorConnectivity()
       self.removeObservers()
       self.eventEpoch = args.epoch
+      self.transportStatus = .paused
       self.wantsPlayback = false
       self.failureEmitted = false
       self.expectedDuration = args.expectedDuration
       self.usesExpectedDuration = false
       self.endedEmitted = false
       self.authoritativeBoundaryHandled = false
-      self.loadStartedAt = CFAbsoluteTimeGetCurrent()
+      self.loadStartedAt = ProcessInfo.processInfo.systemUptime
       self.firstProgressEmitted = false
       self.hasPlayed = false
       self.progressBaseline = start ?? 0
@@ -472,7 +484,7 @@ final class LimusicPlayerPlugin: Plugin {
       return
     }
     let asset = try makeAsset(url: url, headers: args.headers)
-    let startedAt = CFAbsoluteTimeGetCurrent()
+    let startedAt = ProcessInfo.processInfo.systemUptime
     resolveOnMain(invoke) { [weak self] in
       guard let self else { return }
       self.preparedAsset = asset
@@ -487,7 +499,7 @@ final class LimusicPlayerPlugin: Plugin {
           else { return }
           var error: NSError?
           let status = asset.statusOfValue(forKey: "playable", error: &error)
-          let elapsed = max(0, (CFAbsoluteTimeGetCurrent() - startedAt) * 1000)
+          let elapsed = max(0, (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
           switch status {
           case .loaded:
             self.emit(EventKind.diagnostic, value: elapsed, message: "prepared-asset-ready")
@@ -529,7 +541,7 @@ final class LimusicPlayerPlugin: Plugin {
             ])
         }
         if self.hasPlayed {
-          self.resumeStartedAt = CFAbsoluteTimeGetCurrent()
+          self.resumeStartedAt = ProcessInfo.processInfo.systemUptime
           self.progressBaseline = self.player.currentTime().seconds
         }
         if self.hasPlayed, item.status == .readyToPlay, self.bufferedAhead(item) >= 0.25 {
@@ -549,6 +561,7 @@ final class LimusicPlayerPlugin: Plugin {
       guard let self else { return }
       self.wantsPlayback = false
       self.player.pause()
+      self.transportStatus = .paused
       self.emit(EventKind.playing, value: 0)
       self.emit(EventKind.paused, value: 1)
     }
@@ -560,6 +573,7 @@ final class LimusicPlayerPlugin: Plugin {
       self.monitorConnectivity()
       self.wantsPlayback = false
       self.player.pause()
+      self.transportStatus = .paused
       self.removeObservers()
       self.player.replaceCurrentItem(with: nil)
       self.emit(EventKind.position, value: 0)
@@ -604,9 +618,11 @@ final class LimusicPlayerPlugin: Plugin {
       invoke.resolve([
         "epoch": self.eventEpoch,
         "position": self.player.currentTime().seconds.isFinite ? self.player.currentTime().seconds : 0,
-        "bufferedAhead": self.player.currentItem.map { self.bufferedAhead($0) } ?? 0,
+        "bufferedAhead": self.player.currentItem.flatMap {
+          $0.status == .readyToPlay ? self.bufferedAhead($0) : nil
+        } ?? 0,
         "wantsPlayback": self.wantsPlayback,
-        "playing": self.player.timeControlStatus == .playing,
+        "playing": self.transportStatus == .playing,
       ])
     }
   }

@@ -27,7 +27,7 @@ export function summarize(log) {
       if (request) generations.set(gen, { request, offset: time - request.time + request.ipc });
     }
     if (line.includes('iOS AVPlayer stage')) {
-      const stage = line.match(/stage="([a-z-]+)"/)?.[1];
+      const stage = line.match(/stage="?([a-z-]+)/)?.[1];
       if (stage === 'resume-first-progress') add('resume/first-progress', number(line, 'elapsed_ms'));
       const trace = generations.get(gen);
       if (!trace || !['load-received', 'item-ready-to-play', 'first-playback-progress'].includes(stage)) continue;

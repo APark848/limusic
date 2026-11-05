@@ -151,6 +151,9 @@ jobs:
           capture_failure() {
             set +e
             echo "Capturing simulator diagnostics after launch failure"
+            if [ -n "${app_pid:-}" ]; then
+              sample "$app_pid" 3 -file "$diagnostics_dir/process-sample.txt" 2>/dev/null
+            fi
             xcrun simctl spawn "$simulator_udid" log show \
               --style compact --last 3m \
               --predicate 'process == "limusic" OR eventMessage CONTAINS[c] "com.limusic.desktop"' \

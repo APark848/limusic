@@ -98,6 +98,12 @@
 			return;
 		}
 		if (now.videoId === requested) return;
+		if (now.streamClient === 'loading') {
+			requested = '';
+			lyrics = null;
+			loading = true;
+			return;
+		}
 		const id = (requested = now.videoId);
 		loading = true;
 		lyrics = null;

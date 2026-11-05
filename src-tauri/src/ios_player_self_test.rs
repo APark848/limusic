@@ -45,7 +45,9 @@ pub(crate) fn spawn(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared)
     std::thread::Builder::new()
         .name("ios-player-self-test".to_owned())
         .spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
+            // The loopback origin must run while this driver waits for synchronous plugin calls.
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
                 .enable_io()
                 .enable_time()
                 .build()
@@ -73,9 +75,10 @@ async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared
     let result = run(state.clone(), &data_dir, &result_path, &mut events).await;
     let local_passed = result.is_ok();
     let report = match result {
-        Ok(observed) => serde_json::json!({
+        Ok((observed, timings)) => serde_json::json!({
             "status": "passed",
             "observed": observed,
+            "timings": timings,
         }),
         Err(error) => serde_json::json!({
             "status": "failed",
@@ -95,7 +98,7 @@ async fn run(
     data_dir: &Path,
     result_path: &Path,
     events: &mut UnboundedReceiver<PlayerEvent>,
-) -> anyhow::Result<Vec<&'static str>> {
+) -> anyhow::Result<(Vec<&'static str>, serde_json::Value)> {
     let fixture = data_dir.join("ios-player-self-test.wav");
     write_wav_fixture(&fixture)?;
     let fixture_url = tauri::Url::from_file_path(&fixture)
@@ -104,6 +107,7 @@ async fn run(
     let mut observed = vec!["constructed"];
 
     write_progress(result_path, "loading")?;
+    let startup_started = std::time::Instant::now();
     state
         .player
         .load(&fixture_url, &HashMap::new(), None, None, Some(1.0))
@@ -113,6 +117,7 @@ async fn run(
     write_progress(result_path, "playing-before-ready")?;
     state.player.play().context("play before ready failed")?;
     let duration = wait_for_ready_and_playing(events).await?;
+    let ready_playing_ms = startup_started.elapsed().as_millis() as u64;
     if (duration - FIXTURE_SECONDS).abs() > 0.25 {
         bail!("unexpected fixture duration {duration:.3}s");
     }
@@ -123,6 +128,7 @@ async fn run(
         _ => None,
     })
     .await?;
+    let first_progress_ms = startup_started.elapsed().as_millis() as u64;
     let advanced = wait_for(events, "advancing position", |event| match event {
         PlayerEvent::Position(value) if *value > first + 0.2 => Some(*value),
         _ => None,
@@ -187,6 +193,7 @@ async fn run(
     })
     .await?;
     observed.push("resumed");
+    let resume_progress_ms = resume_started.elapsed().as_millis() as u64;
     let resumed_snapshot = state.player.snapshot().context("resumed snapshot")?;
     if paused_snapshot["epoch"] != resumed_snapshot["epoch"] {
         bail!("resume replaced the current AVPlayerItem");
@@ -210,6 +217,7 @@ async fn run(
     })
     .await?;
     observed.push("stopped");
+    write_progress(result_path, "pause-before-ready")?;
     // A pause that beats item readiness must cancel pending autoplay. No network involved.
     state.player.load(&fixture_url, &HashMap::new(), None, None, None)?;
     state.player.play()?;
@@ -221,13 +229,23 @@ async fn run(
     }
     observed.push("pause-before-ready-retained");
     state.player.stop()?;
-    controlled_transport_test(&state, &fixture, events).await?;
+    controlled_transport_test(&state, &fixture, result_path, events).await?;
     observed.extend([
         "buffered-transport-loss-resume",
         "empty-buffer-pause-intent",
         "transport-reconnect",
     ]);
-    Ok(observed)
+    Ok((
+        observed,
+        serde_json::json!({
+            "environment": "iOS simulator, generated local WAV; not a physical device",
+            "samples": 1,
+            "load_to_ready_and_playing_ms": ready_playing_ms,
+            "load_to_first_progress_ms": first_progress_ms,
+            "resume_to_first_progress_ms": resume_progress_ms,
+            "p95_ms": null,
+        }),
+    ))
 }
 
 /// A loopback HTTP origin serving only our generated PCM fixture. Suspension is controlled by
@@ -280,10 +298,12 @@ async fn fixture_origin(
 async fn controlled_transport_test(
     state: &Arc<AppState>,
     fixture: &Path,
+    result_path: &Path,
     events: &mut UnboundedReceiver<PlayerEvent>,
 ) -> anyhow::Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let bytes = Arc::new(std::fs::read(fixture)?);
+    write_progress(result_path, "http-fixture-loading")?;
     let available = Arc::new(AtomicBool::new(true));
     let (url, server) = fixture_origin(bytes.clone(), available).await?;
     // Always abort the origin, including an early failed assertion.
@@ -309,6 +329,7 @@ async fn controlled_transport_test(
         bail!("HTTP fixture did not buffer enough audio for the offline-resume test");
     }
     drop(origin); // The origin and every connection disappear while paused.
+    write_progress(result_path, "http-origin-removed-resume")?;
     while events.try_recv().is_ok() {}
     let offset = before["position"].as_f64().unwrap_or(0.0);
     state.player.play()?;
@@ -323,17 +344,21 @@ async fn controlled_transport_test(
     state.player.stop()?;
 
     let available = Arc::new(AtomicBool::new(false));
+    write_progress(result_path, "no-data-loading")?;
     let (url, server) = fixture_origin(bytes, available.clone()).await?;
     let _origin = Origin(server);
     while events.try_recv().is_ok() {}
     state.player.load(&url, &HashMap::new(), None, None, None)?;
+    write_progress(result_path, "no-data-playing")?;
     state.player.play()?;
     tokio::time::sleep(Duration::from_millis(250)).await;
+    write_progress(result_path, "no-data-snapshot")?;
     let waiting = state.player.snapshot()?;
     if waiting["playing"] != false || waiting["wantsPlayback"] != true {
         bail!("no-data startup lost its buffering intent");
     }
     state.player.toggle()?; // Uses production intent-based toggle while not actually playing.
+    write_progress(result_path, "no-data-reconnect")?;
     available.store(true, Ordering::SeqCst);
     wait_for(events, "ready after transport restored", |e| match e {
         PlayerEvent::Duration(d) if *d > 0.0 => Some(()),

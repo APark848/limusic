@@ -23,3 +23,8 @@ test('reports nearest-rank p95 only with sufficient samples', () => {
   assert.deepEqual(summarize(log)[0], { metric: 'resume/first-progress', n: 20, p50_ms: 10, p95_ms: 19, min_ms: 1, max_ms: 20 });
   assert.deepEqual(summarize('no timing data'), []);
 });
+
+test('accepts the unquoted tracing display format used by the native bridge', () => {
+  const rows = summarize('iOS AVPlayer stage stage=resume-first-progress elapsed_ms=123.25');
+  assert.equal(rows[0].p50_ms, 123.25);
+});
