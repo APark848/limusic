@@ -2764,6 +2764,24 @@ impl AppState {
             "loading resolved stream into native player"
         );
         #[cfg(target_os = "ios")]
+        {
+            // Enqueue the host's track change before native Play can emit its pause-flag event.
+            // broadcast_playback only sends to the room's unbounded channel; no network I/O.
+            if self.lt.is_host().await {
+                let mut p = Playback::new(PlaybackKind::ChangeTrack);
+                p.track = Some(song_to_track(&item));
+                p.position_ms = (seek.unwrap_or(0.0) * 1000.0) as i64;
+                p.playing = true;
+                p.queue =
+                    Some(q.items.iter().skip(q.current + 1).take(50).map(song_to_track).collect());
+                self.lt.broadcast_playback(p).await;
+            }
+            // A radio request can reserve a generation without this queue lock.
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return false;
+            }
+        }
+        #[cfg(target_os = "ios")]
         self.startup_pending.store(0, Ordering::SeqCst);
         #[cfg(target_os = "ios")]
         self.player.begin_trace(gen, startup_started);
@@ -2794,6 +2812,7 @@ impl AppState {
         // Listen Together host: announce the track before `play`, whose pause-flag change is the
         // room's Play. Sent after, a skip while paused reaches guests as "play" on the old track
         // first. At the position mpv starts at, so a retry or a restored context isn't sent as 0.
+        #[cfg(not(target_os = "ios"))]
         self.lt_broadcast_current_track((seek.unwrap_or(0.0) * 1000.0) as i64, true).await;
         if self.generation.load(Ordering::SeqCst) != gen {
             return false;
