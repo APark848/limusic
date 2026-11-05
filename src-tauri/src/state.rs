@@ -2107,6 +2107,7 @@ impl AppState {
             gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             q.seek_to(index);
             q.lookahead_loaded = None;
+            tracing::info!(generation = gen, radio = q.radio, "manual queue selection");
         }
         // The next mpv tick is seconds away (a resolve has to finish first); until then
         // `current_position` would still report the outgoing track's position.

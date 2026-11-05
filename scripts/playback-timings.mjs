@@ -26,6 +26,10 @@ export function summarize(log) {
       const request = requests.get(id);
       if (request) generations.set(gen, { request, offset: time - request.time + request.ipc });
     }
+    if (id && line.includes('manual queue selection') && /\bradio=true\b/.test(line)) {
+      const request = requests.get(id);
+      if (request?.source === 'queue') request.source = 'radio-queue';
+    }
     if (line.includes('iOS AVPlayer stage')) {
       const stage = line.match(/stage="?([a-z-]+)/)?.[1];
       if (stage === 'resume-first-progress') add('resume/first-progress', number(line, 'elapsed_ms'));

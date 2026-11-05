@@ -28,3 +28,14 @@ test('accepts the unquoted tracing display format used by the native bridge', ()
   const rows = summarize('iOS AVPlayer stage stage=resume-first-progress elapsed_ms=123.25');
   assert.equal(rows[0].p50_ms, 123.25);
 });
+
+test('distinguishes an existing radio row from ordinary queue selection', () => {
+  const rows = summarize(`
+2026-11-05T00:00:00.000Z play_index{request_id=3}: playback command received source=queue ipc_ms=2
+2026-11-05T00:00:00.001Z play_index{request_id=3}: manual queue selection generation=9 radio=true
+2026-11-05T00:00:00.010Z play_index{request_id=3}: playback startup entered generation=9
+2026-11-05T00:00:00.100Z iOS AVPlayer stage stage=load-received generation=Some(9) startup_ms=90
+`);
+  assert.equal(rows[0].metric, 'radio-queue/tap-to-load-received');
+  assert.equal(rows[0].p50_ms, 102);
+});
