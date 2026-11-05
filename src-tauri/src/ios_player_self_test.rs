@@ -173,6 +173,8 @@ async fn run(
     observed.push("seeked");
 
     write_progress(result_path, "resuming")?;
+    let paused_snapshot = state.player.snapshot().context("paused snapshot")?;
+    let resume_started = std::time::Instant::now();
     state.player.play().context("resume failed")?;
     wait_for(events, "resumed", |event| match event {
         PlayerEvent::Playing(true) => Some(()),
@@ -185,6 +187,15 @@ async fn run(
     })
     .await?;
     observed.push("resumed");
+    let resumed_snapshot = state.player.snapshot().context("resumed snapshot")?;
+    if paused_snapshot["epoch"] != resumed_snapshot["epoch"] {
+        bail!("resume replaced the current AVPlayerItem");
+    }
+    tracing::info!(
+        elapsed_ms = resume_started.elapsed().as_millis() as u64,
+        "fixture resume first progress (local WAV; not physical device)"
+    );
+    observed.push("resume-retained-item");
 
     write_progress(result_path, "stopping")?;
     state.player.stop().context("stop failed")?;
@@ -199,6 +210,17 @@ async fn run(
     })
     .await?;
     observed.push("stopped");
+    // A pause that beats item readiness must cancel pending autoplay. No network involved.
+    state.player.load(&fixture_url, &HashMap::new(), None, None, None)?;
+    state.player.play()?;
+    state.player.pause()?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let paused = state.player.snapshot()?;
+    if paused["wantsPlayback"] != false || paused["playing"] != false {
+        bail!("item readiness overrode an intentional pause");
+    }
+    observed.push("pause-before-ready-retained");
+    state.player.stop()?;
     Ok(observed)
 }
 

@@ -69,7 +69,7 @@ pub struct PlaybackPing {
     pub client: String,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ResolveError {
     #[error("no client could resolve a playable stream for {0}")]
     AllClientsFailed(String),

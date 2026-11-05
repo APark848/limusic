@@ -27,6 +27,16 @@ pub(crate) struct Player {
 }
 
 impl Player {
+    #[cfg(all(debug_assertions, feature = "ios-player-self-test"))]
+    pub(crate) fn snapshot(&self) -> Result<serde_json::Value, Error> {
+        self.native.snapshot()
+    }
+    pub(crate) fn invalidate_events(&self) {
+        self.native.invalidate_events();
+    }
+    pub(crate) fn begin_trace(&self, generation: u64, started: std::time::Instant) {
+        self.native.begin_trace(generation, started);
+    }
     pub(crate) fn new(app: &tauri::AppHandle) -> Result<Self, Error> {
         let native = ios_player::IosPlayer::from_manager(app)?;
         let events = native.take_events();
@@ -45,6 +55,10 @@ impl Player {
 
     pub(crate) fn is_idle(&self) -> bool {
         self.native.is_idle()
+    }
+
+    pub(crate) fn wants_playback(&self) -> bool {
+        self.native.wants_playback()
     }
 
     pub(crate) fn set_crossfade(&self, _secs: Option<f64>) {
@@ -129,7 +143,7 @@ impl Player {
     }
 
     pub(crate) fn toggle(&self) -> Result<(), Error> {
-        if self.native.is_playing() {
+        if self.native.wants_playback() {
             self.pause()
         } else {
             self.play()

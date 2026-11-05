@@ -221,9 +221,19 @@ pub(crate) fn spawn_event_pump(
     tauri::async_runtime::spawn(async move {
         let mut throttle = PositionThrottle::new();
         while let Some(event) = events.recv().await {
+            #[cfg(target_os = "ios")]
+            let event = match event {
+                PlayerEvent::Scoped { epoch, event } if ios_player::is_current_event(epoch) => {
+                    *event
+                }
+                PlayerEvent::Scoped { .. } => continue,
+                event => event,
+            };
             #[cfg(all(target_os = "ios", feature = "ios-player-self-test"))]
             crate::ios_player_self_test::observe_event(&event);
             match event {
+                #[cfg(target_os = "ios")]
+                PlayerEvent::Scoped { .. } => unreachable!("events are unwrapped above"),
                 PlayerEvent::Position(position) => {
                     if throttle.should_emit(position, std::time::Instant::now()) {
                         let _ = app.emit("position", serde_json::json!({ "position": position }));
@@ -247,6 +257,11 @@ pub(crate) fn spawn_event_pump(
                     state.media_set_playing(playing);
                     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                     crate::tray::set_playing(&app, playing);
+                }
+                #[cfg(target_os = "ios")]
+                PlayerEvent::Buffering => {
+                    let _ = app.emit("playback-state", "buffering");
+                    state.media_set_playing(false);
                 }
                 PlayerEvent::Paused(paused) => state.lt_on_play_state(!paused).await,
                 PlayerEvent::TrackEnded => state.on_track_ended().await,

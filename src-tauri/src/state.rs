@@ -64,6 +64,13 @@ pub struct AppState {
     /// Bumped on every explicit `play`/jump so superseded async resolves discard their result
     /// (cancellation without JoinHandle bookkeeping). context/06 §6.
     generation: AtomicU64,
+    #[cfg(target_os = "ios")]
+    startup_pending: AtomicU64,
+    #[cfg(target_os = "ios")]
+    playback_resolver: crate::playback_resolve::Resolver<
+        (u64, String, bool, i64, u64),
+        Result<PlaybackData, ResolveError>,
+    >,
     /// Bumped by the `rate` command. [`Self::refresh_rating`] samples it before its round trip
     /// and throws the answer away if it moved: a like landing in that ~400 ms window is newer
     /// than what YouTube was asked, and applying the stale reply would flip the heart back.
@@ -364,6 +371,8 @@ struct QueueState {
 }
 
 struct PreparedTrack {
+    #[cfg(target_os = "ios")]
+    session_stamp: u64,
     epoch: u64,
     index: usize,
     video_id: String,
@@ -458,6 +467,13 @@ fn prepared_identity_matches(
     video_id: &str,
 ) -> bool {
     prepared_epoch == epoch && prepared_index == index && prepared_video_id == video_id
+}
+
+fn prepared_lifetime_valid(age_secs: u64, lifetime_secs: i64, duration_secs: i64) -> bool {
+    // Same full-track horizon as the URL cache; seeks may open a new request at the end.
+    age_secs
+        < u64::try_from(lifetime_secs.saturating_sub(duration_secs.max(0)).saturating_sub(60))
+            .unwrap_or(0)
 }
 
 fn prepared_next_is_current(q: &QueueState) -> bool {
@@ -643,6 +659,10 @@ impl AppState {
             history_pinged: AtomicBool::new(false),
             is_playing: AtomicBool::new(false),
             generation: AtomicU64::new(0),
+            #[cfg(target_os = "ios")]
+            startup_pending: AtomicU64::new(0),
+            #[cfg(target_os = "ios")]
+            playback_resolver: Default::default(),
             rate_epoch: AtomicU64::new(0),
             comments: std::sync::Mutex::new(innertube::CommentsSession::default()),
             pending_seek: std::sync::Mutex::new(None),
@@ -1479,6 +1499,9 @@ impl AppState {
 
         {
             let mut q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return Ok(());
+            }
             // Unplayed manual adds survive a context switch (Spotify semantics): they follow the
             // new track, ahead of its radio (hydration appends behind them).
             let mut carried = upcoming_queued(&q.items, q.current);
@@ -1616,6 +1639,7 @@ impl AppState {
         source_name: Option<String>,
         shuffle: bool,
         continuation: Option<String>,
+        expected_generation: Option<u64>,
     ) {
         if items.is_empty() {
             return;
@@ -1628,9 +1652,13 @@ impl AppState {
         let continuation = continuation.filter(|_| !is_mix(source_id.as_deref()));
         let sticky = self.sticky_shuffle();
         let position = self.current_position();
-        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen;
         let epoch = {
             let mut q = self.queue.lock().await;
+            if expected_generation.is_some_and(|g| self.generation.load(Ordering::SeqCst) != g) {
+                return;
+            }
+            gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             // Explicitly requested by a page Shuffle button, or already on and set to stick
             // across queues (issue #117: off by default, so an album opened while shuffle is on
             // plays in order).
@@ -1654,7 +1682,7 @@ impl AppState {
             q.source_id = source_id.clone();
             q.radio_seed = radio_seed_for(source_id);
             q.source_name = source_name;
-            q.radio = false; // a chosen playlist/album; `start_radio` sets it back on for its own
+            q.radio = expected_generation.is_some(); // a chosen playlist/album; `start_radio` sets it back on for its own
             q.hydrating = None; // a `play_song` radio still in flight is for a queue that's gone
             if keep_shuffled {
                 // Snapshot the real playlist order (for un-shuffle), then play the clicked track
@@ -1720,6 +1748,7 @@ impl AppState {
         {
             return Err("This has no radio behind it.".into());
         }
+        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         let client = self.clients.get(innertube::METADATA_CLIENT).ok_or("no metadata client")?;
         // Resolve the seed to (videoId?, radio playlist id). Album and artist need a page fetch:
         // an album's radio keys off its audio playlist, not its `MPRE…` browseId, and an artist
@@ -1748,6 +1777,9 @@ impl AppState {
         };
 
         let (items, seed) = self.fetch_radio(video_id.as_deref(), &playlist_id).await?;
+        if self.generation.load(Ordering::SeqCst) != gen {
+            return Ok(());
+        }
         let title = name.map(|n| format!("{n} Radio"));
 
         // Radio on the song that's already playing: splice instead of replacing, so the track
@@ -1757,7 +1789,7 @@ impl AppState {
             video_id.is_some() && q.items.get(q.current).map(|i| &i.video_id) == video_id.as_ref()
         };
         if playing_seed && !self.player.is_idle() {
-            self.splice_radio(items, seed, title).await;
+            self.splice_radio(items, seed, title, gen).await;
             return Ok(());
         }
         // The seed song comes back inside the first page (usually first, but the panel decides) —
@@ -1766,8 +1798,7 @@ impl AppState {
             .as_ref()
             .and_then(|v| items.iter().position(|i| &i.video_id == v))
             .unwrap_or(0);
-        self.play_tracks(items, Some(start), Some(seed), title, false, None).await;
-        self.queue.lock().await.radio = true;
+        self.play_tracks(items, Some(start), Some(seed), title, false, None, Some(gen)).await;
         Ok(())
     }
 
@@ -1821,9 +1852,13 @@ impl AppState {
         items: Vec<SongItem>,
         seed: String,
         title: Option<String>,
+        gen: u64,
     ) {
         {
             let mut q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return;
+            }
             if !self.sticky_shuffle() {
                 q.shuffle_orig = None; // a radio is a new context, so a non-sticky shuffle ends here
             }
@@ -1948,6 +1983,17 @@ impl AppState {
         if self.lt.is_guest().await {
             return; // guest playback is host-driven
         }
+        #[cfg(target_os = "ios")]
+        {
+            let _queue = self.queue.lock().await;
+            if self.startup_pending.swap(0, Ordering::SeqCst) != 0 {
+                self.generation.fetch_add(1, Ordering::SeqCst);
+                self.playback_resolver.clear();
+                let _ = self.player.stop();
+                let _ = self.app.emit("playback-state", "paused");
+                return;
+            }
+        }
         if self.player.is_idle() {
             tracing::info!("transport toggle found no native track loaded");
             let (idx, has_items) = {
@@ -2004,12 +2050,13 @@ impl AppState {
             self.emit_guest_hint(); // guest playback is host-driven
             return;
         }
-        let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen;
         {
             let mut q = self.queue.lock().await;
             if index >= q.items.len() {
                 return;
             }
+            gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             q.seek_to(index);
             q.lookahead_loaded = None;
         }
@@ -2265,6 +2312,13 @@ impl AppState {
     /// PoToken-enforced/niche videos playable — before giving up and advancing the queue.
     /// Returns true when the track was retried (so the caller can skip the error toast).
     pub async fn on_track_failed(self: &std::sync::Arc<Self>) -> bool {
+        #[cfg(target_os = "ios")]
+        if !self.player.wants_playback() {
+            // A paused item that becomes terminally failed cannot retain playable bytes, but
+            // it must never resume by itself. Preserve its offset for the user's next Play.
+            self.on_audio_device_lost().await;
+            return false;
+        }
         let (video_id, client, already_retried) = {
             let q = self.queue.lock().await;
             let vid = q.items.get(q.current).map(|i| i.video_id.clone());
@@ -2366,9 +2420,74 @@ impl AppState {
         self.db.evict_stream(&video_id);
     }
 
+    #[cfg(target_os = "ios")]
+    fn playback_session_stamp(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.it.cookie().hash(&mut h);
+        self.it.data_sync_id().hash(&mut h);
+        self.it.visitor_data().hash(&mut h);
+        self.db.get_setting("quality").hash(&mut h);
+        self.db.get_setting("disabled_stream_clients").hash(&mut h);
+        h.finish()
+    }
+
+    #[cfg(target_os = "ios")]
+    async fn resolve_playback(
+        self: &Arc<Self>,
+        item: &SongItem,
+        gen: u64,
+        foreground: bool,
+    ) -> Option<Result<PlaybackData, ResolveError>> {
+        let started = Instant::now();
+        let duration = parse_duration_ms(item.duration.as_deref()) / 1000;
+        let session = self.playback_session_stamp();
+        let request = {
+            let q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return None;
+            }
+            let key = (q.epoch, item.video_id.clone(), item.is_upload, duration, session);
+            let me = self.clone();
+            let item = item.clone();
+            self.playback_resolver.request(key, foreground, async move {
+                me.resolve(&item.video_id, item.is_upload, duration).await
+            })
+        };
+        let (owner, future, reused) = request?;
+        tracing::info!(generation = gen, foreground, reused, "playback resolve admitted");
+        let result = future.await;
+        self.playback_resolver.finish(&owner);
+        if self.playback_session_stamp() != session {
+            return None;
+        }
+        tracing::info!(
+            generation = gen,
+            foreground,
+            reused,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            cancelled = result.is_none(),
+            "playback resolve completed"
+        );
+        result
+    }
+
     /// Resolve + load the current track into mpv (replace). Returns false if resolve failed or the
     /// request was superseded.
     async fn start_current(self: &std::sync::Arc<Self>, gen: u64) -> bool {
+        let result = self.start_current_inner(gen).await;
+        #[cfg(target_os = "ios")]
+        {
+            let _ =
+                self.startup_pending.compare_exchange(gen, 0, Ordering::SeqCst, Ordering::SeqCst);
+            if !result && self.generation.load(Ordering::SeqCst) == gen {
+                let _ = self.app.emit("playback-state", "paused");
+            }
+        }
+        result
+    }
+
+    async fn start_current_inner(self: &Arc<Self>, gen: u64) -> bool {
         let startup_started = Instant::now();
         tracing::info!(generation = gen, "playback startup entered");
         // Resolve the current track, auto-skipping any that no client can play (dead / region-locked
@@ -2379,10 +2498,31 @@ impl AppState {
                 return false; // user moved on
             }
             let Some(item) = self.current_item().await else { return false };
+            #[cfg(target_os = "ios")]
+            {
+                let q = self.queue.lock().await;
+                if self.generation.load(Ordering::SeqCst) != gen {
+                    return false;
+                }
+                // Acknowledgement is metadata and loading intent, never evidence of audio.
+                self.startup_pending.store(gen, Ordering::SeqCst);
+                self.player.invalidate_events();
+                let _ = self.player.stop();
+                let _ = self.app.emit("playback-intent", Self::now_playing_json(&item, "loading"));
+                let _ = self.app.emit("playback-state", "buffering");
+                drop(q);
+            }
             tracing::info!(video_id = %item.video_id, "resolving current track");
             let prepared = {
                 let mut q = self.queue.lock().await;
+                if self.generation.load(Ordering::SeqCst) != gen {
+                    return false;
+                }
                 let matches = q.prepared_next.as_ref().is_some_and(|prepared| {
+                    #[cfg(target_os = "ios")]
+                    if prepared.session_stamp != self.playback_session_stamp() {
+                        return false;
+                    }
                     prepared_identity_matches(
                         prepared.epoch,
                         prepared.index,
@@ -2390,10 +2530,16 @@ impl AppState {
                         q.epoch,
                         q.current,
                         &item.video_id,
-                    ) && prepared.resolved_at.elapsed().as_secs()
-                        < u64::try_from(prepared.data.expires_in_seconds.saturating_sub(60))
-                            .unwrap_or(0)
+                    ) && prepared_lifetime_valid(
+                        prepared.resolved_at.elapsed().as_secs(),
+                        prepared.data.expires_in_seconds,
+                        parse_duration_ms(item.duration.as_deref()) / 1000,
+                    )
                 });
+                #[cfg(target_os = "ios")]
+                if matches {
+                    self.playback_resolver.clear();
+                }
                 matches.then(|| q.prepared_next.take().expect("prepared entry was present"))
             };
             let resolved = if let Some(prepared) = prepared {
@@ -2404,6 +2550,14 @@ impl AppState {
                 );
                 Ok(prepared.data)
             } else {
+                #[cfg(target_os = "ios")]
+                {
+                    let Some(result) = self.resolve_playback(&item, gen, true).await else {
+                        return false;
+                    };
+                    result
+                }
+                #[cfg(not(target_os = "ios"))]
                 self.resolve(
                     &item.video_id,
                     item.is_upload,
@@ -2437,6 +2591,9 @@ impl AppState {
                 Err(ResolveError::LocalMissing(_)) => {
                     let exhausted = {
                         let mut q = self.queue.lock().await;
+                        if self.generation.load(Ordering::SeqCst) != gen {
+                            return false;
+                        }
                         let cur = q.current;
                         if cur < q.items.len() {
                             q.items.remove(cur);
@@ -2471,6 +2628,9 @@ impl AppState {
                 }
                 Err(e) => {
                     let mut q = self.queue.lock().await;
+                    if self.generation.load(Ordering::SeqCst) != gen {
+                        return false;
+                    }
                     // Deliberately ignores repeat-all: wrapping the unplayable-skip would spin
                     // forever on a queue where nothing resolves. Skips stop at the tail.
                     if q.current + 1 >= q.items.len() {
@@ -2508,11 +2668,16 @@ impl AppState {
             .duration_trusted
             .then(|| data.duration.as_deref().and_then(parse_positive_seconds))
             .flatten();
+        // Revalidate after acquiring the queue lock. No await between this check and native
+        // load/play: a late resolver cannot install itself over a newer queue selection.
+        let mut q = self.queue.lock().await;
+        if self.generation.load(Ordering::SeqCst) != gen
+            || q.items.get(q.current).map(|i| &i.video_id) != Some(&item.video_id)
         {
-            let mut q = self.queue.lock().await;
-            q.expected_duration = expected_duration;
-            q.duration = 0.0;
+            return false;
         }
+        q.expected_duration = expected_duration;
+        q.duration = 0.0;
         let mut header_names: Vec<&str> = data.headers.keys().map(String::as_str).collect();
         header_names.sort_unstable();
         tracing::info!(
@@ -2523,6 +2688,10 @@ impl AppState {
             elapsed_ms = startup_started.elapsed().as_millis() as u64,
             "loading resolved stream into native player"
         );
+        #[cfg(target_os = "ios")]
+        self.startup_pending.store(0, Ordering::SeqCst);
+        #[cfg(target_os = "ios")]
+        self.player.begin_trace(gen, startup_started);
         #[cfg(target_os = "ios")]
         let load_result = self.player.load(
             &stream_url,
@@ -2540,12 +2709,22 @@ impl AppState {
             self.emit_error(&item.video_id, &error);
             return false;
         }
+        #[cfg(target_os = "ios")]
+        if let Err(error) = self.player.play().map_err(|e| e.to_string()) {
+            self.emit_error(&item.video_id, &error);
+            return false;
+        }
+        drop(q);
         tracing::info!(video_id = %item.video_id, "native player load command completed");
         // Listen Together host: announce the track before `play`, whose pause-flag change is the
         // room's Play. Sent after, a skip while paused reaches guests as "play" on the old track
         // first. At the position mpv starts at, so a retry or a restored context isn't sent as 0.
         self.lt_broadcast_current_track((seek.unwrap_or(0.0) * 1000.0) as i64, true).await;
+        if self.generation.load(Ordering::SeqCst) != gen {
+            return false;
+        }
         tracing::info!(video_id = %item.video_id, "sending play command to native player");
+        #[cfg(not(target_os = "ios"))]
         if let Err(e) = self.player.play() {
             tracing::warn!(video_id = %item.video_id, category = "player-play", error = %e, "playback startup failed");
             self.emit_error(&item.video_id, &e.to_string());
@@ -2568,6 +2747,9 @@ impl AppState {
         self.attach_video(&item.video_id, item.is_video, &stream_url);
         {
             let mut q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return false;
+            }
             q.current_client = Some(data.stream_client.clone());
             q.current_loudness_db = data.loudness_db;
             // Fresh play → fresh history state (context/01 §registerPlayback).
@@ -2596,6 +2778,7 @@ impl AppState {
         // will announce it (see `Player::is_playing`). Say so ourselves — otherwise MPRIS and
         // Discord never learn the track started. After `emit_now_playing`, so the new track is the
         // current one before anything renders it as playing.
+        #[cfg(not(target_os = "ios"))]
         self.media_set_playing(true);
         self.emit_queue().await;
         self.persist_queue().await;
@@ -2761,7 +2944,7 @@ impl AppState {
     /// prime requests cannot bypass the backoff or spend the same attempt twice.
     #[cfg(target_os = "ios")]
     async fn try_prepare_ios_lookahead(
-        &self,
+        self: &Arc<Self>,
         identity: &std::sync::Arc<PreparedIdentity>,
         is_upload: bool,
         duration_secs: i64,
@@ -2787,7 +2970,18 @@ impl AppState {
             generation = identity.generation,
             "iOS next-track preparation started"
         );
-        let data = match self.resolve(&identity.video_id, is_upload, duration_secs).await {
+        let item = SongItem {
+            video_id: identity.video_id.clone(),
+            is_upload,
+            duration: Some(format!("{}:{}", duration_secs / 60, duration_secs % 60)),
+            ..Default::default()
+        };
+        let Some(resolved) = self.resolve_playback(&item, identity.generation, false).await else {
+            let mut q = self.queue.lock().await;
+            finish_preparation(&mut q, identity);
+            return false;
+        };
+        let data = match resolved {
             Ok(data) => data,
             Err(error) => {
                 let retry = {
@@ -2843,6 +3037,7 @@ impl AppState {
         q.preparation_failures = 0;
         q.preparation_identity = Some(identity.as_ref().clone());
         q.prepared_next = Some(PreparedTrack {
+            session_stamp: self.playback_session_stamp(),
             epoch: identity.epoch,
             index: identity.index,
             video_id: identity.video_id.clone(),
@@ -3051,6 +3246,7 @@ impl AppState {
 
     fn emit_now_playing(&self, item: &SongItem, stream_client: &str) {
         let _ = self.app.emit("now-playing", Self::now_playing_json(item, stream_client));
+        #[cfg(not(target_os = "ios"))]
         let _ = self.app.emit("playback-state", "playing");
         // Push the same metadata to the OS media widget (context/16) and Discord.
         if let Some(m) = &self.media {
@@ -3767,6 +3963,8 @@ impl AppState {
     /// Clear both cache tiers (settings "Clear caches"): the SQLite URL cache + mpv's on-disk
     /// audio bytes. Best-effort on the files — the current track may re-buffer. context/14.
     pub fn clear_caches(&self) {
+        #[cfg(target_os = "ios")]
+        self.playback_resolver.clear();
         self.db.clear_stream_cache();
         // The stored PoToken is a cache too, and "clear caches" is where someone goes when
         // playback has started behaving oddly. Dropping it costs one BotGuard bootstrap.
@@ -5224,6 +5422,16 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_url_must_outlive_the_selected_track_and_seek_margin() {
+        use super::prepared_lifetime_valid as valid;
+        assert!(valid(0, 361, 300));
+        assert!(!valid(1, 361, 300));
+        assert!(!valid(0, 60, 0));
+        assert!(!valid(0, -1, 300));
+        assert!(!valid(0, 1800, 3600));
+        assert!(valid(20, 7200, 3600));
+    }
     use super::{
         append_page, backfill_metadata, begin_preparation, cache_horizon, cached_duration_metadata,
         clear_stale_preparation, drop_duplicates, enqueue_at, fail_preparation, finish_preparation,

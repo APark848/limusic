@@ -17,7 +17,7 @@ fn supported_stream_header(name: &str) -> bool {
 mod mobile;
 
 #[cfg(target_os = "ios")]
-pub use mobile::{Error, IosPlayer, PlayerEvent, Result};
+pub use mobile::{is_current_event, Error, IosPlayer, PlayerEvent, Result};
 
 /// Register the Swift package with Tauri. The generated Xcode project discovers it from this
 /// crate's `ios/Package.swift`; generated Apple files never need to be edited or committed.

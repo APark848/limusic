@@ -1,9 +1,10 @@
 import AVFoundation
 import Foundation
+import Network
 import Tauri
 
 @_silgen_name("limusic_ios_player_emit")
-private func emitToRust(_ kind: UInt32, _ value: Double, _ message: UnsafePointer<CChar>?)
+private func emitToRust(_ kind: UInt32, _ value: Double, _ message: UnsafePointer<CChar>?, _ epoch: UInt64)
 
 private enum EventKind {
   static let position: UInt32 = 0
@@ -14,9 +15,11 @@ private enum EventKind {
   static let failed: UInt32 = 5
   static let error: UInt32 = 6
   static let diagnostic: UInt32 = 7
+  static let buffering: UInt32 = 8
 }
 
 private struct LoadArgs: Decodable {
+  let epoch: UInt64
   let url: String
   let headers: [String: String]
   let start: Double?
@@ -42,6 +45,7 @@ private struct LoopArgs: Decodable {
 }
 
 final class LimusicPlayerPlugin: Plugin {
+  private var eventEpoch: UInt64 = 0
   private let player = AVPlayer()
   private var periodicObserver: Any?
   private var statusObservation: NSKeyValueObservation?
@@ -61,16 +65,22 @@ final class LimusicPlayerPlugin: Plugin {
   private var preparedURL: String?
   private var preparedHeaders: [String: String]?
   private var preparedExpectedDuration: Double?
+  private let networkMonitor = NWPathMonitor()
+  private var networkMonitoringStarted = false
+  private var wasOffline = false
+  private var resumeStartedAt: Double?
+  private var progressBaseline: Double = 0
 
   deinit {
+    networkMonitor.cancel()
     removeObservers()
   }
 
   private func emit(_ kind: UInt32, value: Double = 0, message: String? = nil) {
     if let message {
-      message.withCString { emitToRust(kind, value, $0) }
+      message.withCString { emitToRust(kind, value, $0, eventEpoch) }
     } else {
-      emitToRust(kind, value, nil)
+      emitToRust(kind, value, nil, eventEpoch)
     }
   }
 
@@ -120,6 +130,35 @@ final class LimusicPlayerPlugin: Plugin {
       EventKind.diagnostic,
       value: max(0, (CFAbsoluteTimeGetCurrent() - loadStartedAt) * 1000),
       message: stage)
+  }
+
+  private func monitorConnectivity() {
+    guard !networkMonitoringStarted else { return }
+    networkMonitoringStarted = true
+    networkMonitor.pathUpdateHandler = { [weak self] path in
+      DispatchQueue.main.async {
+        guard let self else { return }
+        let reconnected = self.wasOffline && path.status == .satisfied
+        self.wasOffline = path.status != .satisfied
+        // A path change is not an item failure. Keep the item, timestamp and pause intent.
+        if reconnected, self.wantsPlayback, let item = self.player.currentItem,
+          item.status == .readyToPlay, self.player.timeControlStatus != .playing {
+          self.startPlaybackIfReady(item, stage: "network-restored-resume")
+        }
+      }
+    }
+    networkMonitor.start(queue: DispatchQueue(label: "LimusicConnectivity"))
+  }
+
+  private func bufferedAhead(_ item: AVPlayerItem) -> Double {
+    let position = player.currentTime().seconds
+    guard position.isFinite else { return 0 }
+    return item.loadedTimeRanges.reduce(0) { best, value in
+      let range = value.timeRangeValue
+      let start = range.start.seconds
+      let end = CMTimeRangeGetEnd(range).seconds
+      return start <= position && end > position ? max(best, end - position) : best
+    }
   }
 
   private func clearPreparedAsset() {
@@ -230,16 +269,23 @@ final class LimusicPlayerPlugin: Plugin {
     periodicObserver = player.addPeriodicTimeObserver(
       forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
       queue: .main
-    ) { [weak self] time in
+    ) { [weak self, weak item] time in
+      guard let self, let item, item === self.player.currentItem else { return }
       let seconds = time.seconds
       if seconds.isFinite {
-        self?.emit(EventKind.position, value: max(0, seconds))
-        if let self, seconds > 0, !self.firstProgressEmitted {
+        self.emit(EventKind.position, value: max(0, seconds))
+        if self.player.timeControlStatus == .playing, seconds > self.progressBaseline + 0.01,
+          !self.firstProgressEmitted {
           self.firstProgressEmitted = true
           self.diagnostic("first-playback-progress")
         }
-        if let self,
-          self.usesExpectedDuration,
+        if let started = self.resumeStartedAt, self.player.timeControlStatus == .playing,
+          seconds > self.progressBaseline + 0.01 {
+          self.emit(EventKind.diagnostic, value: (CFAbsoluteTimeGetCurrent() - started) * 1000,
+            message: "resume-first-progress")
+          self.resumeStartedAt = nil
+        }
+        if self.usesExpectedDuration,
           let expected = self.expectedDuration,
           seconds >= expected
         {
@@ -294,6 +340,7 @@ final class LimusicPlayerPlugin: Plugin {
       case .paused:
         if self.wantsPlayback {
           self.diagnostic("time-control-paused-with-playback-intent")
+          self.emit(EventKind.buffering)
         } else {
           self.diagnostic("time-control-paused")
           self.emit(EventKind.playing, value: 0)
@@ -308,6 +355,7 @@ final class LimusicPlayerPlugin: Plugin {
         default: reason = "unspecified"
         }
         self.diagnostic("time-control-waiting-\(reason)")
+        if self.wantsPlayback { self.emit(EventKind.buffering) }
       @unknown default:
         self.diagnostic("time-control-unknown")
       }
@@ -334,8 +382,14 @@ final class LimusicPlayerPlugin: Plugin {
     ) { [weak self] notification in
       guard let self else { return }
       guard item === self.player.currentItem else { return }
-      self.wantsPlayback = false
       let error = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? Error
+      if item.status != .failed, let error = error as NSError?, error.domain == NSURLErrorDomain {
+        // A recoverable transport interruption must not trigger Rust's replace/re-resolve path.
+        self.diagnostic("network-interrupted-item-retained")
+        if self.wantsPlayback { self.emit(EventKind.buffering) }
+        return
+      }
+      self.wantsPlayback = false
       self.emitFailure(self.safeFailure(error, fallback: "AVPlayer failed before the track ended"))
     }
 
@@ -364,12 +418,22 @@ final class LimusicPlayerPlugin: Plugin {
       invoke.reject("Playback requires an HTTP or HTTPS stream URL")
       return
     }
-    let freshAsset = try makeAsset(url: url, headers: args.headers)
     let start = args.start
 
     resolveOnMain(invoke) { [weak self] in
       guard let self else { return }
+      let canUsePrepared = self.preparedAsset != nil && self.preparedURL == args.url
+        && self.preparedHeaders == args.headers
+        && self.preparedExpectedDuration == args.expectedDuration
+      let asset: AVURLAsset
+      if canUsePrepared {
+        asset = self.preparedAsset!
+      } else {
+        asset = try self.makeAsset(url: url, headers: args.headers)
+      }
+      self.monitorConnectivity()
       self.removeObservers()
+      self.eventEpoch = args.epoch
       self.wantsPlayback = false
       self.failureEmitted = false
       self.expectedDuration = args.expectedDuration
@@ -378,11 +442,9 @@ final class LimusicPlayerPlugin: Plugin {
       self.authoritativeBoundaryHandled = false
       self.loadStartedAt = CFAbsoluteTimeGetCurrent()
       self.firstProgressEmitted = false
+      self.progressBaseline = start ?? 0
+      self.resumeStartedAt = nil
       self.diagnostic("load-received")
-      let canUsePrepared = self.preparedURL == args.url
-        && self.preparedHeaders == args.headers
-        && self.preparedExpectedDuration == args.expectedDuration
-      let asset = canUsePrepared ? self.preparedAsset! : freshAsset
       self.diagnostic(canUsePrepared ? "prepared-asset-consumed" : "fresh-asset-installed")
       self.clearPreparedAsset()
       let item = AVPlayerItem(asset: asset)
@@ -448,6 +510,8 @@ final class LimusicPlayerPlugin: Plugin {
       try session.setActive(true)
       self.diagnostic("audio-session-active")
       self.wantsPlayback = true
+      self.emit(EventKind.paused, value: 0)
+      self.emit(EventKind.buffering)
       if let item = self.player.currentItem {
         if item.status == .failed {
           self.wantsPlayback = false
@@ -459,7 +523,18 @@ final class LimusicPlayerPlugin: Plugin {
                 self.safeFailure(item.error, fallback: "AVPlayer could not play this track")
             ])
         }
-        self.startPlaybackIfReady(item, stage: "play-requested")
+        if self.firstProgressEmitted {
+          self.resumeStartedAt = CFAbsoluteTimeGetCurrent()
+          self.progressBaseline = self.player.currentTime().seconds
+        }
+        if self.firstProgressEmitted, item.status == .readyToPlay, self.bufferedAhead(item) >= 0.25 {
+          // A resume explicitly asks to use existing bytes. Keep automatic stall management for
+          // ordinary startup and subsequent underruns; do not lower the global buffer target.
+          self.player.playImmediately(atRate: 1)
+          self.diagnostic("resume-buffered-item")
+        } else {
+          self.startPlaybackIfReady(item, stage: "play-requested")
+        }
       }
     }
   }
@@ -515,6 +590,21 @@ final class LimusicPlayerPlugin: Plugin {
       self?.loopsCurrentItem = args.enabled
     }
   }
+
+  #if DEBUG
+  @objc public func snapshot(_ invoke: Invoke) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
+      invoke.resolve([
+        "epoch": self.eventEpoch,
+        "position": self.player.currentTime().seconds.isFinite ? self.player.currentTime().seconds : 0,
+        "bufferedAhead": self.player.currentItem.map { self.bufferedAhead($0) } ?? 0,
+        "wantsPlayback": self.wantsPlayback,
+        "playing": self.player.timeControlStatus == .playing,
+      ])
+    }
+  }
+  #endif
 }
 
 @_cdecl("init_plugin_limusic_player")

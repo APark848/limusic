@@ -1,5 +1,5 @@
 use std::ffi::{c_char, CStr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
@@ -27,9 +27,11 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerEvent {
+    Scoped { epoch: u64, event: Box<PlayerEvent> },
     Position(f64),
     Duration(f64),
     Playing(bool),
+    Buffering,
     Paused(bool),
     TrackEnded,
     TrackFailed(String),
@@ -42,7 +44,14 @@ pub enum PlayerEvent {
 static EVENT_TX: OnceLock<Mutex<Option<UnboundedSender<PlayerEvent>>>> = OnceLock::new();
 static IDLE: AtomicBool = AtomicBool::new(true);
 static PLAYING: AtomicBool = AtomicBool::new(false);
+static WANTS_PLAYBACK: AtomicBool = AtomicBool::new(false);
 static REPORTED_PROGRESS: AtomicBool = AtomicBool::new(false);
+static TRACE: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
+static EVENT_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub fn is_current_event(epoch: u64) -> bool {
+    EVENT_EPOCH.load(Ordering::SeqCst) == epoch
+}
 
 fn event_sink() -> &'static Mutex<Option<UnboundedSender<PlayerEvent>>> {
     EVENT_TX.get_or_init(|| Mutex::new(None))
@@ -63,7 +72,15 @@ fn send_event(event: PlayerEvent) {
 /// `message`, when non-null, must point to a NUL-terminated UTF-8 string that remains valid for
 /// the duration of this call. The Swift bridge satisfies that contract with `withCString`.
 #[no_mangle]
-pub unsafe extern "C" fn limusic_ios_player_emit(kind: u32, value: f64, message: *const c_char) {
+pub unsafe extern "C" fn limusic_ios_player_emit(
+    kind: u32,
+    value: f64,
+    message: *const c_char,
+    epoch: u64,
+) {
+    if !is_current_event(epoch) {
+        return;
+    }
     let message = if message.is_null() {
         String::new()
     } else {
@@ -71,7 +88,10 @@ pub unsafe extern "C" fn limusic_ios_player_emit(kind: u32, value: f64, message:
     };
 
     if kind == 7 {
-        tracing::info!(stage = %message, elapsed_ms = value, "iOS AVPlayer stage");
+        let trace = *TRACE.lock().unwrap();
+        tracing::info!(stage = %message, elapsed_ms = value,
+            generation = trace.map(|t| t.0),
+            startup_ms = trace.map(|t| t.1.elapsed().as_millis() as u64), "iOS AVPlayer stage");
         return;
     }
 
@@ -92,7 +112,14 @@ pub unsafe extern "C" fn limusic_ios_player_emit(kind: u32, value: f64, message:
             PLAYING.store(playing, Ordering::SeqCst);
             PlayerEvent::Playing(playing)
         }
-        3 => PlayerEvent::Paused(value != 0.0),
+        3 => {
+            WANTS_PLAYBACK.store(value == 0.0, Ordering::SeqCst);
+            PlayerEvent::Paused(value != 0.0)
+        }
+        8 => {
+            PLAYING.store(false, Ordering::SeqCst);
+            PlayerEvent::Buffering
+        }
         4 => {
             PLAYING.store(false, Ordering::SeqCst);
             IDLE.store(true, Ordering::SeqCst);
@@ -110,7 +137,7 @@ pub unsafe extern "C" fn limusic_ios_player_emit(kind: u32, value: f64, message:
         }
         _ => PlayerEvent::Error(format!("unknown iOS player event {kind}")),
     };
-    send_event(event);
+    send_event(PlayerEvent::Scoped { epoch, event: Box::new(event) });
 }
 
 pub struct IosPlayer<R: Runtime>(PluginHandle<R>);
@@ -131,6 +158,7 @@ pub(crate) fn init<R: Runtime, C: serde::de::DeserializeOwned>(
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadArgs<'a> {
+    epoch: u64,
     url: &'a str,
     headers: &'a std::collections::HashMap<String, String>,
     start: Option<f64>,
@@ -161,6 +189,17 @@ struct LoopArgs {
 }
 
 impl<R: Runtime> IosPlayer<R> {
+    #[cfg(debug_assertions)]
+    pub fn snapshot(&self) -> Result<serde_json::Value> {
+        self.0.run_mobile_plugin("snapshot", ()).map_err(Into::into)
+    }
+    pub fn invalidate_events(&self) {
+        EVENT_EPOCH.fetch_add(1, Ordering::SeqCst);
+    }
+    pub fn begin_trace(&self, generation: u64, started: std::time::Instant) {
+        *TRACE.lock().unwrap() = Some((generation, started));
+        tracing::info!(generation, "native playback trace assigned");
+    }
     pub fn from_manager(manager: &impl Manager<R>) -> Result<Self> {
         manager.try_state::<Self>().map(|state| state.inner().clone()).ok_or(Error::NotRegistered)
     }
@@ -200,8 +239,11 @@ impl<R: Runtime> IosPlayer<R> {
         let mut header_names: Vec<&str> = headers.keys().map(String::as_str).collect();
         header_names.sort_unstable();
         tracing::info!(headers = ?header_names, has_start = start.is_some(), "calling Swift player load");
-        self.0
-            .run_mobile_plugin::<()>("load", LoadArgs { url, headers, start, expected_duration })?;
+        let epoch = EVENT_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+        self.0.run_mobile_plugin::<()>(
+            "load",
+            LoadArgs { epoch, url, headers, start, expected_duration },
+        )?;
         tracing::info!("Swift player load returned successfully");
         IDLE.store(false, Ordering::SeqCst);
         PLAYING.store(false, Ordering::SeqCst);
@@ -237,18 +279,21 @@ impl<R: Runtime> IosPlayer<R> {
     pub fn play(&self) -> Result<()> {
         tracing::info!("calling Swift player play");
         self.0.run_mobile_plugin::<()>("play", ())?;
+        WANTS_PLAYBACK.store(true, Ordering::SeqCst);
         tracing::info!("Swift player play returned successfully; awaiting AVPlayer state callback");
         Ok(())
     }
 
     pub fn pause(&self) -> Result<()> {
         self.0.run_mobile_plugin::<()>("pause", ())?;
+        WANTS_PLAYBACK.store(false, Ordering::SeqCst);
         PLAYING.store(false, Ordering::SeqCst);
         Ok(())
     }
 
     pub fn stop(&self) -> Result<()> {
         self.0.run_mobile_plugin::<()>("stop", ())?;
+        WANTS_PLAYBACK.store(false, Ordering::SeqCst);
         PLAYING.store(false, Ordering::SeqCst);
         IDLE.store(true, Ordering::SeqCst);
         Ok(())
@@ -278,5 +323,9 @@ impl<R: Runtime> IosPlayer<R> {
 
     pub fn is_playing(&self) -> bool {
         PLAYING.load(Ordering::SeqCst)
+    }
+
+    pub fn wants_playback(&self) -> bool {
+        WANTS_PLAYBACK.load(Ordering::SeqCst)
     }
 }

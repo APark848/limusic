@@ -6,7 +6,7 @@ name: iOS validation
 on:
   workflow_dispatch:
   pull_request:
-    branches: [master]
+    branches: [master, ios-playback-smoothness]
   push:
     branches: [master]
 
@@ -41,7 +41,11 @@ jobs:
 
       - name: Frontend build
         working-directory: ui
-        run: pnpm build
+        run: |
+          pnpm check
+          pnpm test
+          pnpm build
+          node --test ../scripts/playback-timings.test.mjs
 
       - uses: dtolnay/rust-toolchain@stable
         with:
