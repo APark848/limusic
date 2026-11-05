@@ -98,6 +98,12 @@
 			return;
 		}
 		if (now.videoId === requested) return;
+		if (now.streamClient === 'loading') {
+			requested = '';
+			lyrics = null;
+			loading = true;
+			return;
+		}
 		const id = (requested = now.videoId);
 		loading = true;
 		lyrics = null;
@@ -198,7 +204,7 @@
 
 	$effect(() => {
 		const pos = playback.position;
-		if (playback.paused || !needsFrameClock) {
+		if (playback.paused || playback.buffering || !needsFrameClock) {
 			interpolatedPosSecs = pos;
 			return;
 		}

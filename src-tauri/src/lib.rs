@@ -48,6 +48,8 @@ mod notify;
 use platform::mobile_services::notify;
 mod orchestrator;
 mod platform;
+#[cfg(any(target_os = "ios", test))]
+mod playback_resolve;
 mod potoken;
 mod romanize;
 mod session;

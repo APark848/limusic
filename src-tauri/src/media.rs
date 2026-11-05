@@ -318,7 +318,7 @@ pub(crate) fn handle_event(app: &AppHandle, event: MediaControlEvent) {
             MediaControlEvent::Play => state.resume().await,
             MediaControlEvent::Toggle => state.resume_or_toggle().await,
             MediaControlEvent::Pause | MediaControlEvent::Stop => {
-                let _ = state.player.pause();
+                state.pause().await;
             }
             // GNOME's panel media widget calls MPRIS Raise when the entry itself is clicked.
             #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]

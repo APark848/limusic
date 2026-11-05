@@ -767,15 +767,20 @@
 				<button
 					type="button"
 					onclick={() => api.togglePause()}
+					aria-busy={playback.buffering}
 					class="flex h-14 w-14 items-center justify-center rounded-full bg-primary text-primary-foreground active:opacity-80"
 					aria-label={playback.paused ? t('player.play') : t('player.pause')}
 				>
+					{#if playback.buffering}
+						<span class="h-7 w-7 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" aria-label="Buffering"></span>
+					{:else}
 					<HugeiconsIcon
 						icon={PauseIcon}
 						altIcon={PlayIcon}
 						showAlt={playback.paused}
 						class="h-7 w-7"
 					/>
+					{/if}
 				</button>
 				<button
 					type="button"

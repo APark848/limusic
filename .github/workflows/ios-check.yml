@@ -6,7 +6,7 @@ name: iOS validation
 on:
   workflow_dispatch:
   pull_request:
-    branches: [master]
+    branches: [master, ios-playback-smoothness]
   push:
     branches: [master]
 
@@ -41,7 +41,11 @@ jobs:
 
       - name: Frontend build
         working-directory: ui
-        run: pnpm build
+        run: |
+          pnpm check
+          pnpm test
+          pnpm build
+          node --test ../scripts/playback-timings.test.mjs
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -147,6 +151,12 @@ jobs:
           capture_failure() {
             set +e
             echo "Capturing simulator diagnostics after launch failure"
+            if [ -n "${persistent_log:-}" ] && [ -f "$persistent_log" ]; then
+              cp "$persistent_log" "$diagnostics_dir/limusic.log"
+            fi
+            if [ -n "${app_pid:-}" ]; then
+              sample "$app_pid" 3 -file "$diagnostics_dir/process-sample.txt" 2>/dev/null
+            fi
             xcrun simctl spawn "$simulator_udid" log show \
               --style compact --last 3m \
               --predicate 'process == "limusic" OR eventMessage CONTAINS[c] "com.limusic.desktop"' \
@@ -340,6 +350,7 @@ jobs:
             fail "Limusic exited after the remote-stream self-test (pid $app_pid)"
           fi
           trap - ERR
+          cp "$persistent_log" "$diagnostics_dir/limusic.log"
 
       - name: Preserve iOS generation and build logs
         if: ${{ always() }}

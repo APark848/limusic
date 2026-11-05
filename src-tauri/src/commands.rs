@@ -19,6 +19,26 @@ use crate::state::{
 
 type St<'a> = State<'a, Arc<AppState>>;
 
+/// Only numeric timing data crosses this boundary; never URLs or song titles.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybackTrace {
+    id: u64,
+    tapped_at: u64,
+}
+
+fn log_playback_command(trace: &Option<PlaybackTrace>, source: &'static str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    tracing::info!(
+        source,
+        ipc_ms = trace.as_ref().map(|t| now.saturating_sub(t.tapped_at)),
+        "playback command received"
+    );
+}
+
 /// `record_history`: true only for a query the user submitted. A typeahead preview passes false and
 /// goes out unauthenticated, so half-typed prefixes never reach the account's search history (#203).
 #[tauri::command]
@@ -83,7 +103,13 @@ pub async fn search_cards(
 /// Play a track (from a search result). The UI passes the full item so we can seed the queue
 /// with its metadata without another round-trip.
 #[tauri::command]
-pub async fn play(state: St<'_>, item: SongItem) -> Result<(), String> {
+#[tracing::instrument(skip_all, fields(request_id = trace.as_ref().map(|t| t.id).unwrap_or(0)))]
+pub async fn play(
+    state: St<'_>,
+    item: SongItem,
+    trace: Option<PlaybackTrace>,
+) -> Result<(), String> {
+    log_playback_command(&trace, "song");
     let started = std::time::Instant::now();
     tracing::info!(video_id = %item.video_id, "play command received");
     let state = state.inner().clone();
@@ -101,7 +127,13 @@ pub async fn play(state: St<'_>, item: SongItem) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn play_index(state: St<'_>, index: usize) -> Result<(), String> {
+#[tracing::instrument(skip_all, fields(request_id = trace.as_ref().map(|t| t.id).unwrap_or(0)))]
+pub async fn play_index(
+    state: St<'_>,
+    index: usize,
+    trace: Option<PlaybackTrace>,
+) -> Result<(), String> {
+    log_playback_command(&trace, "queue");
     let state = state.inner().clone();
     state.play_index(index).await;
     Ok(())
@@ -1480,6 +1512,7 @@ pub async fn get_browse_grid(
 /// page's next-page token when it has one: pass the tracks that are loaded and the backend walks
 /// the rest into the queue in the background, so playback starts on page 1.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(request_id = trace.as_ref().map(|t| t.id).unwrap_or(0)))]
 pub async fn play_playlist(
     state: St<'_>,
     items: Vec<SongItem>,
@@ -1488,10 +1521,20 @@ pub async fn play_playlist(
     source_name: Option<String>,
     shuffle: Option<bool>,
     continuation: Option<String>,
+    trace: Option<PlaybackTrace>,
 ) -> Result<(), String> {
+    log_playback_command(&trace, "playlist");
     let state = state.inner().clone();
     state
-        .play_tracks(items, start, source_id, source_name, shuffle.unwrap_or(false), continuation)
+        .play_tracks(
+            items,
+            start,
+            source_id,
+            source_name,
+            shuffle.unwrap_or(false),
+            continuation,
+            None,
+        )
         .await;
     Ok(())
 }
@@ -1503,12 +1546,15 @@ pub async fn play_playlist(
 /// Starting a song radio on the track that's already playing keeps it playing and replaces only
 /// what comes after it; every other case replaces the queue.
 #[tauri::command]
+#[tracing::instrument(skip_all, fields(request_id = trace.as_ref().map(|t| t.id).unwrap_or(0)))]
 pub async fn start_radio(
     state: St<'_>,
     kind: String,
     id: String,
     name: Option<String>,
+    trace: Option<PlaybackTrace>,
 ) -> Result<(), String> {
+    log_playback_command(&trace, "radio");
     let state = state.inner().clone();
     state.start_radio(&kind, &id, name).await
 }

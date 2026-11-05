@@ -27,6 +27,7 @@ export const playback = $state({
 	now: null as NowPlaying | null,
 	queue: { items: [], currentIndex: 0 } as QueueState,
 	paused: false,
+	buffering: false,
 	position: 0,
 	/** `performance.now()` when `position` last arrived. Ticks land at ~4 Hz, so `position` on its
 	 *  own is a sample up to 250 ms old; anything that has to line up with the audio *right now*
@@ -1505,6 +1506,16 @@ export function initApp(mini = false): () => void {
 	if (started) return () => {};
 	started = true;
 	const subs = [
+		api.onPlaybackIntent((n) => {
+			if (n.queueIndex !== undefined && playback.queue.items[n.queueIndex]?.video_id === n.videoId) {
+				playback.queue.currentIndex = n.queueIndex;
+			}
+			if (playback.now?.videoId !== n.videoId) playback.duration = 0;
+			playback.now = n;
+			playback.position = n.startPosition ?? 0;
+			playback.buffering = true;
+			playback.paused = false;
+		}),
 		api.onNowPlaying((n) => {
 			playback.now = n;
 			// A new item must not inherit the previous AVPlayer timeline while its own ready callback
@@ -1571,7 +1582,10 @@ export function initApp(mini = false): () => void {
 			playback.positionAt = performance.now();
 		}),
 		api.onDuration((d) => (playback.duration = d)),
-		api.onPlaybackState((s) => (playback.paused = s === 'paused')),
+		api.onPlaybackState((s) => {
+			playback.paused = s === 'paused';
+			playback.buffering = s === 'buffering';
+		}),
 		api.onVolume((v) => {
 			// Not while our own drag is in flight: the echo is a value the pointer has already
 			// moved past, and applying it would yank the thumb backwards mid-drag.
@@ -1580,7 +1594,11 @@ export function initApp(mini = false): () => void {
 			if (v === 0 && playback.volume > 0) preMute = playback.volume;
 			playback.volume = v;
 		}),
-		api.onPlaybackError((msg) => toast.error(msg)),
+		api.onPlaybackError((msg) => {
+			playback.buffering = false;
+			playback.paused = true;
+			toast.error(msg);
+		}),
 		api.onPlaybackNotice((msg) => toast(msg)), // auto-skipped an unplayable track
 		api.onCoverError((msg) => toast.error(msg)), // playlist artwork YouTube wouldn't take
 		api.onLocalChanged(forgetLocal), // a local file turned out to be gone — drop it everywhere
@@ -1629,6 +1647,7 @@ export function initApp(mini = false): () => void {
 			playback.now = s.now;
 			playback.rating = s.now?.rating ?? 'indifferent';
 			playback.paused = s.paused;
+			playback.buffering = s.buffering ?? false;
 			playback.position = s.position;
 			playback.positionAt = performance.now();
 			playback.duration = s.duration;

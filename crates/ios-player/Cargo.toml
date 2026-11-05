@@ -10,6 +10,7 @@ links = "ios-player"
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
 tauri = { version = "2", default-features = false }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }

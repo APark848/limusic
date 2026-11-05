@@ -67,6 +67,9 @@ export interface SongItem {
 }
 
 export interface NowPlaying {
+	/** Present only on early playback intent; update an existing matching queue row. */
+	queueIndex?: number;
+	startPosition?: number;
 	videoId: string;
 	title: string;
 	artists: string;
@@ -367,8 +370,15 @@ export const searchSuggestions = (query: string) =>
 /** Filtered "Show more" card search for one category (albums / artists / playlists). */
 export const searchCards = (query: string, category: 'albums' | 'artists' | 'playlists') =>
 	invoke<BrowseItem[]>('search_cards', { query, category });
-export const play = (item: SongItem) => invoke<void>('play', { item });
-export const playIndex = (index: number) => invoke<void>('play_index', { index });
+let playbackRequestId = 0;
+function playbackRequest(command: string, args: Record<string, unknown>) {
+ const trace = { id: ++playbackRequestId, tappedAt: Date.now() };
+ // This one-way log never gates dispatch of the playback command.
+ void invoke('log_ui', { level: 'info', message: `playback tap request_id=${trace.id} source=${command}` }).catch(() => {});
+ return invoke<void>(command, { ...args, trace });
+}
+export const play = (item: SongItem) => playbackRequest('play', { item });
+export const playIndex = (index: number) => playbackRequest('play_index', { index });
 /** Play the current track's `counterpart` from the same position. Resolves once it plays. */
 export const switchVersion = () => invoke<void>('switch_version');
 /** Remove an upcoming track from the queue (host/local only — guests are add-only). */
@@ -438,6 +448,7 @@ export const ambientFrame = (after: number) =>
 export interface PlaybackSnapshot {
 	now: NowPlaying | null;
 	paused: boolean;
+	buffering?: boolean;
 	position: number;
 	duration: number;
 	/** The level restored from last run (or the one another window already set). */
@@ -768,7 +779,7 @@ export const playPlaylist = (
 	sourceName?: string,
 	shuffle?: boolean,
 	continuation?: string
-) => invoke<void>('play_playlist', { items, start, sourceId, sourceName, shuffle, continuation });
+) => playbackRequest('play_playlist', { items, start, sourceId, sourceName, shuffle, continuation });
 /**
  * Start a radio: an endless YouTube-generated queue seeded on this item. `id` is the videoId
  * (song) or browseId/playlistId (everything else) — Rust resolves it to a radio playlist, so the
@@ -778,7 +789,7 @@ export const playPlaylist = (
  * other case replaces the queue. Rejects when YouTube has no radio for the item.
  */
 export const startRadio = (kind: 'song' | 'artist' | 'album' | 'playlist', id: string, name?: string) =>
-	invoke<void>('start_radio', { kind, id, name });
+	playbackRequest('start_radio', { kind, id, name });
 export const getAlbum = (id: string) => invoke<AlbumPage>('get_album', { id });
 export const getArtist = (id: string) => invoke<ArtistPage>('get_artist', { id });
 /** Other artists' releases this one is featured on (#456). `songsId` is the page's `topSongsId`. */
@@ -1022,8 +1033,10 @@ export const onDuration = (cb: (d: number) => void): Promise<UnlistenFn> =>
 /** Echo of every `set_volume`, so a second window's slider can't drift from what you hear. */
 export const onVolume = (cb: (v: number) => void): Promise<UnlistenFn> =>
 	listen<number>('volume', (e) => cb(e.payload));
-export const onPlaybackState = (cb: (s: 'playing' | 'paused') => void): Promise<UnlistenFn> =>
-	listen<'playing' | 'paused'>('playback-state', (e) => cb(e.payload));
+export const onPlaybackState = (cb: (s: 'playing' | 'paused' | 'buffering') => void): Promise<UnlistenFn> =>
+    listen<'playing' | 'paused' | 'buffering'>('playback-state', (e) => cb(e.payload));
+export const onPlaybackIntent = (cb: (n: NowPlaying) => void): Promise<UnlistenFn> =>
+    listen<NowPlaying>('playback-intent', (e) => cb(e.payload));
 export const onPlaybackError = (cb: (msg: string) => void): Promise<UnlistenFn> =>
 	listen<{ message: string }>('playback-error', (e) => cb(e.payload.message));
 export const onPlaybackNotice = (cb: (msg: string) => void): Promise<UnlistenFn> =>

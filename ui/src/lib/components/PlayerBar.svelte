@@ -292,16 +292,21 @@
 				size="icon"
 				class="rounded-full"
 				onclick={() => api.togglePause()}
+				aria-busy={playback.buffering}
 				aria-label={playback.paused ? t('player.play') : t('player.pause')}
 			>
 				<!-- HugeiconsIcon only re-renders `altIcon`/`showAlt`, not `icon` (frozen at mount) —
 			     so toggle via showAlt, not a ternary on `icon`. -->
+			{#if playback.buffering}
+				<span class="h-5 w-5 animate-spin rounded-full border-2 border-current border-t-transparent motion-reduce:animate-none" aria-label="Buffering"></span>
+			{:else}
 			<HugeiconsIcon
 				icon={PauseIcon}
 				altIcon={PlayIcon}
 				showAlt={playback.paused}
 				class="h-5 w-5"
 			/>
+			{/if}
 			</Button>
 			<Button variant="ghost" size="icon-sm" onclick={() => api.nextTrack()} aria-label={t('player.next')}>
 				<HugeiconsIcon icon={NextIcon} class="h-5 w-5" />
