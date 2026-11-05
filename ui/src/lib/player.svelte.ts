@@ -1507,9 +1507,12 @@ export function initApp(mini = false): () => void {
 	started = true;
 	const subs = [
 		api.onPlaybackIntent((n) => {
+			if (n.queueIndex !== undefined && playback.queue.items[n.queueIndex]?.video_id === n.videoId) {
+				playback.queue.currentIndex = n.queueIndex;
+			}
+			if (playback.now?.videoId !== n.videoId) playback.duration = 0;
 			playback.now = n;
-			playback.position = 0;
-			playback.duration = 0;
+			playback.position = n.startPosition ?? 0;
 			playback.buffering = true;
 			playback.paused = false;
 		}),
@@ -1644,6 +1647,7 @@ export function initApp(mini = false): () => void {
 			playback.now = s.now;
 			playback.rating = s.now?.rating ?? 'indifferent';
 			playback.paused = s.paused;
+			playback.buffering = s.buffering ?? false;
 			playback.position = s.position;
 			playback.positionAt = performance.now();
 			playback.duration = s.duration;

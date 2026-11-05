@@ -221,7 +221,140 @@ async fn run(
     }
     observed.push("pause-before-ready-retained");
     state.player.stop()?;
+    controlled_transport_test(&state, &fixture, events).await?;
+    observed.extend([
+        "buffered-transport-loss-resume",
+        "empty-buffer-pause-intent",
+        "transport-reconnect",
+    ]);
     Ok(observed)
+}
+
+/// A loopback HTTP origin serving only our generated PCM fixture. Suspension is controlled by
+/// the test, not by YouTube or external reachability. This is not a physical airplane-mode test.
+async fn fixture_origin(
+    bytes: Arc<Vec<u8>>,
+    available: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://127.0.0.1:{}/fixture.wav", listener.local_addr()?.port());
+    let task = tokio::spawn(async move {
+        let mut connections = tokio::task::JoinSet::new();
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let bytes = bytes.clone();
+            let available = available.clone();
+            connections.spawn(async move {
+                let mut request = Vec::new();
+                while request.len() < 8192 && !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    if socket.read_exact(&mut byte).await.is_err() { return; }
+                    request.push(byte[0]);
+                }
+                while !available.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let range = request.lines().find_map(|line| line.strip_prefix("range: bytes="));
+                let (start, end) = range.and_then(|r| r.split_once('-'))
+                    .map(|(start, end)| (start.parse::<usize>().unwrap_or(0),
+                        end.trim().parse::<usize>().unwrap_or(bytes.len() - 1)))
+                    .unwrap_or((0, bytes.len() - 1));
+                let end = end.min(bytes.len() - 1);
+                if start > end { return; }
+                let header = if range.is_some() {
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{}\r\n", bytes.len())
+                } else { "HTTP/1.1 200 OK\r\n".into() };
+                let header = format!("{header}Content-Type: audio/wav\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", end - start + 1);
+                if socket.write_all(header.as_bytes()).await.is_err() { return; }
+                if !request.starts_with("head ") { let _ = socket.write_all(&bytes[start..=end]).await; }
+                let _ = socket.shutdown().await;
+            });
+            while connections.try_join_next().is_some() {}
+        }
+        // Dropping JoinSet on cancellation also closes all fixture connections.
+    });
+    Ok((url, task))
+}
+
+async fn controlled_transport_test(
+    state: &Arc<AppState>,
+    fixture: &Path,
+    events: &mut UnboundedReceiver<PlayerEvent>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let bytes = Arc::new(std::fs::read(fixture)?);
+    let available = Arc::new(AtomicBool::new(true));
+    let (url, server) = fixture_origin(bytes.clone(), available).await?;
+    // Always abort the origin, including an early failed assertion.
+    struct Origin(tokio::task::JoinHandle<()>);
+    impl Drop for Origin {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let origin = Origin(server);
+    while events.try_recv().is_ok() {}
+    state.player.load(&url, &HashMap::new(), None, None, None)?;
+    state.player.play()?;
+    wait_for_ready_and_playing(events).await?;
+    wait_for(events, "HTTP fixture progress", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.2 => Some(()),
+        _ => None,
+    })
+    .await?;
+    state.player.pause()?;
+    let before = state.player.snapshot()?;
+    if before["bufferedAhead"].as_f64().unwrap_or(0.0) < 1.0 {
+        bail!("HTTP fixture did not buffer enough audio for the offline-resume test");
+    }
+    drop(origin); // The origin and every connection disappear while paused.
+    while events.try_recv().is_ok() {}
+    let offset = before["position"].as_f64().unwrap_or(0.0);
+    state.player.play()?;
+    wait_for(events, "progress without origin", |e| match e {
+        PlayerEvent::Position(p) if *p > offset + 0.25 => Some(()),
+        _ => None,
+    })
+    .await?;
+    if state.player.snapshot()?["epoch"] != before["epoch"] {
+        bail!("offline resume replaced item");
+    }
+    state.player.stop()?;
+
+    let available = Arc::new(AtomicBool::new(false));
+    let (url, server) = fixture_origin(bytes, available.clone()).await?;
+    let _origin = Origin(server);
+    while events.try_recv().is_ok() {}
+    state.player.load(&url, &HashMap::new(), None, None, None)?;
+    state.player.play()?;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let waiting = state.player.snapshot()?;
+    if waiting["playing"] != false || waiting["wantsPlayback"] != true {
+        bail!("no-data startup lost its buffering intent");
+    }
+    state.player.toggle()?; // Uses production intent-based toggle while not actually playing.
+    available.store(true, Ordering::SeqCst);
+    wait_for(events, "ready after transport restored", |e| match e {
+        PlayerEvent::Duration(d) if *d > 0.0 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let paused = state.player.snapshot()?;
+    if paused["wantsPlayback"] != false || paused["playing"] != false {
+        bail!("transport recovery overrode pause");
+    }
+    state.player.play()?;
+    wait_for(events, "play after transport restored", |e| match e {
+        PlayerEvent::Playing(true) => Some(()),
+        _ => None,
+    })
+    .await?;
+    if state.player.snapshot()?["epoch"] != waiting["epoch"] {
+        bail!("reconnect replaced item");
+    }
+    state.player.stop()?;
+    Ok(())
 }
 
 async fn run_remote(

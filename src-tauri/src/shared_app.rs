@@ -234,6 +234,13 @@ pub(crate) fn spawn_event_pump(
             match event {
                 #[cfg(target_os = "ios")]
                 PlayerEvent::Scoped { .. } => unreachable!("events are unwrapped above"),
+                #[cfg(target_os = "ios")]
+                PlayerEvent::NetworkRestored => {
+                    let state = state.clone();
+                    tauri::async_runtime::spawn(async move {
+                        state.resume_after_network().await;
+                    });
+                }
                 PlayerEvent::Position(position) => {
                     if throttle.should_emit(position, std::time::Instant::now()) {
                         let _ = app.emit("position", serde_json::json!({ "position": position }));

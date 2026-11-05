@@ -16,6 +16,7 @@ private enum EventKind {
   static let error: UInt32 = 6
   static let diagnostic: UInt32 = 7
   static let buffering: UInt32 = 8
+  static let networkRestored: UInt32 = 9
 }
 
 private struct LoadArgs: Decodable {
@@ -61,6 +62,7 @@ final class LimusicPlayerPlugin: Plugin {
   private var authoritativeBoundaryHandled = false
   private var loadStartedAt = CFAbsoluteTimeGetCurrent()
   private var firstProgressEmitted = false
+  private var hasPlayed = false
   private var preparedAsset: AVURLAsset?
   private var preparedURL: String?
   private var preparedHeaders: [String: String]?
@@ -140,6 +142,7 @@ final class LimusicPlayerPlugin: Plugin {
         guard let self else { return }
         let reconnected = self.wasOffline && path.status == .satisfied
         self.wasOffline = path.status != .satisfied
+        if reconnected { self.emit(EventKind.networkRestored) }
         // A path change is not an item failure. Keep the item, timestamp and pause intent.
         if reconnected, self.wantsPlayback, let item = self.player.currentItem,
           item.status == .readyToPlay, self.player.timeControlStatus != .playing {
@@ -334,6 +337,7 @@ final class LimusicPlayerPlugin: Plugin {
       guard let self else { return }
       switch observed.timeControlStatus {
       case .playing:
+        self.hasPlayed = true
         self.diagnostic("time-control-playing")
         self.emit(EventKind.playing, value: 1)
         self.emit(EventKind.paused, value: 0)
@@ -442,6 +446,7 @@ final class LimusicPlayerPlugin: Plugin {
       self.authoritativeBoundaryHandled = false
       self.loadStartedAt = CFAbsoluteTimeGetCurrent()
       self.firstProgressEmitted = false
+      self.hasPlayed = false
       self.progressBaseline = start ?? 0
       self.resumeStartedAt = nil
       self.diagnostic("load-received")
@@ -523,11 +528,11 @@ final class LimusicPlayerPlugin: Plugin {
                 self.safeFailure(item.error, fallback: "AVPlayer could not play this track")
             ])
         }
-        if self.firstProgressEmitted {
+        if self.hasPlayed {
           self.resumeStartedAt = CFAbsoluteTimeGetCurrent()
           self.progressBaseline = self.player.currentTime().seconds
         }
-        if self.firstProgressEmitted, item.status == .readyToPlay, self.bufferedAhead(item) >= 0.25 {
+        if self.hasPlayed, item.status == .readyToPlay, self.bufferedAhead(item) >= 0.25 {
           // A resume explicitly asks to use existing bytes. Keep automatic stall management for
           // ordinary startup and subsequent underruns; do not lower the global buffer target.
           self.player.playImmediately(atRate: 1)
@@ -552,6 +557,7 @@ final class LimusicPlayerPlugin: Plugin {
   @objc public func stop(_ invoke: Invoke) {
     resolveOnMain(invoke) { [weak self] in
       guard let self else { return }
+      self.monitorConnectivity()
       self.wantsPlayback = false
       self.player.pause()
       self.removeObservers()

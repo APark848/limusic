@@ -198,7 +198,7 @@
 
 	$effect(() => {
 		const pos = playback.position;
-		if (playback.paused || !needsFrameClock) {
+		if (playback.paused || playback.buffering || !needsFrameClock) {
 			interpolatedPosSecs = pos;
 			return;
 		}

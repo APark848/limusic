@@ -67,6 +67,9 @@ export interface SongItem {
 }
 
 export interface NowPlaying {
+	/** Present only on early playback intent; update an existing matching queue row. */
+	queueIndex?: number;
+	startPosition?: number;
 	videoId: string;
 	title: string;
 	artists: string;
@@ -445,6 +448,7 @@ export const ambientFrame = (after: number) =>
 export interface PlaybackSnapshot {
 	now: NowPlaying | null;
 	paused: boolean;
+	buffering?: boolean;
 	position: number;
 	duration: number;
 	/** The level restored from last run (or the one another window already set). */

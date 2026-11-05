@@ -32,6 +32,7 @@ pub enum PlayerEvent {
     Duration(f64),
     Playing(bool),
     Buffering,
+    NetworkRestored,
     Paused(bool),
     TrackEnded,
     TrackFailed(String),
@@ -78,6 +79,10 @@ pub unsafe extern "C" fn limusic_ios_player_emit(
     message: *const c_char,
     epoch: u64,
 ) {
+    if kind == 9 {
+        send_event(PlayerEvent::NetworkRestored);
+        return;
+    }
     if !is_current_event(epoch) {
         return;
     }

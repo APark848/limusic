@@ -38,6 +38,8 @@ uses `playImmediately(atRate:)`; ordinary startup and subsequent stall managemen
 defaults. No global buffer-size reduction is made. A ready item experiencing a recoverable transport
 error is retained. Reconnection retries play only when playback intent remains active. A terminally
 failed item cannot supply playable bytes; paused failures save the position for the next explicit Play.
+If a retry cannot reach the source, its playback intent and saved position wait for one retry on the
+next offline-to-online transition. Selecting another song or pausing cancels that pending recovery.
 
 This is **best-effort transient-buffer continuity**, not a downloaded library. AVFoundation can discard
 bytes, a seek can require a new HTTP request, and a failed item may need a fresh URL when online.
@@ -91,8 +93,10 @@ energy/network use with Instruments on device; static analysis cannot establish 
 Deterministic tests cover shared resolve promotion, cancellation under rapid selection, background
 priority, queue/session invalidation, noncached failure/retry and prepared URL lifetime. Existing queue,
 radio, repeat-one, preparation ownership and delayed retry tests remain. The local-WAV simulator smoke
-test also checks same-item resume and pause before readiness; this is not airplane-mode or physical
-iPhone verification. CI and final validation results are recorded in the feature PR.
+test also checks same-item resume and pause before readiness. A controlled loopback WAV origin checks
+buffered resume after the origin disappears, waiting with no response bytes, pause during that wait,
+and ready/reconnect without overriding pause. These are not airplane-mode or physical iPhone
+verification. CI and final validation results are recorded in the feature PR.
 
 Physical scenarios still required: rapid queue/radio/list selection; pause then airplane mode with
 and without sufficient buffered ranges; network loss while playing; reconnect while paused vs waiting;
