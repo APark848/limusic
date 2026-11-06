@@ -129,8 +129,10 @@ jobs:
         run: |
           set -euo pipefail
           app_bundle="$(find src-tauri/gen/apple/build/arm64-sim -maxdepth 1 -type d -name '*.app' -print -quit)"
+          # Tauri's iOS resource_dir resolves to <executable directory>/assets.
+          mkdir -p "$app_bundle/assets"
           python3 scripts/make-podcast-fixture.py "$RUNNER_TEMP/podcast-fixture.wav"
-          afconvert -f m4af -d aac -b 64000 "$RUNNER_TEMP/podcast-fixture.wav" "$app_bundle/podcast-fixture.m4a"
+          afconvert -f m4af -d aac -b 64000 "$RUNNER_TEMP/podcast-fixture.wav" "$app_bundle/assets/podcast-fixture.m4a"
 
       # Headless debug validation: drives the production Rust -> plugin -> AVPlayer -> callback
       # event path with a deterministic local WAV. It does not use an account or network stream.
