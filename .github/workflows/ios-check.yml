@@ -6,7 +6,7 @@ name: iOS validation
 on:
   workflow_dispatch:
   pull_request:
-    branches: [master, ios-playback-smoothness]
+    branches: [master, ios-playback-smoothness, codex/ios-manual-playback-continuity]
   push:
     branches: [master]
 
@@ -123,6 +123,14 @@ jobs:
           cat ios-background-modes.json
           jq -e 'type == "array" and length == 1 and .[0] == "audio"' \
             ios-background-modes.json >/dev/null
+
+      - name: Generate long-form AAC fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_bundle="$(find src-tauri/gen/apple/build/arm64-sim -maxdepth 1 -type d -name '*.app' -print -quit)"
+          python3 scripts/make-podcast-fixture.py "$RUNNER_TEMP/podcast-fixture.wav"
+          afconvert -f m4af -d aac -b 32000 "$RUNNER_TEMP/podcast-fixture.wav" "$app_bundle/podcast-fixture.m4a"
 
       # Headless debug validation: drives the production Rust -> plugin -> AVPlayer -> callback
       # event path with a deterministic local WAV. It does not use an account or network stream.

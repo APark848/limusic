@@ -92,6 +92,8 @@ pub enum ResolveError {
     /// about this particular track, so the queue must not skip past it or drop it.
     #[error("could not reach YouTube. Check your connection and try again ({0})")]
     Unreachable(String),
+    #[error("No compatible audio stream was available for this episode or track. Try another episode or retry later.")]
+    UnsupportedAudio,
 }
 
 impl ResolveError {
@@ -371,10 +373,21 @@ impl Orchestrator {
                 "not OK"
             );
         }
+        #[cfg(not(target_os = "ios"))]
         let has_high = main_resp
             .as_ref()
             .and_then(|r| r.streaming_data.as_ref())
             .is_some_and(|s| s.adaptive_formats.iter().any(is_high));
+        #[cfg(target_os = "ios")]
+        let has_high = main_resp
+            .as_ref()
+            .and_then(|r| r.streaming_data.as_ref().map(|s| (r, s)))
+            .is_some_and(|(r, s)| {
+                innertube::has_ios_high_format(
+                    s,
+                    response_duration(s, known_duration_secs, Some(r), r),
+                )
+            });
         let mut audio_config_loudness = main_resp.as_ref().and_then(main_loudness);
         // Prefer main's tracking block: a ping sent as WEB_REMIX is what registers the play as a
         // YouTube *Music* one. But `playbackTracking` is only present on an OK response, so when
@@ -464,20 +477,8 @@ impl Orchestrator {
             };
 
             let Some(streaming) = resp.streaming_data.as_ref() else { continue };
-            let Some(expires) = streaming.expires_in_seconds else { continue };
-            let expected_duration_ms = expected_audio_duration_ms(
-                streaming,
-                known_duration_secs,
-                main_resp
-                    .as_ref()
-                    .and_then(|response| response.video_details.as_ref())
-                    .and_then(|details| details.length_seconds.as_deref())
-                    .or_else(|| {
-                        resp.video_details
-                            .as_ref()
-                            .and_then(|details| details.length_seconds.as_deref())
-                    }),
-            );
+            let expected_duration_ms =
+                response_duration(streaming, known_duration_secs, main_resp.as_ref(), &resp);
             #[cfg(target_os = "ios")]
             let format = find_ios_format(streaming, quality, expected_duration_ms);
             #[cfg(not(target_os = "ios"))]
@@ -494,8 +495,12 @@ impl Orchestrator {
             // working cipher webview lands here, and for an upload that is fatal: every client on
             // its chain is a web client, so the whole chain produces nothing and the user sees
             // "sign-in needed" for what is really a broken extraction runtime. Issues #71/#128.
+            let url_started = Instant::now();
             let Some(mut url) = self.find_url(format, video_id).await else {
                 tracing::warn!(video_id, client = %key, itag = format.itag, "no stream URL (deciphering unavailable?)");
+                continue;
+            };
+            let Some(expires) = stream_lifetime(&url, streaming.expires_in_seconds) else {
                 continue;
             };
 
@@ -509,6 +514,8 @@ impl Orchestrator {
             if needs_n {
                 url = self.sign(url, client, video_id, visitor.as_deref()).await;
             }
+            tracing::info!(client = %key, elapsed_ms = url_started.elapsed().as_millis() as u64,
+                "stream URL preparation completed");
 
             // HIGH two-pass: remember the best non-HIGH and keep looking if a HIGH exists elsewhere.
             if prefer_high && !is_high(format) && has_high {
@@ -550,7 +557,7 @@ impl Orchestrator {
             let headers =
                 stream_headers(client.map(|c| c.user_agent.clone()), self.it.cookie(), is_upload);
             let validation_started = Instant::now();
-            let validated = self.validate_stream(&url, &headers, content_length(format)).await;
+            let validated = validate_stream(&url, &headers, content_length(format)).await;
             tracing::info!(
                 video_id,
                 client = %key,
@@ -663,8 +670,14 @@ impl Orchestrator {
             return Err(ResolveError::UploadUnavailable(video_id.to_owned()));
         }
         tracing::info!(video_id, "all InnerTube clients exhausted → rustypipe fallback");
-        match rustypipe_fallback::resolve(video_id, prefer_high).await {
-            Ok(c) if !self.validate_stream(&c.url, &HashMap::new(), Some(c.size)).await => {
+        #[cfg(target_os = "ios")]
+        let fallback = rustypipe_fallback::resolve_ios(video_id, prefer_high).await;
+        #[cfg(not(target_os = "ios"))]
+        let fallback = rustypipe_fallback::resolve(video_id, prefer_high).await;
+        match fallback {
+            #[cfg(target_os = "ios")]
+            Err(rustypipe_fallback::FallbackError::NoAudio) => Err(ResolveError::UnsupportedAudio),
+            Ok(c) if !validate_stream(&c.url, &HashMap::new(), Some(c.size)).await => {
                 tracing::warn!(video_id, "rustypipe URL serves only its first MiB, not playable");
                 // rustypipe answered, so the network is up and this failure is about the URL.
                 Err(nothing_played(video_id, logged_in, login_wanted, true))
@@ -783,7 +796,7 @@ impl Orchestrator {
         let format = find_video_format(&sd, max_height)?;
         let url = self.find_url(format, video_id).await?;
         let url = self.sign(url, Some(client), video_id, visitor.as_deref()).await;
-        if !self.validate_stream(&url, &HashMap::new(), content_length(format)).await {
+        if !validate_stream(&url, &HashMap::new(), content_length(format)).await {
             tracing::debug!(video_id, itag = format.itag, "video: WEB_REMIX URL refused");
             return None;
         }
@@ -845,46 +858,6 @@ impl Orchestrator {
         }
         let cipher = format.cipher_string()?;
         self.cipher.deobfuscate_stream_url(cipher, video_id).await
-    }
-
-    /// Will googlevideo serve this URL, all the way to the end? (context/06 §validateStatus.)
-    ///
-    /// Probe shape, not just probe headers. mpv never opens a googlevideo URL directly any more:
-    /// `state::mpv_stream_url` hands it a loopback URL and `audioproxy` fetches bounded ranges
-    /// upstream, so a bounded range is the request this has to predict.
-    ///
-    /// And the range is the last 256 bytes, because that is the one question that separates a
-    /// capped URL from a healthy one. Since 2026 googlevideo answers only the first mebibyte of
-    /// some URLs (rustypipe's, ANDROID_VR's): measured 2026-09-22, a range ending inside that
-    /// window returns 206 and every range ending past it returns 403, on every video tried and at
-    /// any chunk size. HEAD and an opening range both pass, and mpv was handed a stream that
-    /// delivered no bytes and blamed the audio format (issue #292). The unranged HEAD this replaced
-    /// also caught capped direct-client URLs, but only as an accident of what the CDN refused that
-    /// month (KNOWN-ISSUES KI-11/KI-12).
-    ///
-    /// `headers` is what `build` will hand mpv, so the probe carries exactly what the real fetch
-    /// will (issue #71). Falls back to a HEAD when there is no length to aim at: an RSS-feed
-    /// podcast's enclosure is not on googlevideo, reports `contentLength: "0"`, and may not honour
-    /// ranges at all (#294). Success = 2xx, false on any error.
-    async fn validate_stream(
-        &self,
-        url: &str,
-        headers: &HashMap<String, String>,
-        content_length: Option<u64>,
-    ) -> bool {
-        let req = match content_length.filter(|n| *n > 0).filter(|_| is_youtube_stream(url)) {
-            Some(len) => crate::http::client()
-                .get(url)
-                .header("Range", format!("bytes={}-{}", len.saturating_sub(256), len - 1))
-                .header("Accept-Encoding", "identity"),
-            None => crate::http::client().head(url),
-        };
-        // The 10s budget is a property of this one probe, not of the app's HTTP.
-        let mut req = req.timeout(Duration::from_secs(10));
-        for (k, v) in headers {
-            req = req.header(k, v);
-        }
-        matches!(req.send().await, Ok(r) if r.status().is_success())
     }
 
     /// A cipher client's stream was refused, so its config may be stale. Heal off the hot path so
@@ -965,6 +938,89 @@ impl Orchestrator {
             is_video: vd.and_then(|v| v.is_music_video()),
             stream_client: client.to_owned(),
         }
+    }
+}
+
+/// Will googlevideo serve this URL, all the way to the end? (context/06 §validateStatus.)
+///
+/// Probe shape, not just probe headers. mpv never opens a googlevideo URL directly any more:
+/// `state::mpv_stream_url` hands it a loopback URL and `audioproxy` fetches bounded ranges
+/// upstream, so a bounded range is the request this has to predict.
+///
+/// And the range is the last 256 bytes, because that is the one question that separates a
+/// capped URL from a healthy one. Since 2026 googlevideo answers only the first mebibyte of
+/// some URLs (rustypipe's, ANDROID_VR's): measured 2026-09-22, a range ending inside that
+/// window returns 206 and every range ending past it returns 403, on every video tried and at
+/// any chunk size. HEAD and an opening range both pass, and mpv was handed a stream that
+/// delivered no bytes and blamed the audio format (issue #292). The unranged HEAD this replaced
+/// also caught capped direct-client URLs, but only as an accident of what the CDN refused that
+/// month (KNOWN-ISSUES KI-11/KI-12).
+///
+/// `headers` is what `build` will hand mpv, so the probe carries exactly what the real fetch
+/// will (issue #71). Falls back to a HEAD when there is no length to aim at: an RSS-feed
+/// podcast's enclosure is not on googlevideo, reports `contentLength: "0"`, and may not honour
+/// ranges at all (#294). Success = 2xx, false on any error.
+async fn validate_stream(
+    url: &str,
+    headers: &HashMap<String, String>,
+    content_length: Option<u64>,
+) -> bool {
+    let req = match content_length.filter(|n| *n > 0).filter(|_| is_youtube_stream(url)) {
+        Some(len) => crate::http::client()
+            .get(url)
+            .header("Range", format!("bytes={}-{}", len.saturating_sub(256), len - 1))
+            .header("Accept-Encoding", "identity"),
+        None => crate::http::client().head(url),
+    };
+    // The 10s budget is a property of this one probe, not of the app's HTTP.
+    let mut req = req.timeout(Duration::from_secs(10));
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let response = req.send().await;
+    if response.as_ref().is_ok_and(|r| r.status().is_success()) {
+        return true;
+    }
+    // Some podcast origins implement GET but reject HEAD. Only retry that explicit method
+    // rejection, with a tiny range, and drop the response without consuming the audio body.
+    if !is_youtube_stream(url)
+        && response.as_ref().is_ok_and(|r| matches!(r.status().as_u16(), 405 | 501))
+    {
+        let mut get = crate::http::client()
+            .get(url)
+            .header("Range", "bytes=0-1")
+            .timeout(Duration::from_secs(10));
+        for (k, v) in headers {
+            get = get.header(k, v);
+        }
+        return matches!(get.send().await, Ok(r) if r.status().is_success());
+    }
+    false
+}
+
+/// Podcast browse durations are rounded presentation text, not format-validation authority.
+/// Keep the existing music-track precedence while using the episode's player metadata directly.
+fn response_duration(
+    data: &StreamingData,
+    known: Option<u64>,
+    main: Option<&PlayerResponse>,
+    response: &PlayerResponse,
+) -> Option<u64> {
+    let details = main.and_then(|r| r.video_details.as_ref()).or(response.video_details.as_ref());
+    let podcast = details
+        .is_some_and(|d| d.music_video_type.as_deref() == Some("MUSIC_VIDEO_TYPE_PODCAST_EPISODE"));
+    expected_audio_duration_ms(
+        data,
+        if podcast { None } else { known },
+        details.and_then(|d| d.length_seconds.as_deref()),
+    )
+}
+
+fn stream_lifetime(url: &str, expires: Option<i64>) -> Option<i64> {
+    match expires {
+        Some(n) if n > 0 => Some(n),
+        _ if !is_youtube_stream(url) => Some(0), // playable, but never cached/prepared as reusable
+        _ => None,
     }
 }
 
@@ -1116,6 +1172,64 @@ fn best_thumbnail(resp: &PlayerResponse) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn podcast_origin_method_rejection_uses_bounded_get_but_forbidden_does_not() {
+        use std::io::{Read, Write};
+        for (head, get) in [(405, Some(206)), (501, Some(200)), (403, None)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/episode.mp3", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                for (i, status) in std::iter::once(head).chain(get).enumerate() {
+                    let (mut socket, _) = listener.accept().unwrap();
+                    socket.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                    if i == 0 {
+                        assert!(request.starts_with("head "));
+                    } else {
+                        assert!(request.starts_with("get "));
+                        assert!(request.contains("range: bytes=0-1"));
+                    }
+                    assert!(request.contains("user-agent: fixture-agent"));
+                    write!(
+                        socket,
+                        "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n"
+                    )
+                    .unwrap();
+                    if i > 0 {
+                        socket.write_all(b"ok").unwrap();
+                    }
+                }
+            });
+            let headers =
+                std::collections::HashMap::from([("User-Agent".into(), "fixture-agent".into())]);
+            assert_eq!(super::validate_stream(&url, &headers, None).await, get.is_some());
+            server.join().unwrap();
+        }
+    }
+    #[test]
+    fn podcast_player_duration_repairs_bad_browse_hint_and_external_expiry_is_optional() {
+        let response: innertube::PlayerResponse = serde_json::from_value(serde_json::json!({
+            "playabilityStatus": {"status": "OK"},
+            "videoDetails": {"videoId": "fixture", "musicVideoType": "MUSIC_VIDEO_TYPE_PODCAST_EPISODE", "lengthSeconds": "7200"},
+            "streamingData": {"formats": [{"itag": 15, "mimeType": "audio/mpeg", "approxDurationMs": "7200000", "url": "https://podcast.example/episode.mp3"}]}
+        })).unwrap();
+        let data = response.streaming_data.as_ref().unwrap();
+        let duration = super::response_duration(data, Some(120), Some(&response), &response);
+        assert_eq!(duration, Some(7_200_000));
+        assert!(innertube::find_ios_format(data, innertube::AudioQuality::High, duration).is_some());
+        assert_eq!(super::stream_lifetime("https://podcast.example/episode.mp3", None), Some(0));
+        assert_eq!(super::stream_lifetime("https://r1.googlevideo.com/videoplayback", None), None);
+        assert_eq!(
+            super::stream_lifetime("https://r1.googlevideo.com/videoplayback", Some(-1)),
+            None
+        );
+    }
     use super::{
         blacklist_blocks, blacklist_insert, claim_heal, content_length, is_youtube_stream,
         nothing_played, resolved_duration, stream_headers, ResolveError, WEB_REMIX_BLACKLIST_TTL,

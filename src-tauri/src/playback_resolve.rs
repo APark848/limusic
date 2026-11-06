@@ -68,6 +68,28 @@ impl<K: Eq, T: Clone + Send + Sync + 'static> Resolver<K, T> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn distant_radio_selection_does_not_resolve_intermediate_rows() {
+        let resolver = super::Resolver::default();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (_, near, _) =
+            resolver.request((1, 1), false, std::future::pending::<usize>()).unwrap();
+        let count = calls.clone();
+        let (_, distant, _) = resolver
+            .request((1, 20), true, async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                20
+            })
+            .unwrap();
+        assert_eq!(near.await, None);
+        assert_eq!(distant.await, Some(20));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (_, stale, _) =
+            resolver.request((1, 19), true, std::future::pending::<usize>()).unwrap();
+        let (_, replaced, _) = resolver.request((2, 20), true, async { 99 }).unwrap();
+        assert_eq!(stale.await, None);
+        assert_eq!(replaced.await, Some(99));
+    }
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

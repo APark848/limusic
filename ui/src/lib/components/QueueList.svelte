@@ -243,7 +243,7 @@
 
 	function play(i: number) {
 		clicked = i;
-		api.playIndex(i);
+		api.playIndex(i, playback.queue.items[i]?.video_id);
 	}
 </script>
 

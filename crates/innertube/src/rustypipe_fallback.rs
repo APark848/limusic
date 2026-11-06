@@ -58,6 +58,21 @@ impl FallbackError {
 /// Resolve a videoId to its best audio stream via rustypipe. `prefer_high`: pick the
 /// highest-bitrate opus/mp4a stream (matches our HIGH preference); else lowest ≤128k.
 pub async fn resolve(video_id: &str, prefer_high: bool) -> Result<StreamCandidate, FallbackError> {
+    resolve_inner(video_id, prefer_high, false).await
+}
+
+pub async fn resolve_ios(
+    video_id: &str,
+    prefer_high: bool,
+) -> Result<StreamCandidate, FallbackError> {
+    resolve_inner(video_id, prefer_high, true).await
+}
+
+async fn resolve_inner(
+    video_id: &str,
+    prefer_high: bool,
+    ios: bool,
+) -> Result<StreamCandidate, FallbackError> {
     // Keep rustypipe's cache out of the app CWD (it defaults to ./rustypipe_cache.json +
     // ./rustypipe_reports/, and an installed app's CWD may not be writable).
     let storage = std::env::temp_dir().join("limusic-rustypipe");
@@ -71,7 +86,7 @@ pub async fn resolve(video_id: &str, prefer_high: bool) -> Result<StreamCandidat
         .await
         .map_err(map_err)?;
 
-    let best = pick_audio(&player.audio_streams, prefer_high).ok_or(FallbackError::NoAudio)?;
+    let best = pick_audio(&player.audio_streams, prefer_high, ios).ok_or(FallbackError::NoAudio)?;
     Ok(StreamCandidate {
         url: best.url.clone(),
         itag: best.itag,
@@ -85,7 +100,7 @@ pub async fn resolve(video_id: &str, prefer_high: bool) -> Result<StreamCandidat
     })
 }
 
-fn pick_audio(streams: &[AudioStream], prefer_high: bool) -> Option<&AudioStream> {
+fn pick_audio(streams: &[AudioStream], prefer_high: bool, ios: bool) -> Option<&AudioStream> {
     fn codec_score(mime: &str) -> u8 {
         if mime.contains("opus") {
             2
@@ -97,9 +112,14 @@ fn pick_audio(streams: &[AudioStream], prefer_high: bool) -> Option<&AudioStream
     }
     // A dubbed video lists every language at the same bitrates; keep to the original track
     // (`track` is None when there is only one). Mirrors `Format::is_original`.
-    let original: Vec<&AudioStream> =
-        streams.iter().filter(|s| s.track.as_ref().is_none_or(|t| t.is_default)).collect();
-    let streams = if original.is_empty() { streams.iter().collect() } else { original };
+    let compatible: Vec<_> =
+        streams.iter().filter(|s| !ios || crate::ios_audio_mime_supported(&s.mime)).collect();
+    let original: Vec<&AudioStream> = compatible
+        .iter()
+        .copied()
+        .filter(|s| s.track.as_ref().is_none_or(|t| t.is_default))
+        .collect();
+    let streams = if original.is_empty() { compatible } else { original };
     if prefer_high {
         streams.into_iter().max_by(|a, b| {
             codec_score(&a.mime).cmp(&codec_score(&b.mime)).then(a.bitrate.cmp(&b.bitrate))
@@ -127,6 +147,22 @@ fn map_err(e: RpError) -> FallbackError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ios_last_resort_keeps_aac_and_rejects_opus_only() {
+        let stream = |itag, mime, format, codec| {
+            serde_json::from_value::<rustypipe::model::AudioStream>(serde_json::json!({
+            "url": "https://example.test/audio", "itag": itag, "bitrate": 128000,
+            "average_bitrate": 128000, "size": 1024, "mime": mime, "format": format, "codec": codec, "drm_systems": []
+        })).unwrap()
+        };
+        let audio = vec![
+            stream(251, "audio/webm; codecs=\"opus\"", "webm", "opus"),
+            stream(140, "audio/mp4; codecs=\"mp4a.40.2\"", "m4a", "mp4a"),
+        ];
+        assert_eq!(super::pick_audio(&audio, true, false).unwrap().itag, 251);
+        assert_eq!(super::pick_audio(&audio, true, true).unwrap().itag, 140);
+        assert!(super::pick_audio(&audio[..1], true, true).is_none());
+    }
     use super::FallbackError;
 
     #[test]

@@ -378,7 +378,7 @@ function playbackRequest(command: string, args: Record<string, unknown>) {
  return invoke<void>(command, { ...args, trace });
 }
 export const play = (item: SongItem) => playbackRequest('play', { item });
-export const playIndex = (index: number) => playbackRequest('play_index', { index });
+export const playIndex = (index: number, expectedVideoId?: string) => playbackRequest('play_index', { index, expectedVideoId });
 /** Play the current track's `counterpart` from the same position. Resolves once it plays. */
 export const switchVersion = () => invoke<void>('switch_version');
 /** Remove an upcoming track from the queue (host/local only — guests are add-only). */

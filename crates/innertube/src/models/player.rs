@@ -246,13 +246,34 @@ pub fn find_ios_format(
 ) -> Option<&Format> {
     let aac = find_ios_format_where(data, quality, expected_duration_ms, |format| {
         let mime = format.mime_type.to_ascii_lowercase();
-        mime.contains("audio/mp4") || mime.contains("mp4a") || mime.contains("audio/aac")
+        ios_audio_mime_supported(&mime)
+            && !mime.starts_with("audio/mpeg")
+            && !mime.starts_with("audio/mp3")
     });
     aac.or_else(|| {
         find_ios_format_where(data, quality, expected_duration_ms, |format| {
-            format.mime_type.to_ascii_lowercase().contains("audio/mpeg")
+            let mime = format.mime_type.to_ascii_lowercase();
+            ios_audio_mime_supported(&mime)
+                && (mime.starts_with("audio/mpeg") || mime.starts_with("audio/mp3"))
         })
     })
+}
+
+/// Shared by the main resolver and the last-resort extractor. Never send WebM/Opus to AVPlayer.
+pub fn ios_audio_mime_supported(mime: &str) -> bool {
+    let mime = mime.to_ascii_lowercase();
+    let container = mime.split(';').next().unwrap_or("").trim();
+    match container {
+        "audio/mp4" => !mime.contains("codecs=") || mime.contains("mp4a"),
+        "audio/aac" | "audio/mpeg" | "audio/mp3" => true,
+        _ => false,
+    }
+}
+
+/// The HIGH second pass must only chase quality that the platform can actually play.
+pub fn has_ios_high_format(data: &StreamingData, expected: Option<u64>) -> bool {
+    find_ios_format(data, AudioQuality::High, expected)
+        .is_some_and(|format| format.audio_quality.as_deref() == Some("AUDIO_QUALITY_HIGH"))
 }
 
 /// Prefer formats whose own timeline agrees with the authoritative video duration. Some iOS
@@ -458,6 +479,25 @@ pub struct Thumbnail {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ios_high_pass_ignores_unplayable_or_malformed_high_tracks() {
+        let data: super::StreamingData = serde_json::from_value(serde_json::json!({"adaptiveFormats": [
+            {"itag": 251, "mimeType": "audio/webm; codecs=\"opus\"", "audioQuality": "AUDIO_QUALITY_HIGH", "approxDurationMs": "7200000"},
+            {"itag": 140, "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"", "audioQuality": "AUDIO_QUALITY_MEDIUM", "approxDurationMs": "7200000"}
+        ]})).unwrap();
+        assert!(!super::has_ios_high_format(&data, Some(7_200_000)));
+        assert_eq!(
+            super::find_ios_format(&data, super::AudioQuality::High, Some(7_200_000)).unwrap().itag,
+            140
+        );
+        assert!(
+            super::find_ios_format(&data, super::AudioQuality::High, Some(120_000)).is_none(),
+            "bad old podcast row duration rejects valid audio"
+        );
+        assert!(!super::ios_audio_mime_supported("audio/mp4; codecs=\"opus\""));
+        assert!(!super::ios_audio_mime_supported("application/dash+xml"));
+        assert!(super::ios_audio_mime_supported("audio/mpeg"));
+    }
     use super::*;
 
     /// Regression: YouTube sends `expiresInSeconds` as a STRING ("21540") on every client.

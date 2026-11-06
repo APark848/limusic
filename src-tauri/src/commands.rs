@@ -131,11 +131,12 @@ pub async fn play(
 pub async fn play_index(
     state: St<'_>,
     index: usize,
+    expected_video_id: Option<String>,
     trace: Option<PlaybackTrace>,
 ) -> Result<(), String> {
     log_playback_command(&trace, "queue");
     let state = state.inner().clone();
-    state.play_index(index).await;
+    state.play_index_checked(index, expected_video_id.as_deref()).await;
     Ok(())
 }
 
