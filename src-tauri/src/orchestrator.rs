@@ -489,11 +489,7 @@ impl Orchestrator {
             let Some(format) = format else {
                 #[cfg(target_os = "ios")]
                 {
-                    unsupported_audio |= streaming
-                        .adaptive_formats
-                        .iter()
-                        .chain(streaming.formats.iter())
-                        .any(|f| f.mime_type.starts_with("audio/"));
+                    unsupported_audio |= has_audio_formats(streaming);
                 }
                 tracing::debug!(client = %key, "no platform-compatible audio format");
                 continue;
@@ -1025,6 +1021,14 @@ fn response_duration(
     )
 }
 
+#[cfg(any(target_os = "ios", test))]
+fn has_audio_formats(data: &StreamingData) -> bool {
+    data.adaptive_formats
+        .iter()
+        .chain(data.formats.iter().flatten())
+        .any(|f| f.mime_type.starts_with("audio/"))
+}
+
 fn stream_lifetime(url: &str, expires: Option<i64>) -> Option<i64> {
     match expires {
         Some(n) if n > 0 => Some(n),
@@ -1181,6 +1185,22 @@ fn best_thumbnail(resp: &PlayerResponse) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsupported_audio_detection_handles_optional_progressive_formats() {
+        for json in [
+            serde_json::json!({"adaptiveFormats": [{"itag": 251, "mimeType": "audio/webm; codecs=\"opus\""}]}),
+            serde_json::json!({"formats": [{"itag": 251, "mimeType": "audio/webm; codecs=\"opus\""}]}),
+        ] {
+            let data: innertube::StreamingData = serde_json::from_value(json).unwrap();
+            assert!(super::has_audio_formats(&data));
+            assert!(
+                innertube::find_ios_format(&data, innertube::AudioQuality::High, None).is_none()
+            );
+        }
+        let empty: innertube::StreamingData =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!super::has_audio_formats(&empty));
+    }
     #[tokio::test]
     async fn podcast_origin_method_rejection_uses_bounded_get_but_forbidden_does_not() {
         use std::io::{Read, Write};
