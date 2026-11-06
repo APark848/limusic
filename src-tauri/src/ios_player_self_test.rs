@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context};
+use tauri::Manager;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::platform::player::PlayerEvent;
@@ -13,7 +14,8 @@ use crate::state::AppState;
 
 const RESULT_FILE: &str = "ios-player-self-test.json";
 const REMOTE_RESULT_FILE: &str = "ios-remote-stream-self-test.json";
-const PUBLIC_VIDEO_ID: &str = "xl9cFAOKg_Y";
+// Public Diary of a CEO sample, not assumed to be the exact episode reported by the user.
+const PUBLIC_VIDEO_ID: &str = "iDsYrU2o2R8";
 const FIXTURE_SECONDS: f64 = 8.0;
 const SEEK_SECONDS: f64 = 4.0;
 const START_DELAY: Duration = Duration::from_secs(2);
@@ -235,17 +237,107 @@ async fn run(
         "empty-buffer-pause-intent",
         "transport-reconnect",
     ]);
+    let podcast_timings =
+        podcast_fixture_test(&state, data_dir, result_path, &fixture_url, events).await?;
+    observed.extend([
+        "long-aac-podcast",
+        "long-form-seek-resume",
+        "invalid-media-failed",
+        "music-after-podcast-failure",
+    ]);
     Ok((
         observed,
         serde_json::json!({
             "environment": "iOS simulator, generated local WAV; not a physical device",
             "samples": 1,
+            "podcast": podcast_timings,
             "load_to_ready_and_playing_ms": ready_playing_ms,
             "load_to_first_progress_ms": first_progress_ms,
             "resume_to_first_progress_ms": resume_progress_ms,
             "p95_ms": null,
         }),
     ))
+}
+
+async fn podcast_fixture_test(
+    state: &Arc<AppState>,
+    data_dir: &Path,
+    result_path: &Path,
+    music_url: &str,
+    events: &mut UnboundedReceiver<PlayerEvent>,
+) -> anyhow::Result<serde_json::Value> {
+    write_progress(result_path, "long-aac-podcast")?;
+    let fixture = state.app.path().resource_dir()?.join("podcast-fixture.m4a");
+    if !fixture.is_file() {
+        bail!("generated long-form AAC fixture is missing");
+    }
+    let url = tauri::Url::from_file_path(fixture).map_err(|_| anyhow!("fixture URL"))?;
+    while events.try_recv().is_ok() {}
+    let started = std::time::Instant::now();
+    state.player.load(url.as_str(), &HashMap::new(), None, None, Some(7200.0))?;
+    state.player.play()?;
+    let duration = wait_for_ready_and_playing(events).await?;
+    let ready_ms = started.elapsed().as_millis() as u64;
+    if (duration - 7200.0).abs() > 2.0 {
+        bail!("long AAC duration mismatch: {duration}");
+    }
+    state.player.pause()?;
+    let before = state.player.snapshot()?;
+    state.player.seek(3600.0)?;
+    wait_for(events, "long-form seek", |e| match e {
+        PlayerEvent::Position(p) if (*p - 3600.0).abs() < 1.0 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let resumed = std::time::Instant::now();
+    state.player.play()?;
+    wait_for(events, "long-form resume progress", |e| match e {
+        PlayerEvent::Position(p) if *p > 3600.2 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let resume_ms = resumed.elapsed().as_millis() as u64;
+    if state.player.snapshot()?["epoch"] != before["epoch"] {
+        bail!("long-form resume replaced item");
+    }
+    state.player.stop()?;
+
+    write_progress(result_path, "invalid-podcast-media")?;
+    let bad = data_dir.join("invalid-podcast.mp3");
+    std::fs::write(&bad, b"This is deliberately not an audio container.")?;
+    let bad = tauri::Url::from_file_path(bad).map_err(|_| anyhow!("invalid fixture URL"))?;
+    while events.try_recv().is_ok() {}
+    state.player.load(bad.as_str(), &HashMap::new(), None, None, None)?;
+    let _ = state.player.play(); // Failure may arrive before or after this command.
+    tokio::time::timeout(Duration::from_secs(12), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, PlayerEvent::TrackFailed(_) | PlayerEvent::Error(_)) {
+                return Ok(());
+            }
+        }
+        Err(anyhow!("event tap closed"))
+    })
+    .await
+    .context("invalid media stayed loading")??;
+    // Let the production event pump finish terminal cleanup before beginning the next fixture.
+    wait_for(events, "failed media stopped", |e| match e {
+        PlayerEvent::Playing(false) => Some(()),
+        _ => None,
+    })
+    .await?;
+    while events.try_recv().is_ok() {}
+    state.player.load(music_url, &HashMap::new(), None, None, None)?;
+    state.player.play()?;
+    wait_for_ready_and_playing(events).await?;
+    wait_for(events, "music after podcast failure", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.2 => Some(()),
+        _ => None,
+    })
+    .await?;
+    state.player.stop()?;
+    Ok(
+        serde_json::json!({"duration_seconds": duration, "ready_playing_ms": ready_ms, "seek_resume_progress_ms": resume_ms, "samples": 1}),
+    )
 }
 
 /// A loopback HTTP origin serving only our generated PCM fixture. Suspension is controlled by
@@ -393,7 +485,7 @@ async fn run_remote(
 
     let data = match tokio::time::timeout(
         Duration::from_secs(45),
-        state.resolve(PUBLIC_VIDEO_ID, false, 240),
+        state.resolve(PUBLIC_VIDEO_ID, false, 0),
     )
     .await
     {
@@ -510,7 +602,13 @@ async fn run_remote(
             });
             let _ = std::fs::write(result_path, report.to_string());
         }
-        Ok(Err(_)) | Err(_) => write_remote_failure(
+        Ok(Err(error)) => write_remote_failure(
+            &result_path,
+            "external-service",
+            "remote-playback",
+            &format!("AVPlayer remote playback failed: {error}"),
+        ),
+        Err(_) => write_remote_failure(
             &result_path,
             "external-service",
             "remote-playback",

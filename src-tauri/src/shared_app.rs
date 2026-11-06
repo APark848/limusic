@@ -273,9 +273,16 @@ pub(crate) fn spawn_event_pump(
                 PlayerEvent::Paused(paused) => state.lt_on_play_state(!paused).await,
                 PlayerEvent::TrackEnded => state.on_track_ended().await,
                 PlayerEvent::TrackFailed(message) => {
+                    #[cfg(not(target_os = "ios"))]
                     let client = state.current_stream_client().await;
-                    tracing::warn!(error = %message, client = ?client, "track failed");
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = app.emit("playback-state", "paused");
+                        state.media_set_playing(false);
+                    }
+                    tracing::warn!(error = %message, "track failed");
                     if !state.on_track_failed().await {
+                        #[cfg(not(target_os = "ios"))]
                         let message =
                             client.map_or(message.clone(), |c| format!("{message} ({c})"));
                         let _ =
@@ -298,6 +305,12 @@ pub(crate) fn spawn_event_pump(
                 }
                 PlayerEvent::VideoFailed(audio) => state.on_video_failed(&audio).await,
                 PlayerEvent::Error(message) => {
+                    #[cfg(target_os = "ios")]
+                    {
+                        let _ = state.player.stop();
+                        let _ = app.emit("playback-state", "paused");
+                        state.media_set_playing(false);
+                    }
                     tracing::error!(error = %message, "player error");
                     let _ = app.emit("playback-error", serde_json::json!({ "message": message }));
                 }

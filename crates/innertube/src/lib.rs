@@ -41,7 +41,8 @@ pub use models::metadata::{
 };
 pub use models::player::{
     authoritative_duration_secs, expected_audio_duration_ms, find_format, find_ios_format,
-    find_video_format, AudioQuality, Format, PlaybackTracking, PlayerResponse, StreamingData,
+    find_video_format, has_ios_high_format, ios_audio_mime_supported, AudioQuality, Format,
+    PlaybackTracking, PlayerResponse, StreamingData,
 };
 pub use rustypipe_fallback::{FallbackError, StreamCandidate};
 pub use transport::{

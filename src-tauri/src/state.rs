@@ -2094,6 +2094,15 @@ impl AppState {
 
     /// Jump to a specific queue index.
     pub async fn play_index(self: &std::sync::Arc<Self>, index: usize) {
+        self.play_index_checked(index, None).await;
+    }
+
+    pub async fn play_index_checked(
+        self: &Arc<Self>,
+        index: usize,
+        expected_video_id: Option<&str>,
+    ) {
+        let entered = Instant::now();
         if self.lt.is_guest().await {
             self.emit_guest_hint(); // guest playback is host-driven
             return;
@@ -2101,13 +2110,24 @@ impl AppState {
         let gen;
         {
             let mut q = self.queue.lock().await;
-            if index >= q.items.len() {
+            if !selection_matches(&q.items, index, expected_video_id) {
+                if expected_video_id.is_some() {
+                    self.emit_notice("The queue changed. Select the track again.");
+                }
                 return;
             }
+            let distance = q.current.abs_diff(index);
             gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             q.seek_to(index);
             q.lookahead_loaded = None;
-            tracing::info!(generation = gen, radio = q.radio, "manual queue selection");
+            tracing::info!(
+                generation = gen,
+                radio = q.radio,
+                index,
+                distance,
+                elapsed_ms = entered.elapsed().as_millis() as u64,
+                "manual queue selection"
+            );
         }
         // The next mpv tick is seconds away (a resolve has to finish first); until then
         // `current_position` would still report the outgoing track's position.
@@ -2351,6 +2371,7 @@ impl AppState {
     /// Which client's URL the playing track was resolved from ("WEB_REMIX", "VISIONOS", ...).
     /// Names the culprit in a playback-error toast, which on Windows is the only diagnostic a
     /// reporter can actually produce.
+    #[cfg(not(target_os = "ios"))]
     pub async fn current_stream_client(&self) -> Option<String> {
         self.queue.lock().await.current_client.clone()
     }
@@ -2362,14 +2383,30 @@ impl AppState {
     /// Returns true when the track was retried (so the caller can skip the error toast).
     pub async fn on_track_failed(self: &std::sync::Arc<Self>) -> bool {
         #[cfg(target_os = "ios")]
+        let failure_gen = self.generation.load(Ordering::SeqCst);
+        #[cfg(target_os = "ios")]
         if !self.player.wants_playback() {
             // A paused item that becomes terminally failed cannot retain playable bytes, but
             // it must never resume by itself. Preserve its offset for the user's next Play.
-            self.on_audio_device_lost().await;
+            let q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != failure_gen {
+                return true;
+            }
+            let pos = self.current_position();
+            let _ = self.player.stop();
+            if let Some(item) = q.items.get(q.current) {
+                if q.duration > 0.0 && pos > 1.0 && pos < q.duration {
+                    *self.pending_seek.lock().unwrap() = Some((item.video_id.clone(), pos));
+                }
+            }
             return false;
         }
         let (video_id, client, already_retried) = {
             let q = self.queue.lock().await;
+            #[cfg(target_os = "ios")]
+            if self.generation.load(Ordering::SeqCst) != failure_gen {
+                return true;
+            }
             let vid = q.items.get(q.current).map(|i| i.video_id.clone());
             let retried = vid.is_some() && vid == q.retried;
             (vid, q.current_client.clone(), retried)
@@ -2399,8 +2436,14 @@ impl AppState {
                 return true;
             }
             if !already_retried {
+                let gen;
                 {
                     let mut q = self.queue.lock().await;
+                    #[cfg(target_os = "ios")]
+                    if self.generation.load(Ordering::SeqCst) != failure_gen {
+                        return true;
+                    }
+                    gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
                     q.retried = Some(vid.clone());
                     // start_current's loadfile replaces mpv's playlist
                     q.lookahead_loaded = None;
@@ -2414,14 +2457,22 @@ impl AppState {
                     }
                 }
                 tracing::info!(video_id = %vid, "retrying failed track via fallback clients");
-                let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
                 if self.start_current(gen).await {
                     self.prime_lookahead_after_player_event(gen).await;
                 }
                 return true;
             }
         }
+        #[cfg(not(target_os = "ios"))]
         self.on_track_ended().await;
+        #[cfg(target_os = "ios")]
+        {
+            let _q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != failure_gen {
+                return true;
+            }
+            let _ = self.player.stop();
+        }
         false
     }
 
@@ -2680,7 +2731,9 @@ impl AppState {
                         return false;
                     }
                 }
-                Err(e) if e.affects_every_track() => {
+                Err(e)
+                    if e.affects_every_track() || matches!(e, ResolveError::UnsupportedAudio) =>
+                {
                     #[cfg(target_os = "ios")]
                     if matches!(&e, ResolveError::Unreachable(_)) {
                         let _q = self.queue.lock().await;
@@ -5524,8 +5577,26 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
     hasher.finish()
 }
 
+fn selection_matches(items: &[SongItem], index: usize, expected: Option<&str>) -> bool {
+    items.get(index).is_some_and(|item| expected.map_or(true, |id| id == item.video_id))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn near_and_deep_selection_preserve_identity_during_mutation() {
+        let mut items: Vec<_> = (0..25)
+            .map(|i| innertube::SongItem { video_id: i.to_string(), ..Default::default() })
+            .collect();
+        assert!(super::selection_matches(&items, 1, Some("1")));
+        assert!(super::selection_matches(&items, 20, Some("20")));
+        items.remove(2);
+        assert!(!super::selection_matches(&items, 20, Some("20")));
+        assert!(super::selection_matches(&items, 19, Some("20")));
+        items.reverse();
+        assert!(!super::selection_matches(&items, 19, Some("20")));
+        assert!(!super::selection_matches(&items, 99, None));
+    }
     #[test]
     fn prepared_url_must_outlive_the_selected_track_and_seek_margin() {
         use super::prepared_lifetime_valid as valid;

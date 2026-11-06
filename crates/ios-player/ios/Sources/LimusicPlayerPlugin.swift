@@ -207,8 +207,15 @@ final class LimusicPlayerPlugin: Plugin {
 
   private func safeFailure(_ error: Error?, fallback: String) -> String {
     guard let error else { return fallback }
-    let nsError = error as NSError
-    return "\(fallback) (domain=\(nsError.domain), code=\(nsError.code))"
+    var current: NSError? = error as NSError
+    var codes: [String] = []
+    // Underlying errors explain container vs transport failures without exposing signed URLs.
+    for _ in 0..<3 {
+      guard let e = current else { break }
+      codes.append("domain=\(e.domain), code=\(e.code)")
+      current = e.userInfo[NSUnderlyingErrorKey] as? NSError
+    }
+    return "\(fallback) (\(codes.joined(separator: "; ")))"
   }
 
   private func cookies(from header: String, for url: URL) throws -> [HTTPCookie] {
@@ -442,6 +449,7 @@ final class LimusicPlayerPlugin: Plugin {
         && self.preparedHeaders == args.headers
         && self.preparedExpectedDuration == args.expectedDuration
       let asset: AVURLAsset
+      let assetStarted = ProcessInfo.processInfo.systemUptime
       if canUsePrepared {
         asset = self.preparedAsset!
       } else {
@@ -463,6 +471,8 @@ final class LimusicPlayerPlugin: Plugin {
       self.progressBaseline = start ?? 0
       self.resumeStartedAt = nil
       self.diagnostic("load-received")
+      self.emit(EventKind.diagnostic, value: (ProcessInfo.processInfo.systemUptime - assetStarted) * 1000,
+        message: "asset-creation")
       self.diagnostic(canUsePrepared ? "prepared-asset-consumed" : "fresh-asset-installed")
       self.clearPreparedAsset()
       let item = AVPlayerItem(asset: asset)

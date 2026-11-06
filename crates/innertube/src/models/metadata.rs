@@ -143,7 +143,7 @@ pub(crate) const UPLOADED_TRACK_TYPE: &str = "MUSIC_VIDEO_TYPE_PRIVATELY_OWNED_T
 
 /// True for a `musicVideoType` that means "a music video", i.e. neither of the two audio kinds.
 pub(crate) fn is_video_type(t: &str) -> bool {
-    t != AUDIO_TRACK_TYPE && t != UPLOADED_TRACK_TYPE
+    t != AUDIO_TRACK_TYPE && t != UPLOADED_TRACK_TYPE && t != "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"
 }
 
 /// The `musicVideoType` a watch endpoint carries, if any.
@@ -614,14 +614,28 @@ pub(crate) fn parse_episode_item(node: &Value) -> Option<SongItem> {
 }
 
 /// " • 1 hr 4 min" → "1:04:00", " • 55 min" → "55:00": the colon form every other row uses.
-/// ponytail: numbers only, so it survives a localized unit word; a lone number is read as minutes,
-/// which makes an exact "2 hr" episode "2:00". The player's own duration corrects it on play.
+/// Do not guess units in an unfamiliar localization: a wrong duration rejects valid iOS formats.
 fn episode_duration(text: &str) -> Option<String> {
-    let n: Vec<u32> =
-        text.split(|c: char| !c.is_ascii_digit()).filter_map(|s| s.parse().ok()).collect();
-    match n[..] {
-        [m] => Some(format!("{m}:00")),
-        [h, m] => Some(format!("{h}:{m:02}:00")),
+    let text = text.trim().trim_start_matches('•').trim();
+    if text.contains(':') {
+        let parts = text.split(':').map(str::parse::<u32>).collect::<Result<Vec<_>, _>>().ok()?;
+        return match parts.as_slice() {
+            [m, s] if *s < 60 => Some(format!("{m}:{s:02}")),
+            [h, m, s] if *m < 60 && *s < 60 => Some(format!("{h}:{m:02}:{s:02}")),
+            _ => None,
+        };
+    }
+    let lower = text.to_ascii_lowercase();
+    let words: Vec<_> = lower.split_whitespace().collect();
+    let hours = |s: &str| matches!(s, "h" | "hr" | "hrs" | "hour" | "hours");
+    let minutes = |s: &str| matches!(s, "m" | "min" | "mins" | "minute" | "minutes");
+    match words.as_slice() {
+        [n, unit] if hours(unit) => Some(format!("{}:00:00", n.parse::<u32>().ok()?)),
+        [n, unit] if minutes(unit) => Some(format!("{}:00", n.parse::<u32>().ok()?)),
+        [h, hu, m, mu] if hours(hu) && minutes(mu) => {
+            let (h, m) = (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?);
+            (m < 60).then(|| format!("{h}:{m:02}:00"))
+        }
         _ => None,
     }
 }
@@ -1157,6 +1171,22 @@ pub(crate) fn find_first_str(root: &Value, key: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn podcast_duration_preserves_hours_and_clock_fields() {
+        for (raw, expected) in [
+            ("2 hr", "2:00:00"),
+            (" • 1 hr 4 min", "1:04:00"),
+            ("55 min", "55:00"),
+            ("45:30", "45:30"),
+            ("1:45:30", "1:45:30"),
+        ] {
+            assert_eq!(super::episode_duration(raw).as_deref(), Some(expected));
+        }
+        for raw in ["2", "2 unknown", "1:99", "live", "2時間"] {
+            assert_eq!(super::episode_duration(raw), None, "{raw}");
+        }
+        assert!(!super::is_video_type("MUSIC_VIDEO_TYPE_PODCAST_EPISODE"));
+    }
     use super::*;
     use serde_json::json;
 
