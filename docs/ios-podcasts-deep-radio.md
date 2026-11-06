@@ -14,9 +14,11 @@ causal trace from that physical phone:
   unit fields are now parsed separately. Unknown localized units remain unknown rather than
   inventing a duration. Podcast player metadata outranks the rounded browse hint; music retains
   its existing queue-duration precedence. Podcast episode type is not classified as a music video.
-* The main resolver selected AAC on iOS, but the rustypipe safety net still preferred Opus/WebM.
-  Both paths now use the native-compatible MIME policy. The fallback filters before ranking, so
-  AAC remains available even when Opus has higher bitrate. Unsupported audio fails explicitly.
+* The iOS resolver now uses an explicit native-compatible MIME policy, rejects MP4 entries
+  advertising a non-AAC codec, and reports unsupported audio after exhausting direct clients.
+  The desktop rustypipe extractor is disabled on mobile and is not a cause of this iPhone failure;
+  its ranking remains unchanged. The first Apple build caught and prompted removal of an
+  incorrect attempt to call that desktop-only extractor from iOS.
 * External podcast enclosures could be skipped when `expiresInSeconds` was absent, or rejected
   when an origin supported GET but returned 405/501 to HEAD. Missing expiry is now allowed only
   for external origins, with zero reusable cache lifetime. Method rejection permits one bounded

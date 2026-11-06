@@ -5578,7 +5578,7 @@ fn persist_fingerprint(q: &QueueState) -> u64 {
 }
 
 fn selection_matches(items: &[SongItem], index: usize, expected: Option<&str>) -> bool {
-    items.get(index).is_some_and(|item| expected.is_none_or(|id| id == item.video_id))
+    items.get(index).is_some_and(|item| expected.map_or(true, |id| id == item.video_id))
 }
 
 #[cfg(test)]

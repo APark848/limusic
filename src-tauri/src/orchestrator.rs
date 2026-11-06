@@ -92,6 +92,7 @@ pub enum ResolveError {
     /// about this particular track, so the queue must not skip past it or drop it.
     #[error("could not reach YouTube. Check your connection and try again ({0})")]
     Unreachable(String),
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     #[error("No compatible audio stream was available for this episode or track. Try another episode or retry later.")]
     UnsupportedAudio,
 }
@@ -363,6 +364,8 @@ impl Orchestrator {
         // (issue #292). `reason` is YouTube's own sentence, which is what separates a country
         // block from a bot check.
         let mut login_wanted = false;
+        #[cfg(target_os = "ios")]
+        let mut unsupported_audio = false;
         if let Some(r) = main_resp.as_ref().filter(|_| !main_ok) {
             login_wanted = r.playability_status.status == "LOGIN_REQUIRED";
             crate::import::note_playability(r.playability_status.reason.as_deref());
@@ -484,6 +487,14 @@ impl Orchestrator {
             #[cfg(not(target_os = "ios"))]
             let format = find_format(streaming, quality);
             let Some(format) = format else {
+                #[cfg(target_os = "ios")]
+                {
+                    unsupported_audio |= streaming
+                        .adaptive_formats
+                        .iter()
+                        .chain(streaming.formats.iter())
+                        .any(|f| f.mime_type.starts_with("audio/"));
+                }
                 tracing::debug!(client = %key, "no platform-compatible audio format");
                 continue;
             };
@@ -669,14 +680,12 @@ impl Orchestrator {
             tracing::warn!(video_id, "no authenticated client could stream this upload");
             return Err(ResolveError::UploadUnavailable(video_id.to_owned()));
         }
-        tracing::info!(video_id, "all InnerTube clients exhausted → rustypipe fallback");
         #[cfg(target_os = "ios")]
-        let fallback = rustypipe_fallback::resolve_ios(video_id, prefer_high).await;
-        #[cfg(not(target_os = "ios"))]
-        let fallback = rustypipe_fallback::resolve(video_id, prefer_high).await;
-        match fallback {
-            #[cfg(target_os = "ios")]
-            Err(rustypipe_fallback::FallbackError::NoAudio) => Err(ResolveError::UnsupportedAudio),
+        if unsupported_audio {
+            return Err(ResolveError::UnsupportedAudio);
+        }
+        tracing::info!(video_id, "all InnerTube clients exhausted → rustypipe fallback");
+        match rustypipe_fallback::resolve(video_id, prefer_high).await {
             Ok(c) if !validate_stream(&c.url, &HashMap::new(), Some(c.size)).await => {
                 tracing::warn!(video_id, "rustypipe URL serves only its first MiB, not playable");
                 // rustypipe answered, so the network is up and this failure is about the URL.

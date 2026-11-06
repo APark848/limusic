@@ -259,7 +259,7 @@ pub fn find_ios_format(
     })
 }
 
-/// Shared by the main resolver and the last-resort extractor. Never send WebM/Opus to AVPlayer.
+/// Native resolver policy. Never send WebM/Opus to AVPlayer.
 pub fn ios_audio_mime_supported(mime: &str) -> bool {
     let mime = mime.to_ascii_lowercase();
     let container = mime.split(';').next().unwrap_or("").trim();
