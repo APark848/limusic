@@ -410,7 +410,7 @@ export const prevTrack = () => invoke<void>('prev_track');
 export const backToPrevious = () => invoke<void>('back_to_previous');
 export const toggleShuffle = () => invoke<void>('toggle_shuffle');
 export const setRepeat = (mode: RepeatMode) => invoke<void>('set_repeat', { mode });
-export const togglePause = () => invoke<void>('toggle_pause');
+export const togglePause = () => playbackRequest('toggle_pause', {});
 export const seek = (position: number) => invoke<void>('seek', { position });
 export const setVolume = (volume: number) => invoke<void>('set_volume', { volume });
 /** Tempo (0.25–2.0) + pitch (−12..=12 semitones). Not persisted: resets on restart. */

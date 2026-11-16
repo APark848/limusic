@@ -70,7 +70,7 @@ pub struct AppState {
     network_resume_generation: AtomicU64,
     #[cfg(target_os = "ios")]
     playback_resolver: crate::playback_resolve::Resolver<
-        (u64, String, bool, i64, u64),
+        (u64, String, bool, i64, u64, Option<String>),
         Result<PlaybackData, ResolveError>,
     >,
     /// Bumped by the `rate` command. [`Self::refresh_rating`] samples it before its round trip
@@ -379,6 +379,7 @@ struct PreparedTrack {
     index: usize,
     video_id: String,
     resolved_at: Instant,
+    resolved_wall_secs: i64,
     data: PlaybackData,
 }
 
@@ -476,6 +477,20 @@ fn prepared_lifetime_valid(age_secs: u64, lifetime_secs: i64, duration_secs: i64
     age_secs
         < u64::try_from(lifetime_secs.saturating_sub(duration_secs.max(0)).saturating_sub(60))
             .unwrap_or(0)
+}
+
+impl PreparedTrack {
+    fn reusable(&self, duration_secs: i64, now: i64) -> bool {
+        let Ok(wall_age) = u64::try_from(now.saturating_sub(self.resolved_wall_secs)) else {
+            return false;
+        };
+        // Sleep time is observable in the CDN's clock even if the local uptime clock paused.
+        prepared_lifetime_valid(
+            wall_age.max(self.resolved_at.elapsed().as_secs()),
+            self.data.expires_in_seconds,
+            duration_secs,
+        )
+    }
 }
 
 fn prepared_next_is_current(q: &QueueState) -> bool {
@@ -1364,6 +1379,16 @@ impl AppState {
         is_upload: bool,
         duration_secs: i64,
     ) -> Result<PlaybackData, ResolveError> {
+        self.resolve_for_client_retry(video_id, is_upload, duration_secs, None).await
+    }
+
+    async fn resolve_for_client_retry(
+        &self,
+        video_id: &str,
+        is_upload: bool,
+        duration_secs: i64,
+        exclude: Option<&str>,
+    ) -> Result<PlaybackData, ResolveError> {
         // A local file is its own "stream": no network, no cache, no extraction (local.rs).
         if let Some(path) = crate::local::song_path(video_id) {
             return crate::local::playback_data(video_id, path).map_err(|_| {
@@ -1385,7 +1410,10 @@ impl AppState {
         // The cost of asking for more life than a row has is one resolve.
         let now = now_secs();
         let cache_started = Instant::now();
-        let cached = self.db.get_stream(video_id, cache_horizon(now, duration_secs));
+        let cached = self
+            .db
+            .get_stream(video_id, cache_horizon(now, duration_secs))
+            .filter(|c| exclude.is_none() || c.client.as_deref() != exclude);
         #[cfg(target_os = "ios")]
         if cached.is_none() {
             let reason = match self.db.stream_expiry(video_id) {
@@ -1453,13 +1481,18 @@ impl AppState {
                 });
             }
         }
+        let mut disabled = self.disabled_clients();
+        if let Some(client) = exclude {
+            disabled.insert(client.to_owned());
+            tracing::info!(client, "excluding failed native source for this startup retry");
+        }
         let data = self
             .orchestrator
             .resolve(
                 video_id,
                 is_upload,
                 self.quality(),
-                &self.disabled_clients(),
+                &disabled,
                 (duration_secs > 0).then_some(duration_secs as u64),
             )
             .await?;
@@ -2026,6 +2059,13 @@ impl AppState {
             }
         }
         tracing::info!("sending transport toggle to native player");
+        #[cfg(target_os = "ios")]
+        if !self.player.wants_playback() {
+            tracing::info!(
+                generation = self.generation.load(Ordering::SeqCst),
+                "retained native resume requested"
+            );
+        }
         let error = match self.player.toggle() {
             Ok(()) => return,
             Err(error) => error.to_string(),
@@ -2606,11 +2646,37 @@ impl AppState {
             if self.generation.load(Ordering::SeqCst) != gen {
                 return None;
             }
-            let key = (q.epoch, item.video_id.clone(), item.is_upload, duration, session);
+            // A source which passed the probe but never became ready failed twice on
+            // the reported phone. Try a different eligible source once. A failure
+            // after readiness (e.g. expiry during a seek) can still renew the same one.
+            let exclude = q.current_client.clone().filter(|c| {
+                foreground
+                    && !item.is_upload
+                    && q.retried.as_ref() == Some(&item.video_id)
+                    && q.duration == 0.0
+                    && c != MAIN_CLIENT
+                    && self.clients.get(c).is_some()
+            });
+            let key = (
+                q.epoch,
+                item.video_id.clone(),
+                item.is_upload,
+                duration,
+                session,
+                exclude.clone(),
+            );
             let me = self.clone();
             let item = item.clone();
             self.playback_resolver.request(key, foreground, async move {
-                me.resolve(&item.video_id, item.is_upload, duration).await
+                let work = me.resolve_for_client_retry(
+                    &item.video_id,
+                    item.is_upload,
+                    duration,
+                    exclude.as_deref(),
+                );
+                tokio::time::timeout(std::time::Duration::from_secs(60), work)
+                    .await
+                    .unwrap_or(Err(ResolveError::StartupTimeout))
             })
         };
         let (owner, future, reused) = request?;
@@ -2693,7 +2759,9 @@ impl AppState {
                 }
                 let matches = q.prepared_next.as_ref().is_some_and(|prepared| {
                     #[cfg(target_os = "ios")]
-                    if prepared.session_stamp != self.playback_session_stamp() {
+                    if prepared.session_stamp != self.playback_session_stamp()
+                        || q.retried.as_ref() == Some(&item.video_id)
+                    {
                         return false;
                     }
                     prepared_identity_matches(
@@ -2703,11 +2771,8 @@ impl AppState {
                         q.epoch,
                         q.current,
                         &item.video_id,
-                    ) && prepared_lifetime_valid(
-                        prepared.resolved_at.elapsed().as_secs(),
-                        prepared.data.expires_in_seconds,
-                        parse_duration_ms(item.duration.as_deref()) / 1000,
-                    )
+                    ) && prepared
+                        .reusable(parse_duration_ms(item.duration.as_deref()) / 1000, now_secs())
                 });
                 #[cfg(target_os = "ios")]
                 if matches {
@@ -2818,6 +2883,11 @@ impl AppState {
                     if self.generation.load(Ordering::SeqCst) != gen {
                         return false;
                     }
+                    #[cfg(target_os = "ios")]
+                    if q.retried.as_ref() == Some(&item.video_id) {
+                        self.emit_error(&item.video_id, &e.to_string());
+                        return false;
+                    }
                     // Deliberately ignores repeat-all: wrapping the unplayable-skip would spin
                     // forever on a queue where nothing resolves. Skips stop at the tail.
                     if q.current + 1 >= q.items.len() {
@@ -2897,6 +2967,10 @@ impl AppState {
         self.startup_pending.store(0, Ordering::SeqCst);
         #[cfg(target_os = "ios")]
         self.player.begin_trace(gen, startup_started);
+        #[cfg(target_os = "ios")]
+        {
+            q.current_client = Some(data.stream_client.clone());
+        }
         #[cfg(target_os = "ios")]
         let load_result = self.player.load(
             &stream_url,
@@ -3110,7 +3184,8 @@ impl AppState {
                     q.epoch,
                     index,
                     &video_id,
-                )
+                ) && prepared.reusable(duration_secs, now_secs())
+                    && prepared.session_stamp == self.playback_session_stamp()
             }) {
                 return;
             }
@@ -3169,6 +3244,7 @@ impl AppState {
             }
         }
         let started = Instant::now();
+        let resolved_wall_secs = now_secs();
         let session_stamp = self.playback_session_stamp();
         tracing::info!(
             video_id = %identity.video_id,
@@ -3248,7 +3324,8 @@ impl AppState {
             epoch: identity.epoch,
             index: identity.index,
             video_id: identity.video_id.clone(),
-            resolved_at: Instant::now(),
+            resolved_at: started,
+            resolved_wall_secs,
             data,
         });
         tracing::info!(
@@ -5711,6 +5788,25 @@ mod tests {
         assert!(!valid(0, -1, 300));
         assert!(!valid(0, 1800, 3600));
         assert!(valid(20, 7200, 3600));
+    }
+    #[test]
+    fn preparation_expires_across_hours_of_sleep_without_uptime_progress() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let mut data = crate::local::playback_data("fixture", path).unwrap();
+        data.expires_in_seconds = 3600;
+        let entry = super::PreparedTrack {
+            #[cfg(target_os = "ios")]
+            session_stamp: 0,
+            epoch: 7,
+            index: 1,
+            video_id: "fixture".into(),
+            resolved_at: std::time::Instant::now(),
+            resolved_wall_secs: 100_000,
+            data,
+        };
+        assert!(entry.reusable(300, 100_030));
+        assert!(!entry.reusable(300, 100_000 + 4 * 3600));
+        assert!(!entry.reusable(300, 99_999));
     }
     use super::{
         append_page, backfill_metadata, begin_preparation, cache_horizon, cached_duration_metadata,

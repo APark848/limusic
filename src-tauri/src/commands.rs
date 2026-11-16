@@ -240,8 +240,9 @@ pub async fn set_repeat(state: St<'_>, mode: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub async fn toggle_pause(state: St<'_>) -> Result<(), String> {
-    tracing::info!("toggle_pause command received");
+#[tracing::instrument(skip_all, fields(request_id = trace.as_ref().map(|t| t.id).unwrap_or(0)))]
+pub async fn toggle_pause(state: St<'_>, trace: Option<PlaybackTrace>) -> Result<(), String> {
+    log_playback_command(&trace, "transport");
     let state = state.inner().clone();
     state.resume_or_toggle().await;
     Ok(())

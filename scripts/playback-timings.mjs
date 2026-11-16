@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 
 export function summarize(log) {
   const requests = new Map(), generations = new Map(), samples = new Map();
+  const resumes = new Map();
   const source = r => r.source + (r.distance === undefined ? '' : r.distance <= 1 ? '/near' : '/distant');
   const number = (line, key) => {
     const value = line.match(new RegExp(`\\b${key}=(?:Some\\()?([0-9.]+)`));
@@ -28,6 +29,9 @@ export function summarize(log) {
       const request = requests.get(id);
       if (request) generations.set(gen, { request, offset: time - request.time + request.ipc });
     }
+    if (gen !== undefined && line.includes('retained native resume requested')) {
+      resumes.set(gen, requests.get(id));
+    }
     if (id && line.includes('manual queue selection') && /\bradio=true\b/.test(line)) {
       const request = requests.get(id);
       if (request?.source === 'queue') {
@@ -49,7 +53,12 @@ export function summarize(log) {
     }
     if (line.includes('iOS AVPlayer stage')) {
       const stage = line.match(/stage="?([a-z-]+)/)?.[1];
-      if (stage === 'resume-first-progress') add('resume/first-progress', number(line, 'elapsed_ms'));
+      if (stage === 'resume-first-progress') {
+        add('resume/first-progress', number(line, 'elapsed_ms'));
+        const resume = resumes.get(gen);
+        if (resume) add('transport/tap-to-resume-progress', time - resume.time + resume.ipc);
+        resumes.delete(gen);
+      }
       const trace = generations.get(gen);
       if (trace && stage === 'asset-creation') add(`${source(trace.request)}/native-asset-creation`, number(line, 'elapsed_ms'));
       if (!trace || !['load-received', 'item-ready-to-play', 'time-control-playing', 'first-playback-progress'].includes(stage)) continue;

@@ -209,10 +209,12 @@ final class LimusicPlayerPlugin: Plugin {
     guard item === player.currentItem, wantsPlayback, !failureEmitted, !authoritativeBoundaryHandled else { return }
     authoritativeBoundaryHandled = true
     if loopsCurrentItem {
-      player.seek(to: .zero) { [weak self, weak item] _ in
-        guard let self, let item, item === self.player.currentItem else { return }
-        self.authoritativeBoundaryHandled = false
-        self.startPlaybackIfReady(item, stage: "authoritative-duration-loop-restart")
+      player.seek(to: .zero) { [weak self, weak item] finished in
+        DispatchQueue.main.async {
+          guard let self, let item, item === self.player.currentItem else { return }
+          self.authoritativeBoundaryHandled = false
+          if finished { self.startPlaybackIfReady(item, stage: "authoritative-duration-loop-restart") }
+        }
       }
     } else {
       finishCurrentItem()
@@ -244,6 +246,7 @@ final class LimusicPlayerPlugin: Plugin {
       guard self.wantsPlayback, !self.authoritativeBoundaryHandled else { return }
       if baseline.isFinite && item.currentTime().seconds > baseline + 0.01 { return }
       self.diagnostic("native-no-progress-timeout")
+      self.reportAssetState(item)
       self.wantsPlayback = false
       self.player.pause()
       self.emitFailure(self.safeFailure(item.error, fallback: "Playback timed out waiting for media"))
@@ -268,7 +271,10 @@ final class LimusicPlayerPlugin: Plugin {
     // Underlying errors explain container vs transport failures without exposing signed URLs.
     for _ in 0..<3 {
       guard let e = current else { break }
-      codes.append("domain=\(e.domain), code=\(e.code)")
+      let knownDomains = [NSURLErrorDomain, NSOSStatusErrorDomain, NSCocoaErrorDomain,
+        AVFoundationErrorDomain, "CoreMediaErrorDomain", "kCFErrorDomainCFNetwork"]
+      let domain = knownDomains.contains(e.domain) ? e.domain : "other"
+      codes.append("domain=\(domain), code=\(e.code)")
       current = e.userInfo[NSUnderlyingErrorKey] as? NSError
     }
     if let event = player.currentItem?.errorLog()?.events.last {
@@ -287,6 +293,9 @@ final class LimusicPlayerPlugin: Plugin {
     }
     if let access = item.accessLog()?.events.last {
       diagnostic("native-access-requests-\(access.numberOfMediaRequests)-bytes-\(access.numberOfBytesTransferred)")
+      if let uri = access.uri, let effective = URL(string: uri), let asset = item.asset as? AVURLAsset {
+        diagnostic(effective == asset.url ? "native-access-uri-original" : "native-access-uri-changed")
+      }
     } else {
       diagnostic("native-access-log-empty")
     }
@@ -596,7 +605,7 @@ final class LimusicPlayerPlugin: Plugin {
           let status = asset.statusOfValue(forKey: "playable", error: &error)
           let elapsed = max(0, (ProcessInfo.processInfo.systemUptime - startedAt) * 1000)
           switch status {
-          case .loaded:
+          case .loaded where asset.isPlayable:
             self.emit(EventKind.diagnostic, value: elapsed, message: "prepared-asset-ready")
           case .failed, .cancelled:
             self.emit(EventKind.diagnostic, value: elapsed, message: "prepared-asset-failed")

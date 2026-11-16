@@ -95,6 +95,9 @@ pub enum ResolveError {
     #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     #[error("No compatible audio stream was available for this episode or track. Try another episode or retry later.")]
     UnsupportedAudio,
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    #[error("Playback resolution timed out. Press play to retry.")]
+    StartupTimeout,
 }
 
 impl ResolveError {
@@ -102,7 +105,12 @@ impl ResolveError {
     /// forward, or to delete a row, has to know: skipping is right for a track YouTube refused and
     /// wrong for an outage, where it walks the whole queue and deletes what it passes.
     pub fn affects_every_track(&self) -> bool {
-        matches!(self, ResolveError::Unreachable(_) | ResolveError::SignInRequired(_))
+        matches!(
+            self,
+            ResolveError::Unreachable(_)
+                | ResolveError::SignInRequired(_)
+                | ResolveError::StartupTimeout
+        )
     }
 }
 
