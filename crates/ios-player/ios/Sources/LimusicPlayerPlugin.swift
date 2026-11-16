@@ -77,6 +77,7 @@ final class LimusicPlayerPlugin: Plugin {
   private var lifecycleObservers: [NSObjectProtocol] = []
   private var backgroundedAt: Date?
   private var progressDeadline: DispatchWorkItem?
+  private var lastObservedSeconds: Double = 0
 
   deinit {
     networkMonitor.cancel()
@@ -238,13 +239,11 @@ final class LimusicPlayerPlugin: Plugin {
 
   private func awaitProgress(_ item: AVPlayerItem) {
     guard wantsPlayback, !failureEmitted, progressDeadline == nil else { return }
-    let baseline = item.currentTime().seconds
     let work = DispatchWorkItem { [weak self, weak item] in
       guard let self, let item, item === self.player.currentItem, self.wantsPlayback else { return }
       self.progressDeadline = nil
       self.recoverEnd(item)
       guard self.wantsPlayback, !self.authoritativeBoundaryHandled else { return }
-      if baseline.isFinite && item.currentTime().seconds > baseline + 0.01 { return }
       self.diagnostic("native-no-progress-timeout")
       self.reportAssetState(item)
       self.wantsPlayback = false
@@ -368,6 +367,12 @@ final class LimusicPlayerPlugin: Plugin {
       guard let self, let item, item === self.player.currentItem else { return }
       let seconds = time.seconds
       if seconds.isFinite {
+        // The callback already supplies the time. Synchronously asking an unready item
+        // for currentTime can block the main queue until the media origin responds.
+        if self.transportStatus == .playing && seconds > self.lastObservedSeconds + 0.01 {
+          self.clearProgressDeadline()
+        }
+        self.lastObservedSeconds = seconds
         self.emit(EventKind.position, value: max(0, seconds))
         if self.transportStatus == .playing, seconds > self.progressBaseline + 0.01,
           !self.firstProgressEmitted {
@@ -562,6 +567,7 @@ final class LimusicPlayerPlugin: Plugin {
       self.firstProgressEmitted = false
       self.hasPlayed = false
       self.progressBaseline = start ?? 0
+      self.lastObservedSeconds = self.progressBaseline
       self.resumeStartedAt = nil
       self.diagnostic("load-received")
       self.emit(EventKind.diagnostic, value: (ProcessInfo.processInfo.systemUptime - assetStarted) * 1000,

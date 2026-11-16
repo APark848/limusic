@@ -379,7 +379,7 @@ jobs:
                       ("restore-"+letter,url,0,int(time.time())+3600,"8"))
           PY
           # The old JSON belongs to the terminated process.
-          rm -f "$result_file"
+          rm -f "$result_file" "$(dirname "$result_file")/fixture-foreground-ready"
           SIMCTL_CHILD_LIMUSIC_TEST_RESTORED_QUEUE=1 xcrun simctl launch "$simulator_udid" "$bundle_id"
           for _ in $(seq 1 60); do
             if jq -e '.step == "background-ready"' "$result_file" >/dev/null 2>&1; then break; fi
@@ -388,6 +388,15 @@ jobs:
           jq -e '.step == "background-ready"' "$result_file"
           xcrun simctl launch "$simulator_udid" com.apple.Preferences
           for _ in $(seq 1 35); do
+            if jq -e '.step == "return-to-foreground"' "$result_file" >/dev/null 2>&1; then
+              xcrun simctl launch "$simulator_udid" "$bundle_id"
+              touch "$(dirname "$result_file")/fixture-foreground-ready"
+              break
+            fi
+            if jq -e '.status != "running"' "$result_file" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          for _ in $(seq 1 12); do
             if jq -e '.status != "running"' "$result_file" >/dev/null 2>&1; then break; fi
             sleep 1
           done
@@ -395,6 +404,7 @@ jobs:
           cp "$persistent_log" "$diagnostics_dir/restored-queue.log"
           jq -e '.status == "passed"' "$result_file"
           grep -Fq 'lifecycle-background' "$persistent_log"
+          grep -Fq 'lifecycle-active-background-ms' "$persistent_log"
 
       - name: Preserve iOS generation and build logs
         if: ${{ always() }}

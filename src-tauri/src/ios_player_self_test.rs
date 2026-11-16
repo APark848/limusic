@@ -186,8 +186,30 @@ async fn test_restored_queue(
     wait_for_ready_and_playing(events).await?;
     anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 0);
     state.pause().await;
+    let paused = state.player.snapshot()?;
+    write_progress(path, "return-to-foreground")?;
+    let returned = path.with_file_name("fixture-foreground-ready");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !returned.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("simulator did not return to the foreground")?;
+    while events.try_recv().is_ok() {}
+    let warm = std::time::Instant::now();
+    state.resume_or_toggle().await;
+    let resume_position = paused["position"].as_f64().context("missing paused position")?;
+    wait_for(events, "foreground resume progress", |e| match e {
+        PlayerEvent::Position(p) if *p > resume_position + 0.1 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let warm_ms = warm.elapsed().as_millis();
+    anyhow::ensure!(state.player.snapshot()?["epoch"] == paused["epoch"]);
+    state.pause().await;
     Ok(
-        serde_json::json!({"restored_play_to_progress_ms":cold_ms, "eof_to_successor_progress_ms":transition_ms}),
+        serde_json::json!({"restored_play_to_progress_ms":cold_ms, "eof_to_successor_progress_ms":transition_ms, "foreground_resume_to_progress_ms":warm_ms}),
     )
 }
 
