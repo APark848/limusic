@@ -700,6 +700,20 @@ impl Db {
         .ok()
     }
 
+    /// Diagnose a miss without retrieving an expired URL.
+    #[cfg(target_os = "ios")]
+    pub fn stream_expiry(&self, video_id: &str) -> Option<i64> {
+        self.0
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT expires_at FROM stream_url_cache WHERE video_id = ?1",
+                [video_id],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
     /// Drop a cached URL (e.g. it 403'd on the real GET). context/06 §2.
     pub fn evict_stream(&self, video_id: &str) {
         let conn = self.0.lock().unwrap();

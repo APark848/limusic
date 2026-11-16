@@ -257,6 +257,29 @@ pub fn find_ios_format(
                 && (mime.starts_with("audio/mpeg") || mime.starts_with("audio/mp3"))
         })
     })
+    .or_else(|| {
+        // A video podcast may have only a progressive MP4. Require both native
+        // codecs explicitly so a video-only track can never win this fallback.
+        data.formats
+            .iter()
+            .flatten()
+            .filter(|f| {
+                let mime = f.mime_type.to_ascii_lowercase();
+                let codecs = mime
+                    .split(';')
+                    .skip(1)
+                    .find_map(|p| p.trim().strip_prefix("codecs="))
+                    .unwrap_or("")
+                    .trim_matches('"');
+                let has = |prefix: &str| codecs.split(',').any(|c| c.trim().starts_with(prefix));
+                mime.split(';').next().is_some_and(|m| m.trim() == "video/mp4")
+                    && has("avc1.")
+                    && has("mp4a.40.")
+                    && f.is_original()
+                    && ios_duration_matches(f, expected_duration_ms)
+            })
+            .min_by_key(|f| f.bitrate)
+    })
 }
 
 /// Native resolver policy. Never send WebM/Opus to AVPlayer.
@@ -286,22 +309,20 @@ fn find_ios_format_where(
     expected_duration_ms: Option<u64>,
     compatible: impl Fn(&Format) -> bool + Copy,
 ) -> Option<&Format> {
-    let sane = |format: &Format| {
-        let Some(expected_ms) = expected_duration_ms.filter(|value| *value > 0) else {
-            return true;
-        };
-        let Some(actual_ms) = format_duration_ms(format) else {
-            return true;
-        };
-        let tolerance_ms = 10_000u64.max(expected_ms / 10);
-        actual_ms.abs_diff(expected_ms) <= tolerance_ms
+    find_format_where(data, quality, |format| {
+        compatible(format) && ios_duration_matches(format, expected_duration_ms)
+    })
+}
+
+fn ios_duration_matches(format: &Format, expected_duration_ms: Option<u64>) -> bool {
+    let Some(expected_ms) = expected_duration_ms.filter(|value| *value > 0) else {
+        return true;
     };
-    let sane_format = find_format_where(data, quality, |format| compatible(format) && sane(format));
-    if expected_duration_ms.is_some() {
-        sane_format
-    } else {
-        sane_format.or_else(|| find_format_where(data, quality, compatible))
-    }
+    let Some(actual_ms) = format_duration_ms(format) else {
+        return true;
+    };
+    let tolerance_ms = 10_000u64.max(expected_ms / 10);
+    actual_ms.abs_diff(expected_ms) <= tolerance_ms
 }
 
 /// Independent expected duration shared by playback metadata and iOS format selection.
@@ -479,6 +500,18 @@ pub struct Thumbnail {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ios_progressive_podcast_requires_audio_and_matching_timeline() {
+        let data: super::StreamingData = serde_json::from_value(serde_json::json!({"formats": [
+            {"itag": 137, "mimeType": "video/mp4; codecs=\"avc1.640028\"", "width": 1920},
+            {"itag": 18, "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"", "width": 640, "approxDurationMs": "7200000"}
+        ]})).unwrap();
+        assert_eq!(
+            super::find_ios_format(&data, super::AudioQuality::Low, Some(7200000)).unwrap().itag,
+            18
+        );
+        assert!(super::find_ios_format(&data, super::AudioQuality::High, Some(120000)).is_none());
+    }
     #[test]
     fn ios_high_pass_ignores_unplayable_or_malformed_high_tracks() {
         let data: super::StreamingData = serde_json::from_value(serde_json::json!({"adaptiveFormats": [

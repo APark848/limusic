@@ -1386,6 +1386,15 @@ impl AppState {
         let now = now_secs();
         let cache_started = Instant::now();
         let cached = self.db.get_stream(video_id, cache_horizon(now, duration_secs));
+        #[cfg(target_os = "ios")]
+        if cached.is_none() {
+            let reason = match self.db.stream_expiry(video_id) {
+                None => "no-row",
+                Some(at) if at <= now => "expired",
+                Some(_) => "insufficient-lifetime",
+            };
+            tracing::info!(reason, "iOS stream cache miss");
+        }
         tracing::info!(
             video_id,
             hit = cached.is_some(),
@@ -1503,6 +1512,8 @@ impl AppState {
         {
             let mut q = self.queue.lock().await;
             gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            #[cfg(target_os = "ios")]
+            self.player.invalidate_events();
             // Unplayed manual adds survive a context switch (Spotify semantics): they follow the
             // new track, ahead of its radio (hydration appends behind them).
             let mut carried = upcoming_queued(&q.items, q.current);
@@ -1664,6 +1675,8 @@ impl AppState {
                 return;
             }
             gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            #[cfg(target_os = "ios")]
+            self.player.invalidate_events();
             // Explicitly requested by a page Shuffle button, or already on and set to stick
             // across queues (issue #117: off by default, so an album opened while shuffle is on
             // plays in order).
@@ -2030,6 +2043,10 @@ impl AppState {
         #[cfg(target_os = "ios")]
         {
             let _queue = self.queue.lock().await;
+            if self.player.is_idle() {
+                // EOF may already be queued on the event pump.
+                self.player.invalidate_events();
+            }
             let loading = self.startup_pending.swap(0, Ordering::SeqCst) != 0;
             let waiting = self.network_resume_generation.swap(0, Ordering::SeqCst) != 0;
             if loading || waiting {
@@ -2118,6 +2135,8 @@ impl AppState {
             }
             let distance = q.current.abs_diff(index);
             gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            #[cfg(target_os = "ios")]
+            self.player.invalidate_events();
             q.seek_to(index);
             q.lookahead_loaded = None;
             tracing::info!(
@@ -2156,6 +2175,8 @@ impl AppState {
             if !swap_version(item) {
                 return;
             }
+            #[cfg(target_os = "ios")]
+            self.player.invalidate_events();
             // A video's cut runs its own length; `backfill_metadata` reads it off `/player`.
             item.duration = None;
             if resume {
@@ -2224,13 +2245,33 @@ impl AppState {
     /// next entry (just sync pointer + UI); if mpv went idle (lookahead absent/failed, or the
     /// track errored on a single-entry playlist) load the next track explicitly, otherwise
     /// playback silently stalls while the UI shows a phantom "now playing".
-    pub async fn on_track_ended(self: &std::sync::Arc<Self>) {
+    pub async fn on_track_ended(self: &std::sync::Arc<Self>, #[cfg(target_os = "ios")] epoch: u64) {
         if self.lt.is_guest().await {
             return; // the host drives track changes for guests; don't auto-advance locally
         }
         let transition_started = Instant::now();
+        #[cfg(target_os = "ios")]
+        let transition_gen;
         let (has_next, primed, prepared) = {
             let mut q = self.queue.lock().await;
+            #[cfg(target_os = "ios")]
+            {
+                let accepted = ios_player::is_current_event(epoch) && !q.items.is_empty();
+                tracing::info!(
+                    epoch,
+                    accepted,
+                    queue_epoch = q.epoch,
+                    index = q.current,
+                    "Rust received native EOF"
+                );
+                if !accepted {
+                    return;
+                }
+                // Claim EOF once, under the same lock as selection and OS pause.
+                self.player.invalidate_events();
+                transition_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                self.startup_pending.store(transition_gen, Ordering::SeqCst);
+            }
             match next_index(q.items.len(), q.current, q.repeat) {
                 Some(next) => {
                     let primed = q.lookahead_loaded == Some(next);
@@ -2247,6 +2288,7 @@ impl AppState {
                         })
                     });
                     q.seek_to(next);
+                    tracing::info!(queue_epoch = q.epoch, index = next, "queue advanced at EOF");
                     (true, primed, prepared)
                 }
                 None => (false, false, false),
@@ -2265,15 +2307,29 @@ impl AppState {
             // pausing here and un-pausing a second later would flicker every consumer (UI,
             // MPRIS, Discord).
             let me = self.clone();
+            #[cfg(not(target_os = "ios"))]
+            let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            #[cfg(target_os = "ios")]
+            let gen = transition_gen;
             tauri::async_runtime::spawn(async move {
-                let gen = me.generation.fetch_add(1, Ordering::SeqCst) + 1;
-                if me.extend_queue_radio(gen).await > 0 {
-                    {
-                        let mut q = me.queue.lock().await;
-                        let next = q.current + 1; // the first appended track
+                me.extend_queue_radio(gen).await;
+                let advanced = {
+                    let mut q = me.queue.lock().await;
+                    if me.generation.load(Ordering::SeqCst) != gen {
+                        return;
+                    }
+                    // An early radio fetch or an explicit enqueue can win the race.
+                    if let Some(next) = next_index(q.items.len(), q.current, q.repeat) {
                         q.seek_to(next);
                         q.lookahead_loaded = None; // start_current's loadfile replaces mpv's playlist
+                        true
+                    } else {
+                        #[cfg(target_os = "ios")]
+                        me.startup_pending.store(0, Ordering::SeqCst);
+                        false
                     }
+                };
+                if advanced {
                     if me.start_current(gen).await {
                         me.prime_lookahead(gen).await;
                     }
@@ -2297,7 +2353,10 @@ impl AppState {
             // into the gapless branch below — a phantom "now playing" over a silent player. If we
             // never primed this index, mpv cannot have advanced into it; load explicitly. Bump the
             // generation so any in-flight lookahead resolve discards itself (double-enqueue).
+            #[cfg(not(target_os = "ios"))]
             let gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            #[cfg(target_os = "ios")]
+            let gen = transition_gen;
             tracing::info!("no primed lookahead at track end — loading next explicitly");
             // start_current's loadfile *replaces* mpv's playlist, so whatever was recorded here is
             // gone either way — clear it like every other load path (play_index, on_track_failed,
@@ -3819,11 +3878,13 @@ impl AppState {
     async fn extend_queue_radio(self: &std::sync::Arc<Self>, gen: u64) -> usize {
         const AUTOPLAY_BATCH: usize = 20;
         if !self.autoplay_enabled() || self.lt.is_guest().await {
+            tracing::info!(generation = gen, "radio extension disabled or host-driven");
             return 0;
         }
         let (last_video, seed) = {
             let q = self.queue.lock().await;
             if q.hydrating == Some(gen) {
+                tracing::debug!(generation = gen, "radio hydration already running");
                 // This queue's own `play_song` is already fetching its radio (#255). Keyed to the
                 // generation: a marker left by a queue that has since been replaced (`play_index`
                 // and the other load paths bump the generation without clearing it) must not stop
@@ -3831,9 +3892,11 @@ impl AppState {
                 return 0;
             }
             if q.repeat != RepeatMode::Off {
+                tracing::debug!(generation = gen, "radio extension suppressed by repeat");
                 return 0; // the queue never exhausts under repeat
             }
             if q.items.len().saturating_sub(q.current) > 2 {
+                tracing::debug!(generation = gen, "radio extension deferred until queue tail");
                 return 0; // tail not near yet
             }
             let Some(last) = q.items.last() else { return 0 };
@@ -3843,14 +3906,38 @@ impl AppState {
                 return 0;
             }
             let seed = q.radio_seed.clone().unwrap_or_else(|| format!("RDAMVM{}", last.video_id));
+            tracing::info!(
+                generation = gen,
+                queue_epoch = q.epoch,
+                index = q.current,
+                saved_seed = q.radio_seed.is_some(),
+                "radio extension requested"
+            );
             (last.video_id.clone(), seed)
         };
         let Some(client) = self.clients.get(innertube::METADATA_CLIENT) else { return 0 };
         // Snapshot → network → re-lock, same discipline as `prime_lookahead`; the generation check
         // between them is what makes it safe, and `absorb_radio` dedupes against the queue as it
         // is after the fetch, so whatever grew it meanwhile can't come back as a duplicate.
-        let fresh = match self.it.next(client, Some(&last_video), Some(&seed)).await {
-            Ok(next) => next.items,
+        let page =
+            async { self.it.next(client, Some(&last_video), Some(&seed)).await.map(|n| n.items) };
+        #[cfg(all(target_os = "ios", feature = "ios-player-self-test"))]
+        let page = async {
+            if seed == "RD-restored-ci" && std::env::var_os("LIMUSIC_TEST_RESTORED_QUEUE").is_some()
+            {
+                if last_video == "restore-b" {
+                    return Ok(vec![SongItem {
+                        video_id: "restore-c".into(),
+                        title: "Radio fixture".into(),
+                        ..Default::default()
+                    }]);
+                }
+                return Ok(vec![]);
+            }
+            page.await
+        };
+        let fresh = match page.await {
+            Ok(items) => items,
             Err(e) => {
                 tracing::warn!(error = %e, "autoplay radio fetch failed");
                 return 0;
@@ -3898,6 +3985,9 @@ impl AppState {
         }
         let (added, trimmed) = {
             let mut q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != gen {
+                return 0;
+            }
             // Against the queue as it is *now*, not a snapshot from before the fetch: a playlist
             // fill, a guest add or `play_song`'s own hydration can all have appended something
             // while we were on the network, and dropping a stale set on top of it duplicates.
@@ -3930,7 +4020,7 @@ impl AppState {
             self.lt_broadcast_queue().await;
             // Appending at the tail never touches a primed lookahead slot; this covers the
             // "current was last, nothing was primed" case.
-            self.prime_lookahead(gen).await;
+            self.prime_lookahead_after_player_event(gen).await;
         }
         added
     }
@@ -4037,11 +4127,26 @@ impl AppState {
             }
         }
         let pos = self.db.get_setting("queue_position").and_then(|s| s.parse::<f64>().ok());
-        if let Some(p) = pos.filter(|p| *p > 0.0) {
-            *self.pending_seek.lock().unwrap() = Some((items[current].video_id.clone(), p));
-        }
         {
             let mut q = self.queue.lock().await;
+            if self.generation.load(Ordering::SeqCst) != 0 || !q.items.is_empty() {
+                tracing::info!("queue restoration superseded by user selection");
+                return;
+            }
+            if let Some(p) = pos.filter(|p| p.is_finite() && *p > 0.0) {
+                *self.pending_seek.lock().unwrap() = Some((items[current].video_id.clone(), p));
+            }
+            q.epoch += 1;
+            tracing::info!(
+                queue_epoch = q.epoch,
+                index = current,
+                count = items.len(),
+                ?repeat,
+                shuffle = shuffle_orig.is_some(),
+                has_radio_seed = radio_seed.is_some(),
+                autoplay = self.autoplay_enabled(),
+                "restored paused queue"
+            );
             q.current = current;
             q.items = items;
             q.repeat = repeat;

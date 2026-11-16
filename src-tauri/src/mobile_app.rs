@@ -9,6 +9,13 @@ use crate::{commands, db::Db, http, shared_app};
 #[tauri::mobile_entry_point]
 pub fn run() {
     tauri::Builder::default()
+        // Bridge::create navigates to this bundled document on every platform.
+        .register_uri_scheme_protocol(crate::webview::SCHEME, |_ctx, _req| {
+            tauri::http::Response::builder()
+                .header(tauri::http::header::CONTENT_TYPE, "text/html")
+                .body(crate::webview::HARNESS_HTML.as_bytes())
+                .expect("static harness response")
+        })
         .plugin(ios_player::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())

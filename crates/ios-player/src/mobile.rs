@@ -46,7 +46,6 @@ static EVENT_TX: OnceLock<Mutex<Option<UnboundedSender<PlayerEvent>>>> = OnceLoc
 static IDLE: AtomicBool = AtomicBool::new(true);
 static PLAYING: AtomicBool = AtomicBool::new(false);
 static WANTS_PLAYBACK: AtomicBool = AtomicBool::new(false);
-static REPORTED_PROGRESS: AtomicBool = AtomicBool::new(false);
 static TRACE: Mutex<Option<(u64, std::time::Instant)>> = Mutex::new(None);
 static EVENT_EPOCH: AtomicU64 = AtomicU64::new(0);
 
@@ -84,6 +83,9 @@ pub unsafe extern "C" fn limusic_ios_player_emit(
         return;
     }
     if !is_current_event(epoch) {
+        if kind == 4 {
+            tracing::info!(epoch, "discarded stale native end event");
+        }
         return;
     }
     let message = if message.is_null() {
@@ -94,19 +96,14 @@ pub unsafe extern "C" fn limusic_ios_player_emit(
 
     if kind == 7 {
         let trace = *TRACE.lock().unwrap();
-        tracing::info!(stage = %message, elapsed_ms = value,
+        tracing::info!(epoch, stage = %message, elapsed_ms = value,
             generation = trace.map(|t| t.0),
             startup_ms = trace.map(|t| t.1.elapsed().as_millis() as u64), "iOS AVPlayer stage");
         return;
     }
 
     let event = match kind {
-        0 => {
-            if value > 0.0 && !REPORTED_PROGRESS.swap(true, Ordering::SeqCst) {
-                tracing::info!(position = value, "iOS AVPlayer reported first playback progress");
-            }
-            PlayerEvent::Position(value)
-        }
+        0 => PlayerEvent::Position(value),
         1 => {
             tracing::info!(duration = value, "iOS AVPlayer item ready with duration");
             PlayerEvent::Duration(value)
@@ -252,7 +249,6 @@ impl<R: Runtime> IosPlayer<R> {
         tracing::info!("Swift player load returned successfully");
         IDLE.store(false, Ordering::SeqCst);
         PLAYING.store(false, Ordering::SeqCst);
-        REPORTED_PROGRESS.store(false, Ordering::SeqCst);
         Ok(())
     }
 

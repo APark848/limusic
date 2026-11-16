@@ -6,7 +6,7 @@ name: iOS validation
 on:
   workflow_dispatch:
   pull_request:
-    branches: [master, ios-playback-smoothness, codex/ios-manual-playback-continuity]
+    branches: [master, ios-playback-smoothness, codex/ios-manual-playback-continuity, codex/ios-podcasts-deep-radio]
   push:
     branches: [master]
 
@@ -361,6 +361,40 @@ jobs:
           fi
           trap - ERR
           cp "$persistent_log" "$diagnostics_dir/limusic.log"
+
+          # Relaunch the installed app with a real SQLite queue. Only this simulator's
+          # generated WAV supplies audio; the sole network fixture is the saved radio's page.
+          xcrun simctl terminate "$simulator_udid" "$bundle_id"
+          python3 - "$data_container" <<'PY'
+          import json, pathlib, sqlite3, sys, time
+          root = pathlib.Path(sys.argv[1])
+          url = next(root.rglob("ios-player-self-test.wav")).as_uri()
+          items = [dict(video_id="restore-" + letter, title=letter, artists="Fixture", duration="0:08") for letter in "ab"]
+          queue = dict(items=items, current=0, shuffleOrig=items[::-1], repeat="off", radioSeed="RD-restored-ci")
+          with sqlite3.connect(next(root.rglob("limusic.sqlite"))) as db:
+              db.executemany("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+                  [("queue_json",json.dumps(queue)), ("queue_position","0"), ("autoplay","true")])
+              for letter in "abc":
+                  db.execute("INSERT OR REPLACE INTO stream_url_cache(video_id,url,itag,expires_at,duration,duration_trusted) VALUES(?,?,?,?,?,1)",
+                      ("restore-"+letter,url,0,int(time.time())+3600,"8"))
+          PY
+          # The old JSON belongs to the terminated process.
+          rm -f "$result_file"
+          SIMCTL_CHILD_LIMUSIC_TEST_RESTORED_QUEUE=1 xcrun simctl launch "$simulator_udid" "$bundle_id"
+          for _ in $(seq 1 60); do
+            if jq -e '.step == "background-ready"' "$result_file" >/dev/null 2>&1; then break; fi
+            sleep 0.25
+          done
+          jq -e '.step == "background-ready"' "$result_file"
+          xcrun simctl launch "$simulator_udid" com.apple.Preferences
+          for _ in $(seq 1 35); do
+            if jq -e '.status != "running"' "$result_file" >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          cp "$result_file" "$diagnostics_dir/restored-queue.json"
+          cp "$persistent_log" "$diagnostics_dir/restored-queue.log"
+          jq -e '.status == "passed"' "$result_file"
+          grep -Fq 'lifecycle-background' "$persistent_log"
 
       - name: Preserve iOS generation and build logs
         if: ${{ always() }}

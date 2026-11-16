@@ -14,8 +14,8 @@ use crate::state::AppState;
 
 const RESULT_FILE: &str = "ios-player-self-test.json";
 const REMOTE_RESULT_FILE: &str = "ios-remote-stream-self-test.json";
-// Public Diary of a CEO sample, not assumed to be the exact episode reported by the user.
-const PUBLIC_VIDEO_ID: &str = "iDsYrU2o2R8";
+// Episode identified in the signed-out physical iPhone diagnostic report.
+const PUBLIC_VIDEO_ID: &str = "FRoQOzZRcpw";
 const FIXTURE_SECONDS: f64 = 8.0;
 const SEEK_SECONDS: f64 = 4.0;
 const START_DELAY: Duration = Duration::from_secs(2);
@@ -74,6 +74,15 @@ async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared
     let _ = write_progress(&result_path, "starting");
     tokio::time::sleep(START_DELAY).await;
     let mut events = prepared.events;
+    if std::env::var_os("LIMUSIC_TEST_RESTORED_QUEUE").is_some() {
+        let result = test_restored_queue(&state, &result_path, &mut events).await;
+        let report = match result {
+            Ok(timings) => serde_json::json!({"status":"passed", "timings":timings}),
+            Err(e) => serde_json::json!({"status":"failed", "error":format!("{e:#}")}),
+        };
+        let _ = std::fs::write(result_path, report.to_string());
+        return;
+    }
     let result = run(state.clone(), &data_dir, &result_path, &mut events).await;
     let local_passed = result.is_ok();
     let report = match result {
@@ -93,6 +102,71 @@ async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared
     if local_passed {
         run_remote(state, &data_dir, &mut events).await;
     }
+}
+
+async fn test_restored_queue(
+    state: &Arc<AppState>,
+    path: &Path,
+    events: &mut UnboundedReceiver<PlayerEvent>,
+) -> anyhow::Result<serde_json::Value> {
+    let initial = state.queue_snapshot().await;
+    anyhow::ensure!(
+        initial["currentIndex"] == 0
+            && initial["items"][0]["video_id"] == "restore-a"
+            && initial["shuffle"] == true
+            && state.player.is_idle(),
+        "queue did not restore paused"
+    );
+    let started = std::time::Instant::now();
+    state.resume().await;
+    wait_for(events, "restored playback", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.2 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let cold_ms = started.elapsed().as_millis();
+    state.pause().await;
+    let first_epoch = state.player.snapshot()?["epoch"].as_u64().context("missing epoch")?;
+    state.resume_or_toggle().await;
+    let snapshot = state.player.snapshot()?;
+    anyhow::ensure!(snapshot["epoch"] == first_epoch && snapshot["wantsPlayback"] == true);
+    // Deliver the previous item's completion while the new one is live.
+    state.on_track_ended(first_epoch - 1).await;
+    anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 0);
+    write_progress(path, "background-ready")?;
+    wait_for(events, "first natural EOF", |e| matches!(e, PlayerEvent::TrackEnded).then_some(()))
+        .await?;
+    let eof = std::time::Instant::now();
+    wait_for_ready_and_playing(events).await?;
+    wait_for(events, "successor progress", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.1 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let transition_ms = eof.elapsed().as_millis();
+    let q = state.queue_snapshot().await;
+    anyhow::ensure!(
+        q["currentIndex"] == 1
+            && q["items"][1]["video_id"] == "restore-b"
+            && q["items"][2]["video_id"] == "restore-c",
+        "existing successor or radio extension missing"
+    );
+    state.on_track_ended(first_epoch).await;
+    anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 1);
+    state.user_seek(FIXTURE_SECONDS - 1.0).await.map_err(anyhow::Error::msg)?;
+    wait_for(events, "second natural EOF", |e| matches!(e, PlayerEvent::TrackEnded).then_some(()))
+        .await?;
+    wait_for_ready_and_playing(events).await?;
+    wait_for(events, "radio playback progress", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.1 => Some(()),
+        _ => None,
+    })
+    .await?;
+    anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 2);
+    state.pause().await;
+    Ok(
+        serde_json::json!({"restored_play_to_progress_ms":cold_ms, "eof_to_successor_progress_ms":transition_ms}),
+    )
 }
 
 async fn run(

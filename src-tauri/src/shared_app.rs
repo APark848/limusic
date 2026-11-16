@@ -31,6 +31,12 @@ pub(crate) fn build(
     let data_sync_id = crate::state::persisted_data_sync_id(&db);
     let visitor_data = db.get_setting("visitor_data").filter(|s| !s.is_empty());
     let needs_visitor_bootstrap = visitor_data.is_none();
+    #[cfg(target_os = "ios")]
+    tracing::info!(
+        signed_in = cookie.is_some(),
+        visitor_restored = !needs_visitor_bootstrap,
+        "new iOS process restoring playback session"
+    );
     let visitor_for_prewarm = visitor_data.clone();
     let session = Session { locale: Locale::default(), visitor_data, data_sync_id, cookie };
     let it = InnerTube::new(session, proxy)?;
@@ -223,6 +229,16 @@ pub(crate) fn spawn_event_pump(
         while let Some(event) = events.recv().await {
             #[cfg(target_os = "ios")]
             let event = match event {
+                PlayerEvent::Scoped { epoch, event }
+                    if matches!(*event, PlayerEvent::TrackEnded) =>
+                {
+                    #[cfg(feature = "ios-player-self-test")]
+                    if ios_player::is_current_event(epoch) {
+                        crate::ios_player_self_test::observe_event(&event);
+                    }
+                    state.on_track_ended(epoch).await;
+                    continue;
+                }
                 PlayerEvent::Scoped { epoch, event } if ios_player::is_current_event(epoch) => {
                     *event
                 }
@@ -271,7 +287,10 @@ pub(crate) fn spawn_event_pump(
                     state.media_set_playing(false);
                 }
                 PlayerEvent::Paused(paused) => state.lt_on_play_state(!paused).await,
+                #[cfg(not(target_os = "ios"))]
                 PlayerEvent::TrackEnded => state.on_track_ended().await,
+                #[cfg(target_os = "ios")]
+                PlayerEvent::TrackEnded => unreachable!("native completion is item-scoped"),
                 PlayerEvent::TrackFailed(message) => {
                     #[cfg(not(target_os = "ios"))]
                     let client = state.current_stream_client().await;
