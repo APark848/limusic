@@ -14,8 +14,8 @@ use crate::state::AppState;
 
 const RESULT_FILE: &str = "ios-player-self-test.json";
 const REMOTE_RESULT_FILE: &str = "ios-remote-stream-self-test.json";
-// Public Diary of a CEO sample, not assumed to be the exact episode reported by the user.
-const PUBLIC_VIDEO_ID: &str = "iDsYrU2o2R8";
+// Episode identified in the signed-out physical iPhone diagnostic report.
+const PUBLIC_VIDEO_ID: &str = "FRoQOzZRcpw";
 const FIXTURE_SECONDS: f64 = 8.0;
 const SEEK_SECONDS: f64 = 4.0;
 const START_DELAY: Duration = Duration::from_secs(2);
@@ -74,6 +74,15 @@ async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared
     let _ = write_progress(&result_path, "starting");
     tokio::time::sleep(START_DELAY).await;
     let mut events = prepared.events;
+    if std::env::var_os("LIMUSIC_TEST_RESTORED_QUEUE").is_some() {
+        let result = test_restored_queue(&state, &result_path, &mut events).await;
+        let report = match result {
+            Ok(timings) => serde_json::json!({"status":"passed", "timings":timings}),
+            Err(e) => serde_json::json!({"status":"failed", "error":format!("{e:#}")}),
+        };
+        let _ = std::fs::write(result_path, report.to_string());
+        return;
+    }
     let result = run(state.clone(), &data_dir, &result_path, &mut events).await;
     let local_passed = result.is_ok();
     let report = match result {
@@ -93,6 +102,115 @@ async fn run_spawned(state: Arc<AppState>, data_dir: PathBuf, prepared: Prepared
     if local_passed {
         run_remote(state, &data_dir, &mut events).await;
     }
+}
+
+async fn test_restored_queue(
+    state: &Arc<AppState>,
+    path: &Path,
+    events: &mut UnboundedReceiver<PlayerEvent>,
+) -> anyhow::Result<serde_json::Value> {
+    let initial = state.queue_snapshot().await;
+    anyhow::ensure!(
+        initial["currentIndex"] == 0
+            && initial["items"][0]["video_id"] == "restore-a"
+            && initial["shuffle"] == true
+            && state.player.is_idle(),
+        "queue did not restore paused"
+    );
+    let started = std::time::Instant::now();
+    state.resume().await;
+    wait_for(events, "restored playback", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.2 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let cold_ms = started.elapsed().as_millis();
+    state.pause().await;
+    let first_epoch = state.player.snapshot()?["epoch"].as_u64().context("missing epoch")?;
+    state.resume_or_toggle().await;
+    let snapshot = state.player.snapshot()?;
+    anyhow::ensure!(snapshot["epoch"] == first_epoch && snapshot["wantsPlayback"] == true);
+    // Deliver the previous item's completion while the new one is live.
+    state.on_track_ended(first_epoch - 1).await;
+    anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 0);
+    // Leave several seconds for simctl to activate Settings before natural completion.
+    state.user_seek(2.0).await.map_err(anyhow::Error::msg)?;
+    write_progress(path, "background-ready")?;
+    wait_for(events, "first natural EOF", |e| matches!(e, PlayerEvent::TrackEnded).then_some(()))
+        .await?;
+    let eof = std::time::Instant::now();
+    wait_for_ready_and_playing(events).await?;
+    wait_for(events, "successor progress", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.1 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let transition_ms = eof.elapsed().as_millis();
+    let q = state.queue_snapshot().await;
+    anyhow::ensure!(
+        q["currentIndex"] == 1
+            && q["items"][1]["video_id"] == "restore-b"
+            && q["items"][2]["video_id"] == "restore-c",
+        "existing successor or radio extension missing"
+    );
+    state.on_track_ended(first_epoch).await;
+    anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 1);
+    state.user_seek(FIXTURE_SECONDS - 1.0).await.map_err(anyhow::Error::msg)?;
+    wait_for(events, "second natural EOF", |e| matches!(e, PlayerEvent::TrackEnded).then_some(()))
+        .await?;
+    wait_for_ready_and_playing(events).await?;
+    wait_for(events, "radio playback progress", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.1 => Some(()),
+        _ => None,
+    })
+    .await?;
+    anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 2);
+    state.set_repeat(crate::state::RepeatMode::One).await;
+    let loop_epoch = state.player.snapshot()?["epoch"].clone();
+    state.user_seek(FIXTURE_SECONDS - 1.0).await.map_err(anyhow::Error::msg)?;
+    wait_for(events, "repeat-one seek", |e| match e {
+        PlayerEvent::Position(p) if *p >= FIXTURE_SECONDS - 1.1 => Some(()),
+        _ => None,
+    })
+    .await?;
+    wait_for(events, "repeat-one restart", |e| match e {
+        PlayerEvent::Position(p) if *p > 0.1 && *p < 2.0 => Some(()),
+        _ => None,
+    })
+    .await?;
+    anyhow::ensure!(state.player.snapshot()?["epoch"] == loop_epoch);
+    state.set_repeat(crate::state::RepeatMode::All).await;
+    state.user_seek(FIXTURE_SECONDS - 1.0).await.map_err(anyhow::Error::msg)?;
+    wait_for(events, "repeat-all EOF", |e| matches!(e, PlayerEvent::TrackEnded).then_some(()))
+        .await?;
+    wait_for_ready_and_playing(events).await?;
+    anyhow::ensure!(state.queue_snapshot().await["currentIndex"] == 0);
+    state.pause().await;
+    let paused = state.player.snapshot()?;
+    write_progress(path, "return-to-foreground")?;
+    let returned = path.with_file_name("fixture-foreground-ready");
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !returned.exists() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .context("simulator did not return to the foreground")?;
+    while events.try_recv().is_ok() {}
+    let warm = std::time::Instant::now();
+    state.resume_or_toggle().await;
+    let resume_position = paused["position"].as_f64().context("missing paused position")?;
+    wait_for(events, "foreground resume progress", |e| match e {
+        PlayerEvent::Position(p) if *p > resume_position + 0.1 => Some(()),
+        _ => None,
+    })
+    .await?;
+    let warm_ms = warm.elapsed().as_millis();
+    anyhow::ensure!(state.player.snapshot()?["epoch"] == paused["epoch"]);
+    state.pause().await;
+    Ok(
+        serde_json::json!({"restored_play_to_progress_ms":cold_ms, "eof_to_successor_progress_ms":transition_ms, "foreground_resume_to_progress_ms":warm_ms}),
+    )
 }
 
 async fn run(
@@ -345,15 +463,18 @@ async fn podcast_fixture_test(
 async fn fixture_origin(
     bytes: Arc<Vec<u8>>,
     available: Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(String, tokio::task::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://127.0.0.1:{}/fixture.wav", listener.local_addr()?.port());
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let redirected_range = observed.clone();
     let task = tokio::spawn(async move {
         let mut connections = tokio::task::JoinSet::new();
         while let Ok((mut socket, _)) = listener.accept().await {
             let bytes = bytes.clone();
             let available = available.clone();
+            let redirected_range = redirected_range.clone();
             connections.spawn(async move {
                 let mut request = Vec::new();
                 while request.len() < 8192 && !request.ends_with(b"\r\n\r\n") {
@@ -365,7 +486,14 @@ async fn fixture_origin(
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
                 let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                if request.lines().next().is_some_and(|line| line.contains(" /fixture.wav ")) {
+                    let _ = socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: /media.wav\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+                    return;
+                }
                 let range = request.lines().find_map(|line| line.strip_prefix("range: bytes="));
+                if range.is_some() && request.contains("user-agent: limusic-fixture") {
+                    redirected_range.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 let (start, end) = range.and_then(|r| r.split_once('-'))
                     .map(|(start, end)| (start.parse::<usize>().unwrap_or(0),
                         end.trim().parse::<usize>().unwrap_or(bytes.len() - 1)))
@@ -384,7 +512,7 @@ async fn fixture_origin(
         }
         // Dropping JoinSet on cancellation also closes all fixture connections.
     });
-    Ok((url, task))
+    Ok((url, task, observed))
 }
 
 async fn controlled_transport_test(
@@ -397,7 +525,7 @@ async fn controlled_transport_test(
     let bytes = Arc::new(std::fs::read(fixture)?);
     write_progress(result_path, "http-fixture-loading")?;
     let available = Arc::new(AtomicBool::new(true));
-    let (url, server) = fixture_origin(bytes.clone(), available).await?;
+    let (url, server, redirected_range) = fixture_origin(bytes.clone(), available).await?;
     // Always abort the origin, including an early failed assertion.
     struct Origin(tokio::task::JoinHandle<()>);
     impl Drop for Origin {
@@ -407,7 +535,8 @@ async fn controlled_transport_test(
     }
     let origin = Origin(server);
     while events.try_recv().is_ok() {}
-    state.player.load(&url, &HashMap::new(), None, None, None)?;
+    let headers = HashMap::from([("User-Agent".into(), "Limusic-Fixture".into())]);
+    state.player.load(&url, &headers, None, None, None)?;
     state.player.play()?;
     wait_for_ready_and_playing(events).await?;
     wait_for(events, "HTTP fixture progress", |e| match e {
@@ -415,6 +544,10 @@ async fn controlled_transport_test(
         _ => None,
     })
     .await?;
+    anyhow::ensure!(
+        redirected_range.load(Ordering::SeqCst),
+        "AVURLAsset did not send the configured User-Agent on a redirected range GET"
+    );
     state.player.pause()?;
     let before = state.player.snapshot()?;
     if before["bufferedAhead"].as_f64().unwrap_or(0.0) < 1.0 {
@@ -437,7 +570,7 @@ async fn controlled_transport_test(
 
     let available = Arc::new(AtomicBool::new(false));
     write_progress(result_path, "no-data-loading")?;
-    let (url, server) = fixture_origin(bytes, available.clone()).await?;
+    let (url, server, _) = fixture_origin(bytes, available.clone()).await?;
     let _origin = Origin(server);
     while events.try_recv().is_ok() {}
     state.player.load(&url, &HashMap::new(), None, None, None)?;

@@ -29,6 +29,15 @@ test('accepts the unquoted tracing display format used by the native bridge', ()
   assert.equal(rows[0].p50_ms, 123.25);
 });
 
+test('measures retained-item resume from the transport tap', () => {
+  const rows = summarize(`
+2026-11-05T00:00:00.010Z toggle_pause{request_id=2}: playback command received source=transport ipc_ms=7
+2026-11-05T00:00:00.013Z toggle_pause{request_id=2}: retained native resume requested generation=3
+2026-11-05T00:00:00.190Z iOS AVPlayer stage stage=resume-first-progress generation=3 elapsed_ms=170
+`);
+  assert.equal(rows.find(r => r.metric === 'transport/tap-to-resume-progress').p50_ms, 187);
+});
+
 test('distinguishes an existing radio row from ordinary queue selection', () => {
   const rows = summarize(`
 2026-11-05T00:00:00.000Z play_index{request_id=3}: playback command received source=queue ipc_ms=2

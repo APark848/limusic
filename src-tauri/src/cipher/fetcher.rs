@@ -43,6 +43,13 @@ impl PlayerJsFetcher {
 
     /// Return the current `player.js` (cached if fresh, else fetched fresh and cached).
     pub async fn fetch(&self) -> Result<PlayerJs, Error> {
+        // A relaunch loses the in-memory analysis. Reuse the exact pair already on disk
+        // within its original TTL. A partial write or clock rollback forces rediscovery.
+        #[cfg(target_os = "ios")]
+        if let Some(player) = self.cached_player(now_secs()) {
+            tracing::info!("player discovery reused fresh disk cache");
+            return Ok(player);
+        }
         let hash = self.current_hash().await?;
         let cached = self.cache_dir.join(format!("player_{hash}.js"));
         if let Some(js) = read_if_fresh(&cached) {
@@ -56,6 +63,21 @@ impl PlayerJsFetcher {
         std::fs::write(self.cache_dir.join("current_hash.txt"), format!("{hash}\n{}", now_secs()))?;
         tracing::info!(hash, bytes = js.len(), "fetched fresh player.js");
         Ok(PlayerJs { js, hash })
+    }
+
+    #[cfg(any(target_os = "ios", test))]
+    fn cached_player(&self, now: u64) -> Option<PlayerJs> {
+        let stamp = std::fs::read_to_string(self.cache_dir.join("current_hash.txt")).ok()?;
+        let (hash, at) = stamp.split_once('\n')?;
+        if hash.is_empty()
+            || hash.len() > 64
+            || !hash.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+            || now.checked_sub(at.parse().ok()?)? >= CACHE_TTL.as_secs()
+        {
+            return None;
+        }
+        let js = read_if_fresh(&self.cache_dir.join(format!("player_{hash}.js")))?;
+        (!js.is_empty()).then(|| PlayerJs { hash: hash.into(), js })
     }
 
     /// Delete cached `player_*.js` + `current_hash.txt` (NOT the shared config files). context/05.
@@ -110,6 +132,23 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_player_cache_requires_a_fresh_matching_pair() {
+        let dir =
+            std::env::temp_dir().join(format!("limusic-player-cache-{}", rand::random::<u64>()));
+        let f = PlayerJsFetcher::new(&dir);
+        let stamp = f.cache_dir.join("current_hash.txt");
+        std::fs::write(&stamp, "fixture\n100").unwrap();
+        assert!(f.cached_player(101).is_none());
+        std::fs::write(f.cache_dir.join("player_fixture.js"), "fixture").unwrap();
+        assert!(f.cached_player(101).is_some());
+        assert!(f.cached_player(99).is_none());
+        assert!(f.cached_player(100 + CACHE_TTL.as_secs()).is_none());
+        std::fs::write(stamp, "../fixture\n100").unwrap();
+        assert!(f.cached_player(101).is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn hash_from_escaped_iframe_api() {

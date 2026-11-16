@@ -95,6 +95,9 @@ pub enum ResolveError {
     #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
     #[error("No compatible audio stream was available for this episode or track. Try another episode or retry later.")]
     UnsupportedAudio,
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    #[error("Playback resolution timed out. Press play to retry.")]
+    StartupTimeout,
 }
 
 impl ResolveError {
@@ -102,7 +105,12 @@ impl ResolveError {
     /// forward, or to delete a row, has to know: skipping is right for a track YouTube refused and
     /// wrong for an outage, where it walks the whole queue and deletes what it passes.
     pub fn affects_every_track(&self) -> bool {
-        matches!(self, ResolveError::Unreachable(_) | ResolveError::SignInRequired(_))
+        matches!(
+            self,
+            ResolveError::Unreachable(_)
+                | ResolveError::SignInRequired(_)
+                | ResolveError::StartupTimeout
+        )
     }
 }
 
@@ -265,12 +273,27 @@ impl Orchestrator {
             .any(|k| self.clients.get(k).is_some_and(|c| c.use_web_po_tokens));
         let prerequisites_started = Instant::now();
         #[cfg(target_os = "ios")]
-        let (sts, session_pot_owned) = tokio::join!(self.cipher.signature_timestamp(), async {
-            match &visitor {
-                Some(vd) if wants_pot => self.potoken.get_session_po_token(vd).await,
-                _ => None,
+        let (sts, session_pot_owned) = tokio::join!(
+            async {
+                let result = self.cipher.signature_timestamp().await;
+                tracing::info!(
+                    elapsed_ms = prerequisites_started.elapsed().as_millis() as u64,
+                    "player version lookup finished"
+                );
+                result
+            },
+            async {
+                let result = match &visitor {
+                    Some(vd) if wants_pot => self.potoken.get_session_po_token(vd).await,
+                    _ => None,
+                };
+                tracing::info!(
+                    elapsed_ms = prerequisites_started.elapsed().as_millis() as u64,
+                    "session prerequisite finished"
+                );
+                result
             }
-        });
+        );
         #[cfg(not(target_os = "ios"))]
         let (sts, session_pot_owned) = {
             let sts = self.cipher.signature_timestamp().await;
@@ -314,6 +337,7 @@ impl Orchestrator {
             client = MAIN_CLIENT,
             elapsed_ms = main_started.elapsed().as_millis() as u64,
             answered = main_resp.is_some(),
+            outcome = client_outcome(main_resp.as_ref()),
             "stream client attempt completed"
         );
 
@@ -339,6 +363,7 @@ impl Orchestrator {
                             client = "WEB_CREATOR",
                             elapsed_ms = creator_started.elapsed().as_millis() as u64,
                             answered = true,
+                            outcome = client_outcome(Some(&r)),
                             "stream client attempt completed"
                         );
                         main_resp = Some(r);
@@ -456,6 +481,7 @@ impl Orchestrator {
                     client = key,
                     elapsed_ms = client_started.elapsed().as_millis() as u64,
                     answered = answered.is_ok(),
+                    outcome = client_outcome(answered.as_ref().ok()),
                     "stream client attempt completed"
                 );
                 reached |= answered.is_ok();
@@ -491,7 +517,9 @@ impl Orchestrator {
                 {
                     unsupported_audio |= has_audio_formats(streaming);
                 }
-                tracing::debug!(client = %key, "no platform-compatible audio format");
+                tracing::info!(client = %key, adaptive_count = streaming.adaptive_formats.len(),
+                    progressive_count = streaming.formats.as_ref().map_or(0, Vec::len),
+                    "no platform-compatible audio format");
                 continue;
             };
             if audio_config_loudness.is_none() {
@@ -525,7 +553,7 @@ impl Orchestrator {
                 "stream URL preparation completed");
 
             // HIGH two-pass: remember the best non-HIGH and keep looking if a HIGH exists elsewhere.
-            if prefer_high && !is_high(format) && has_high {
+            if !cfg!(target_os = "ios") && prefer_high && !is_high(format) && has_high {
                 if better(format, best.as_ref().map(|c| &c.format)) {
                     let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
                     best = Some(Candidate {
@@ -565,16 +593,38 @@ impl Orchestrator {
                 stream_headers(client.map(|c| c.user_agent.clone()), self.it.cookie(), is_upload);
             let validation_started = Instant::now();
             let validated = validate_stream(&url, &headers, content_length(format)).await;
+            // The device report passed a tail probe, then timed out preparing the opening.
+            // A tail response alone says nothing about an AVURLAsset's initial byte range.
+            #[cfg(target_os = "ios")]
+            let validated = validated
+                && (!expected_duration_ms.is_some_and(|ms| ms >= 30 * 60_000)
+                    || !is_youtube_stream(&url)
+                    || validate_opening(&url, &headers, Duration::from_secs(5)).await);
             tracing::info!(
                 video_id,
                 client = %key,
                 itag = format.itag,
                 elapsed_ms = validation_started.elapsed().as_millis() as u64,
                 validated,
+                media = media_category(&format.mime_type),
                 "stream validation completed"
             );
             if validated {
                 let ping = main_ping.clone().or_else(|| playback_ping(&resp, &key));
+                #[cfg(target_os = "ios")]
+                if prefer_high && !is_high(format) && has_high {
+                    if better(format, best.as_ref().map(|c| &c.format)) {
+                        best = Some(Candidate {
+                            format: format.clone(),
+                            expected_duration_ms,
+                            url,
+                            expires,
+                            client: key,
+                            ping,
+                        });
+                    }
+                    continue;
+                }
                 tracing::info!(
                     video_id,
                     client = %key,
@@ -983,7 +1033,7 @@ async fn validate_stream(
         req = req.header(k, v);
     }
     let response = req.send().await;
-    if response.as_ref().is_ok_and(|r| r.status().is_success()) {
+    if valid_probe(&response) {
         return true;
     }
     // Some podcast origins implement GET but reject HEAD. Only retry that explicit method
@@ -998,9 +1048,108 @@ async fn validate_stream(
         for (k, v) in headers {
             get = get.header(k, v);
         }
-        return matches!(get.send().await, Ok(r) if r.status().is_success());
+        return valid_probe(&get.send().await);
     }
     false
+}
+
+fn client_outcome(response: Option<&PlayerResponse>) -> &'static str {
+    match response.map(|r| r.playability_status.status.as_str()) {
+        Some("OK") => "eligible",
+        Some("LOGIN_REQUIRED") => "login-required",
+        Some("UNPLAYABLE") => "unavailable",
+        Some(_) => "ineligible",
+        None => "no-response",
+    }
+}
+
+fn media_category(mime: &str) -> &'static str {
+    match mime.split(';').next().unwrap_or("").trim() {
+        "video/mp4" => "video-mp4",
+        "audio/mp4" if mime.contains("mp4a") => "mp4-aac",
+        "audio/mp4" => "audio-mp4",
+        "audio/mpeg" | "audio/mp3" => "mpeg-audio",
+        "audio/aac" => "aac",
+        "audio/webm" => "webm",
+        _ => "other",
+    }
+}
+
+#[cfg(any(target_os = "ios", test))]
+async fn validate_opening(url: &str, headers: &HashMap<String, String>, timeout: Duration) -> bool {
+    let mut req = crate::http::client()
+        .get(url)
+        .header("Range", "bytes=0-1")
+        .header("Accept-Encoding", "identity")
+        .timeout(timeout);
+    for (k, v) in headers {
+        req = req.header(k, v);
+    }
+    let mut response = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::info!(timeout = e.is_timeout(), "opening range request failed");
+            return false;
+        }
+    };
+    let status = response.status().as_u16();
+    let redirected = reqwest::Url::parse(url).is_ok_and(|u| &u != response.url());
+    let content_type =
+        response.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let mime = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let media = mime.starts_with("audio/")
+        || mime.starts_with("video/")
+        || matches!(mime.as_str(), "" | "application/octet-stream");
+    let range = response
+        .headers()
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("bytes 0-1/"))
+        .is_some_and(|v| v.parse::<u64>().is_ok_and(|size| size >= 2));
+    let mut received = 0;
+    if status == 206 && range && media {
+        while received < 2 {
+            match response.chunk().await {
+                Ok(Some(chunk)) => received += chunk.len(),
+                _ => break,
+            }
+        }
+    }
+    tracing::info!(
+        status,
+        redirected,
+        range,
+        media_type = media_category(&mime),
+        media,
+        bytes = received,
+        "native startup range validation"
+    );
+    received == 2
+}
+
+fn valid_probe(response: &reqwest::Result<reqwest::Response>) -> bool {
+    match response {
+        Ok(r) => {
+            let mime = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let document =
+                mime.split(';').next().is_some_and(|m| m.trim().eq_ignore_ascii_case("text/html"));
+            tracing::info!(
+                status = r.status().as_u16(),
+                document,
+                partial = r.headers().contains_key("content-range"),
+                "media HTTP probe"
+            );
+            r.status().is_success() && !(cfg!(target_os = "ios") && document)
+        }
+        Err(e) => {
+            tracing::info!(
+                timeout = e.is_timeout(),
+                connect = e.is_connect(),
+                "media HTTP probe failed"
+            );
+            false
+        }
+    }
 }
 
 /// Podcast browse durations are rounded presentation text, not format-validation authority.
@@ -1030,6 +1179,13 @@ fn has_audio_formats(data: &StreamingData) -> bool {
 }
 
 fn stream_lifetime(url: &str, expires: Option<i64>) -> Option<i64> {
+    if is_youtube_stream(url) {
+        let parsed = reqwest::Url::parse(url).ok()?;
+        if let Some((_, deadline)) = parsed.query_pairs().find(|(k, _)| k == "expire") {
+            let remaining = deadline.parse::<i64>().ok()?.checked_sub(crate::db::now_secs())?;
+            return expires.filter(|n| *n > 0 && remaining > 0).map(|n| n.min(remaining));
+        }
+    }
     match expires {
         Some(n) if n > 0 => Some(n),
         _ if !is_youtube_stream(url) => Some(0), // playable, but never cached/prepared as reusable
@@ -1185,6 +1341,50 @@ fn best_thumbnail(resp: &PlayerResponse) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn podcast_opening_requires_the_requested_media_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (status, range, mime, body, stall, valid) in [
+            (206, "bytes 0-1/9000", "audio/mp4", "ok", false, true),
+            (206, "bytes 0-1/9000", "audio/mp4", "o", false, false),
+            (206, "bytes 2-3/9000", "audio/mp4", "ok", false, false),
+            (206, "bytes 0-1/9000", "text/html", "ok", false, false),
+            (403, "", "text/html", "", false, false),
+            (206, "bytes 0-1/9000", "audio/mp4", "", true, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/episode", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                assert!(String::from_utf8(request)
+                    .unwrap()
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=0-1"));
+                let reply = format!("HTTP/1.1 {status} Fixture\r\nContent-Range: {range}\r\nContent-Type: {mime}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{body}");
+                socket.write_all(reply.as_bytes()).await.unwrap();
+                if stall {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            });
+            assert_eq!(
+                super::validate_opening(
+                    &url,
+                    &Default::default(),
+                    std::time::Duration::from_secs(1)
+                )
+                .await,
+                valid
+            );
+            server.await.unwrap();
+        }
+        assert!(
+            super::stream_lifetime("https://r.googlevideo.com/test?expire=1", Some(600)).is_none()
+        );
+    }
     #[test]
     fn unsupported_audio_detection_handles_optional_progressive_formats() {
         for json in [
